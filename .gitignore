@@ -1,0 +1,29 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.pidb
+*.userprefs
+
+# Build
+bin/
+obj/
+
+# Unity
+Library/
+Temp/
+*.csproj
+*.unityproj
+*.sln
+*.sln.docstates
+*.pidb.meta
+*.pdb
+*.mdb
+# BepInEx configs & logs (optional to ignore)
+BepInEx/config/
+BepInEx/patchers/
+BepInEx/LogOutput.log
+
+# OS
+.DS_Store
+Thumbs.db
