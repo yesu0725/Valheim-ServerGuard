@@ -3,69 +3,82 @@ using System.IO;
 using System.Linq;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
 using BepInEx;
 using HarmonyLib;
 using UnityEngine;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
+using Newtonsoft.Json;
 
-[BepInPlugin("com.taeguk.valheim.anticheat", "Valheim AntiCheat Server", "1.2.3")]
+[BepInPlugin("com.taeguk.valheim.anticheat", "Valheim AntiCheat Server", "1.3.0")]
 public class Plugin : BaseUnityPlugin
 {
     public static Plugin Instance { get; private set; }
     const int MAX_VIOLATIONS = 3;
 
+    //─── In-memory config ───
     public HashSet<string> Admins        = new();
     public Dictionary<string,string> Reg = new();
     public HashSet<string> AllowedMods   = new();
     public Dictionary<string,int>    Viol= new();
 
+    //─── Discord webhook URL ───
+    public string DiscordWebhookUrl = "";
+
     IDeserializer _deserializer;
-    FileSystemWatcher _adminsWatcher, _regWatcher, _modsWatcher;
+    FileSystemWatcher _adminsWatcher, _regWatcher, _modsWatcher, _mainWatcher;
+    static readonly HttpClient _httpClient = new HttpClient();
 
     void Awake()
     {
         Instance = this;
+
         try
         {
             Logger.LogInfo("[AntiCheat] Awake starting…");
 
-            // Build YAML deserializer
+            // build YAML deserializer
             _deserializer = new DeserializerBuilder()
                 .WithNamingConvention(CamelCaseNamingConvention.Instance)
                 .IgnoreUnmatchedProperties()
                 .Build();
 
-            // 1) Ensure configs exist with inline YAML + comments
-            EnsureConfig("anticheat_admins.yaml", 
-@"# List of admin Steam IDs (exempt from checks)
-# Example:
+            // ensure main config + per-feature configs exist
+            EnsureConfig("anticheat_config.yaml",
+@"# Main AntiCheat settings
+# Put your Discord webhook URL here (only one):
+# webhook_url: ""https://discord.com/api/webhooks/XXXXXXXX/XXXXXXXX""
+webhook_url: """"
+");
+            EnsureConfig("anticheat_admins.yaml",
+@"# List of admin Steam IDs (exempt from all checks)
 # - ""76561199062837584""
 []
 ");
-            EnsureConfig("anticheat_registered_chars.yaml", 
+            EnsureConfig("anticheat_registered_chars.yaml",
 @"# Registered characters mapping: characterName: SteamID
-# Example:
 # Cheatest: ""76561199062837584""
 {}
 ");
-            EnsureConfig("anticheat_allowed_mods.yaml", 
-@"# Allowed mods (by mod name)
-# Example:
+            EnsureConfig("anticheat_allowed_mods.yaml",
+@"# Allowed mods (optional list of client-reported mod names)
 # - ""EpicLoot""
 []
 ");
             Logger.LogInfo("[AntiCheat] Config files created or already present.");
 
-            // 2) Load them
+            // load all configs
             LoadConfigs();
             Logger.LogInfo("[AntiCheat] Configs loaded.");
 
-            // 3) Watch for live edits
+            // watch for edits
             SetupWatchers();
             Logger.LogInfo("[AntiCheat] File watchers set.");
 
-            // 4) Patch handshake
+            // patch handshake
             var harmony = new Harmony("com.taeguk.valheim.anticheat");
             harmony.Patch(
                 AccessTools.Method(typeof(ZNet), "RPC_PeerInfo"),
@@ -93,12 +106,25 @@ public class Plugin : BaseUnityPlugin
     {
         string dir = Paths.ConfigPath;
 
+        // Main config (webhook)
+        try
+        {
+            var mainText = File.ReadAllText(Path.Combine(dir, "anticheat_config.yaml"));
+            var mainDict = _deserializer.Deserialize<Dictionary<string,string>>(mainText)
+                           ?? new Dictionary<string,string>();
+            mainDict.TryGetValue("webhook_url", out DiscordWebhookUrl);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[AntiCheat] Failed loading main config: {ex}");
+        }
+
         // Admins
         try
         {
-            var adminsPath = Path.Combine(dir, "anticheat_admins.yaml");
-            var list = _deserializer.Deserialize<List<string>>(File.ReadAllText(adminsPath))
-                       ?? new List<string>();
+            var list = _deserializer.Deserialize<List<string>>(
+                File.ReadAllText(Path.Combine(dir, "anticheat_admins.yaml"))
+            ) ?? new List<string>();
             Admins = new HashSet<string>(list);
         }
         catch (Exception ex)
@@ -106,12 +132,12 @@ public class Plugin : BaseUnityPlugin
             Logger.LogError($"[AntiCheat] Failed loading admins: {ex}");
         }
 
-        // Registered characters
+        // Registered chars
         try
         {
-            var regPath = Path.Combine(dir, "anticheat_registered_chars.yaml");
-            var dict = _deserializer.Deserialize<Dictionary<string,string>>(File.ReadAllText(regPath))
-                       ?? new Dictionary<string,string>();
+            var dict = _deserializer.Deserialize<Dictionary<string,string>>(
+                File.ReadAllText(Path.Combine(dir, "anticheat_registered_chars.yaml"))
+            ) ?? new Dictionary<string,string>();
             Reg = dict;
         }
         catch (Exception ex)
@@ -122,9 +148,9 @@ public class Plugin : BaseUnityPlugin
         // Allowed mods
         try
         {
-            var modsPath = Path.Combine(dir, "anticheat_allowed_mods.yaml");
-            var list = _deserializer.Deserialize<List<string>>(File.ReadAllText(modsPath))
-                       ?? new List<string>();
+            var list = _deserializer.Deserialize<List<string>>(
+                File.ReadAllText(Path.Combine(dir, "anticheat_allowed_mods.yaml"))
+            ) ?? new List<string>();
             AllowedMods = new HashSet<string>(list);
         }
         catch (Exception ex)
@@ -136,11 +162,13 @@ public class Plugin : BaseUnityPlugin
     void SetupWatchers()
     {
         string dir = Paths.ConfigPath;
+
+        _mainWatcher = new FileSystemWatcher(dir, "anticheat_config.yaml");
         _adminsWatcher = new FileSystemWatcher(dir, "anticheat_admins.yaml");
         _regWatcher    = new FileSystemWatcher(dir, "anticheat_registered_chars.yaml");
         _modsWatcher   = new FileSystemWatcher(dir, "anticheat_allowed_mods.yaml");
 
-        foreach (var w in new[]{ _adminsWatcher, _regWatcher, _modsWatcher })
+        foreach (var w in new[]{ _mainWatcher, _adminsWatcher, _regWatcher, _modsWatcher })
         {
             w.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size;
             w.Changed += OnConfigChanged;
@@ -175,7 +203,7 @@ public class Plugin : BaseUnityPlugin
         Instance.Viol.TryGetValue(steamId, out int count);
         bool kicked = false;
 
-        // Allowed-mods check
+        // Allowed-mods
         var mf = peer.GetType()
                      .GetField("m_mods", BindingFlags.NonPublic | BindingFlags.Instance);
         var mods = mf?.GetValue(peer) as List<string>;
@@ -185,28 +213,28 @@ public class Plugin : BaseUnityPlugin
             if (bad.Count > 0)
             {
                 kicked = true; count++;
-                Instance.Logger.LogWarning(
-                    $"[AntiCheat] Unauthorized mods by {steamId}: {string.Join(", ", bad)}"
-                );
+                string msg = $"[AntiCheat] Unauthorized mods by {steamId}: {string.Join(", ", bad)}";
+                Instance.Logger.LogWarning(msg);
+                Instance.SendDiscordLogAsync(msg);
             }
         }
 
-        // Registration check
+        // Registration
         if (!Instance.Reg.TryGetValue(playerName, out var owner) || owner != steamId)
         {
             kicked = true; count++;
-            Instance.Logger.LogWarning(
-                $"[AntiCheat] Unregistered character '{playerName}' ({steamId})"
-            );
+            string msg = $"[AntiCheat] Unregistered character '{playerName}' ({steamId})";
+            Instance.Logger.LogWarning(msg);
+            Instance.SendDiscordLogAsync(msg);
         }
 
         // Auto-ban
         if (count >= MAX_VIOLATIONS)
         {
             kicked = true;
-            Instance.Logger.LogError(
-                $"[AntiCheat] {steamId} exceeded {count} violations — banning"
-            );
+            string msg = $"[AntiCheat] {steamId} exceeded {count} violations — banning";
+            Instance.Logger.LogError(msg);
+            Instance.SendDiscordLogAsync(msg);
         }
 
         Instance.Viol[steamId] = count;
@@ -214,9 +242,27 @@ public class Plugin : BaseUnityPlugin
         if (kicked)
             peer.m_rpc.Invoke("Error", 3);
         else
-            Instance.Logger.LogInfo(
-                $"[AntiCheat] {playerName} ({steamId}) passed checks"
-            );
+            Instance.Logger.LogInfo($"[AntiCheat] {playerName} ({steamId}) passed checks");
+    }
+
+    /// <summary>
+    /// Sends a log message to Discord via webhook, if configured.
+    /// </summary>
+    async void SendDiscordLogAsync(string content)
+    {
+        if (string.IsNullOrEmpty(DiscordWebhookUrl)) return;
+
+        try
+        {
+            var payload = new { content };
+            var json = JsonConvert.SerializeObject(payload);
+            using var httpContent = new StringContent(json, Encoding.UTF8, "application/json");
+            await _httpClient.PostAsync(DiscordWebhookUrl, httpContent);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[AntiCheat] Failed to send Discord log: {ex}");
+        }
     }
 
     [HarmonyPatch(typeof(Chat), "OnNewChatMessage")]
@@ -235,11 +281,9 @@ public class Plugin : BaseUnityPlugin
             Plugin.Instance.Reg[name] = sid;
             pl.Message(MessageHud.MessageType.TopLeft,
                        $"Registered '{name}' → {sid}");
-            Plugin.Instance.Logger.LogInfo(
-                $"[AntiCheat] Registered '{name}' → {sid}"
-            );
+            Plugin.Instance.Logger.LogInfo($"[AntiCheat] Registered '{name}' → {sid}");
 
-            // Persist YAML mapping
+            // persist YAML mapping
             var serializer = new SerializerBuilder()
                 .WithNamingConvention(CamelCaseNamingConvention.Instance)
                 .Build();
