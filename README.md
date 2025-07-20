@@ -1,48 +1,53 @@
+# Valheim AntiCheat Server
 
-# Valheim AntiCheat Server Mod
+A server-side Valheim anti-cheat plugin (BepInEx) that enforces:
 
-A server-side mod for Valheim that ensures fair play by checking the following:
-- No unauthorized client-side mods
-- Character must be registered (prevents use of overpowered local saves)
-- Admin SteamIDs can be whitelisted
-- Allowed mods can be explicitly ignored
-- Violations are tracked and auto-bans are issued after a set number of attempts
+- **Admin Whitelist**  
+  Specific Steam IDs that bypass all checks.
 
-## 📦 Features
-- Server-only BepInEx mod
-- JSON-based configuration
-- Easy in-game character registration
-- Compatible with FTP server deployments
+- **Registered-Character Enforcement**  
+  Only characters explicitly registered via `/register_char` or in `anticheat_registered_chars.yaml` may join.
 
-## 🛠 Installation
+- **Live-Reloadable Configs (YAML)**  
+  - **`anticheat_admins.yaml`** – list of admin Steam IDs  
+  - **`anticheat_registered_chars.yaml`** – mapping of character names to Steam IDs  
+  - **`anticheat_allowed_mods.yaml`** – (optional) list of allowed client-reported mods  
+  Changes to any of these files take effect immediately—no server restart required.
 
-1. Unzip this folder into your Valheim server directory.
-2. Ensure these paths exist:
-   - `BepInEx/plugins/AntiCheatServer/AntiCheatServer.dll`
-   - `BepInEx/config/*.json` config files
-3. Register characters via in-game console:
-   ```
-   register_char
-   ```
-   This binds the currently logged-in character to the SteamID.
+- **Violation Tracking & Auto-Ban**  
+  Each rule violation increments a counter per player; reaching the threshold (default 3) results in an automatic ban.
 
-## 🧪 Development
+- **Extensible Rule Hooks**  
+  Easily add custom checks (e.g. speed hacks, teleport distance, inventory audits) via Harmony patches.
 
-To build:
-```bash
-dotnet build -c Release
-```
+---
 
-Or open `AntiCheatServer.sln` in Visual Studio and build the solution.
+## Installation
 
-## 📁 Config Files
+1. Build with `dotnet build -c Release`.  
+2. Copy `AntiCheatServer.dll` (and `YamlDotNet.dll`) into `BepInEx/plugins`.  
+3. Start your Valheim server.
 
-- `config.json` - Set max violations before banning.
-- `whitelist.json` - Admin SteamIDs exempt from checks.
-- `allowed_mods.json` - Client mods allowed on login.
-- `registered_characters.json` - Maps character name to SteamID.
-- `violations.json` - Tracks each player's violation attempts.
+---
 
-## 🔐 Security Note
+## Basic Usage
 
-This mod does not currently block character file transfers directly. Server-side file hash checks are recommended for deeper validation.
+- **Register your character** in-game:
+/register_char
+This writes your current name → SteamID mapping into `anticheat_registered_chars.yaml`.
+
+- **Edit configs** under `BepInEx/config/`:
+```yaml
+# anticheat_admins.yaml
+# Example admin IDs:
+# - "76561199000000000"
+- "76561199062837584"
+
+# anticheat_registered_chars.yaml
+# Example:
+# MyCharName: "76561199062837584"
+MyCharName: "76561199062837584"
+
+# anticheat_allowed_mods.yaml
+# Example:
+# - "Jotunn"
