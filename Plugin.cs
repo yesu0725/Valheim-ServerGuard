@@ -6,123 +6,219 @@ using System.Reflection;
 using BepInEx;
 using HarmonyLib;
 using UnityEngine;
-using Newtonsoft.Json;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
 
-[BepInPlugin("com.taeguk.valheim.anticheat", "Valheim AntiCheat Server", "1.1.4")]
+[BepInPlugin("com.taeguk.valheim.anticheat", "Valheim AntiCheat Server", "1.2.3")]
 public class Plugin : BaseUnityPlugin
 {
     public static Plugin Instance { get; private set; }
     const int MAX_VIOLATIONS = 3;
 
-    // ─── Configuration stores ───
-    public HashSet<string> Admins        = new();   // exempt SteamIDs
-    public Dictionary<string,string> Reg = new();   // character → SteamID
-    public HashSet<string> AllowedMods   = new();   // mod names allowed
-    public Dictionary<string,int>    Viol= new();   // SteamID → violation count
+    public HashSet<string> Admins        = new();
+    public Dictionary<string,string> Reg = new();
+    public HashSet<string> AllowedMods   = new();
+    public Dictionary<string,int>    Viol= new();
 
-    Harmony _harmony;
+    IDeserializer _deserializer;
+    FileSystemWatcher _adminsWatcher, _regWatcher, _modsWatcher;
 
     void Awake()
     {
         Instance = this;
-
-        // Load config files
-        LoadConfig("anticheat_admins.json",             ref Admins);
-        LoadConfig("anticheat_registered_chars.json",  ref Reg);
-        LoadConfig("anticheat_allowed_mods.json",      ref AllowedMods);
-
-        // Patch RPC_PeerInfo with a postfix
-        _harmony = new Harmony("com.taeguk.valheim.anticheat");
-        var rpcInfo = AccessTools.Method(typeof(ZNet), "RPC_PeerInfo");
-        var postfix = AccessTools.Method(typeof(Plugin), nameof(RPC_PeerInfo_Postfix));
-        _harmony.Patch(rpcInfo, postfix: new HarmonyMethod(postfix));
-        Logger.LogInfo("[AntiCheat] Patched RPC_PeerInfo postfix");
-    }
-
-    void LoadConfig<T>(string filename, ref T target)
-    {
-        string path = Path.Combine(Paths.ConfigPath, filename);
-        if (!File.Exists(path))
-            File.WriteAllText(path, JsonConvert.SerializeObject(target, Formatting.Indented));
         try
         {
-            target = JsonConvert.DeserializeObject<T>(File.ReadAllText(path));
-            Logger.LogInfo($"[AntiCheat] Loaded {filename}");
+            Logger.LogInfo("[AntiCheat] Awake starting…");
+
+            // Build YAML deserializer
+            _deserializer = new DeserializerBuilder()
+                .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                .IgnoreUnmatchedProperties()
+                .Build();
+
+            // 1) Ensure configs exist with inline YAML + comments
+            EnsureConfig("anticheat_admins.yaml", 
+@"# List of admin Steam IDs (exempt from checks)
+# Example:
+# - ""76561199062837584""
+[]
+");
+            EnsureConfig("anticheat_registered_chars.yaml", 
+@"# Registered characters mapping: characterName: SteamID
+# Example:
+# Cheatest: ""76561199062837584""
+{}
+");
+            EnsureConfig("anticheat_allowed_mods.yaml", 
+@"# Allowed mods (by mod name)
+# Example:
+# - ""EpicLoot""
+[]
+");
+            Logger.LogInfo("[AntiCheat] Config files created or already present.");
+
+            // 2) Load them
+            LoadConfigs();
+            Logger.LogInfo("[AntiCheat] Configs loaded.");
+
+            // 3) Watch for live edits
+            SetupWatchers();
+            Logger.LogInfo("[AntiCheat] File watchers set.");
+
+            // 4) Patch handshake
+            var harmony = new Harmony("com.taeguk.valheim.anticheat");
+            harmony.Patch(
+                AccessTools.Method(typeof(ZNet), "RPC_PeerInfo"),
+                postfix: new HarmonyMethod(typeof(Plugin), nameof(RPC_PeerInfo_Postfix))
+            );
+            Logger.LogInfo("[AntiCheat] Patched ZNet.RPC_PeerInfo postfix.");
         }
         catch (Exception ex)
         {
-            Logger.LogError($"[AntiCheat] Error loading {filename}: {ex.Message}");
+            Logger.LogError($"[AntiCheat] Exception in Awake: {ex}");
         }
     }
 
-    // Runs after Valheim has processed the handshake and added the peer
+    void EnsureConfig(string fileName, string defaultYaml)
+    {
+        string path = Path.Combine(Paths.ConfigPath, fileName);
+        if (!File.Exists(path))
+        {
+            File.WriteAllText(path, defaultYaml);
+            Instance.Logger.LogInfo($"[AntiCheat] Created default {fileName}");
+        }
+    }
+
+    void LoadConfigs()
+    {
+        string dir = Paths.ConfigPath;
+
+        // Admins
+        try
+        {
+            var adminsPath = Path.Combine(dir, "anticheat_admins.yaml");
+            var list = _deserializer.Deserialize<List<string>>(File.ReadAllText(adminsPath))
+                       ?? new List<string>();
+            Admins = new HashSet<string>(list);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[AntiCheat] Failed loading admins: {ex}");
+        }
+
+        // Registered characters
+        try
+        {
+            var regPath = Path.Combine(dir, "anticheat_registered_chars.yaml");
+            var dict = _deserializer.Deserialize<Dictionary<string,string>>(File.ReadAllText(regPath))
+                       ?? new Dictionary<string,string>();
+            Reg = dict;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[AntiCheat] Failed loading registered_chars: {ex}");
+        }
+
+        // Allowed mods
+        try
+        {
+            var modsPath = Path.Combine(dir, "anticheat_allowed_mods.yaml");
+            var list = _deserializer.Deserialize<List<string>>(File.ReadAllText(modsPath))
+                       ?? new List<string>();
+            AllowedMods = new HashSet<string>(list);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[AntiCheat] Failed loading allowed_mods: {ex}");
+        }
+    }
+
+    void SetupWatchers()
+    {
+        string dir = Paths.ConfigPath;
+        _adminsWatcher = new FileSystemWatcher(dir, "anticheat_admins.yaml");
+        _regWatcher    = new FileSystemWatcher(dir, "anticheat_registered_chars.yaml");
+        _modsWatcher   = new FileSystemWatcher(dir, "anticheat_allowed_mods.yaml");
+
+        foreach (var w in new[]{ _adminsWatcher, _regWatcher, _modsWatcher })
+        {
+            w.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size;
+            w.Changed += OnConfigChanged;
+            w.Created += OnConfigChanged;
+            w.EnableRaisingEvents = true;
+        }
+    }
+
+    void OnConfigChanged(object sender, FileSystemEventArgs e)
+    {
+        try
+        {
+            LoadConfigs();
+            Instance.Logger.LogInfo($"[AntiCheat] Reloaded config: {e.Name}");
+        }
+        catch (Exception ex)
+        {
+            Instance.Logger.LogError($"[AntiCheat] Error reloading {e.Name}: {ex}");
+        }
+    }
+
     public static void RPC_PeerInfo_Postfix(ZNet __instance, ZRpc rpc, ZPackage pkg)
     {
-        // Find the peer just added for this rpc
-        var peer = __instance.GetPeers()
-                     .LastOrDefault(p => p.m_rpc == rpc);
+        var peer = __instance.GetPeers().LastOrDefault(p => p.m_rpc == rpc);
         if (peer == null) return;
 
-        // Grab SteamID and playerName (now populated)
         string steamId    = rpc.GetSocket().GetHostName();
         string playerName = peer.m_playerName ?? "";
 
-        // Admins bypass all checks
         if (Instance.Admins.Contains(steamId)) return;
 
-        // Initialize violation count
         Instance.Viol.TryGetValue(steamId, out int count);
         bool kicked = false;
 
-        // 1) Mod‐whitelist check (if peer.m_mods exists)
-        var modsField = peer.GetType()
-                            .GetField("m_mods", BindingFlags.NonPublic | BindingFlags.Instance);
-        var mods = modsField?.GetValue(peer) as List<string>;
+        // Allowed-mods check
+        var mf = peer.GetType()
+                     .GetField("m_mods", BindingFlags.NonPublic | BindingFlags.Instance);
+        var mods = mf?.GetValue(peer) as List<string>;
         if (mods != null && mods.Count > 0)
         {
             var bad = mods.Except(Instance.AllowedMods).ToList();
             if (bad.Count > 0)
             {
-                kicked = true;
-                count++;
+                kicked = true; count++;
                 Instance.Logger.LogWarning(
-                  $"[AntiCheat] Unauthorized mods by {steamId}: {string.Join(", ", bad)}"
+                    $"[AntiCheat] Unauthorized mods by {steamId}: {string.Join(", ", bad)}"
                 );
             }
         }
 
-        // 2) Registered-character check
+        // Registration check
         if (!Instance.Reg.TryGetValue(playerName, out var owner) || owner != steamId)
         {
-            kicked = true;
-            count++;
+            kicked = true; count++;
             Instance.Logger.LogWarning(
-              $"[AntiCheat] Unregistered character '{playerName}' ({steamId})"
+                $"[AntiCheat] Unregistered character '{playerName}' ({steamId})"
             );
         }
 
-        // 3) Auto‐ban threshold
+        // Auto-ban
         if (count >= MAX_VIOLATIONS)
         {
             kicked = true;
             Instance.Logger.LogError(
-              $"[AntiCheat] {steamId} exceeded {count} violations — banning"
+                $"[AntiCheat] {steamId} exceeded {count} violations — banning"
             );
         }
 
-        // Persist updated count
         Instance.Viol[steamId] = count;
 
-        // Kick if needed
         if (kicked)
             peer.m_rpc.Invoke("Error", 3);
         else
             Instance.Logger.LogInfo(
-              $"[AntiCheat] {playerName} ({steamId}) passed checks"
+                $"[AntiCheat] {playerName} ({steamId}) passed checks"
             );
     }
 
-    // In-game /register_char chat command
     [HarmonyPatch(typeof(Chat), "OnNewChatMessage")]
     public static class RegisterCmd
     {
@@ -143,9 +239,13 @@ public class Plugin : BaseUnityPlugin
                 $"[AntiCheat] Registered '{name}' → {sid}"
             );
 
+            // Persist YAML mapping
+            var serializer = new SerializerBuilder()
+                .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                .Build();
             File.WriteAllText(
-                Path.Combine(Paths.ConfigPath, "anticheat_registered_chars.json"),
-                JsonConvert.SerializeObject(Plugin.Instance.Reg, Formatting.Indented)
+                Path.Combine(Paths.ConfigPath, "anticheat_registered_chars.yaml"),
+                serializer.Serialize(Plugin.Instance.Reg)
             );
         }
     }
