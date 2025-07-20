@@ -94,20 +94,3 @@ Edit and save these files; the plugin will reload them automatically—no restar
 Violations and critical errors will appear in both your server log and (if configured) your Discord channel.
 
 ---
-
-## Development
-
-1. Clone the repo and edit `Plugin.cs` or `README.md`.  
-2. Build and test locally:
-   ```bash
-   dotnet restore
-   dotnet build -c Release
-   ```
-3. Commit and push your changes:
-   ```bash
-   git add .
-   git commit -m "docs: update README with Discord webhook feature"
-   git push origin main
-   ```
-
----
