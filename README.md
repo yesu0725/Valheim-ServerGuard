@@ -15,6 +15,11 @@ A server-side Valheim anti-cheat plugin (BepInEx) that enforces:
   - **`anticheat_allowed_mods.yaml`** – (optional) allowed client-reported mods  
   Changes take effect immediately—no server restart required.
 
+- **Teleport/Position Validation (Server-Side)**
+  - Detects and blocks non-portal, non-admin, long-range teleport/position hacks.
+  - **Vanilla portals and admin teleports are always allowed.**
+  - Violations result in a server kick and Discord log (if configured).
+
 - **Discord Logging**  
   If `webhook_url` is set in `anticheat_config.yaml`, violations and errors will also be posted to that Discord channel.
 
@@ -28,16 +33,16 @@ A server-side Valheim anti-cheat plugin (BepInEx) that enforces:
 
 ## Installation
 
-1. Build your plugin:
+1. **Build the plugin:**
    ```bash
    dotnet restore
    dotnet build -c Release
    ```
-2. Copy the following DLLs into your Valheim server’s `BepInEx/plugins` folder:
+2. **Copy the following files to your Valheim server’s `BepInEx/plugins` folder:**
    - `AntiCheatServer.dll`  
    - `YamlDotNet.dll`  
    - `Newtonsoft.Json.dll`  
-3. Start your Valheim server.
+3. **Start (or restart) your Valheim server.**
 
 ---
 
@@ -90,7 +95,17 @@ Edit and save these files; the plugin will reload them automatically—no restar
   This writes your current `characterName: SteamID` mapping into `anticheat_registered_chars.yaml`.
 
 - **Edit configs** under `BepInEx/config/` as shown above.
+  - Changes are applied instantly—no restart required.
+  - Violations and critical errors will appear in both your server log and (if configured) your Discord channel.
 
-Violations and critical errors will appear in both your server log and (if configured) your Discord channel.
+---
+
+## Teleport/Position Cheat Protection
+
+- **How it works:**
+  - Players who attempt to teleport a suspiciously large distance instantly (not via portals, not admins) are detected and kicked.
+- **Portals and admin teleports** are always allowed.
+- **Discord:**
+  - Violations are logged in the server log and to Discord if configured.
 
 ---

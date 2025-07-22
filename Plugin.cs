@@ -13,11 +13,12 @@ using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 using Newtonsoft.Json;
 
-[BepInPlugin("com.taeguk.valheim.anticheat", "Valheim AntiCheat Server", "1.3.0")]
+[BepInPlugin("com.taeguk.valheim.anticheat", "Valheim AntiCheat Server", "1.4.0")]
 public class Plugin : BaseUnityPlugin
 {
     public static Plugin Instance { get; private set; }
     const int MAX_VIOLATIONS = 3;
+    const float MAX_TELEPORT_DIST = 200f; // Change as needed (meters)
 
     //─── In-memory config ───
     public HashSet<string> Admins        = new();
@@ -25,12 +26,14 @@ public class Plugin : BaseUnityPlugin
     public HashSet<string> AllowedMods   = new();
     public Dictionary<string,int>    Viol= new();
 
-    //─── Discord webhook URL ───
     public string DiscordWebhookUrl = "";
 
     IDeserializer _deserializer;
     FileSystemWatcher _adminsWatcher, _regWatcher, _modsWatcher, _mainWatcher;
     static readonly HttpClient _httpClient = new HttpClient();
+
+    // --- For teleport validation ---
+    private Dictionary<string, Vector3> LastKnownPositions = new();
 
     void Awake()
     {
@@ -40,13 +43,11 @@ public class Plugin : BaseUnityPlugin
         {
             Logger.LogInfo("[AntiCheat] Awake starting…");
 
-            // build YAML deserializer
             _deserializer = new DeserializerBuilder()
                 .WithNamingConvention(CamelCaseNamingConvention.Instance)
                 .IgnoreUnmatchedProperties()
                 .Build();
 
-            // ensure main config + per-feature configs exist
             EnsureConfig("anticheat_config.yaml",
 @"# Main AntiCheat settings
 # Put your Discord webhook URL here (only one):
@@ -55,12 +56,12 @@ webhook_url: """"
 ");
             EnsureConfig("anticheat_admins.yaml",
 @"# List of admin Steam IDs (exempt from all checks)
-# - ""76561199062837584""
+# - ""76561198000000000""
 []
 ");
             EnsureConfig("anticheat_registered_chars.yaml",
 @"# Registered characters mapping: characterName: SteamID
-# Cheatest: ""76561199062837584""
+# MyHero: ""76561198000000000""
 {}
 ");
             EnsureConfig("anticheat_allowed_mods.yaml",
@@ -78,13 +79,28 @@ webhook_url: """"
             SetupWatchers();
             Logger.LogInfo("[AntiCheat] File watchers set.");
 
-            // patch handshake
             var harmony = new Harmony("com.taeguk.valheim.anticheat");
+            // Peer checks (mods/registration/ban)
             harmony.Patch(
                 AccessTools.Method(typeof(ZNet), "RPC_PeerInfo"),
                 postfix: new HarmonyMethod(typeof(Plugin), nameof(RPC_PeerInfo_Postfix))
             );
             Logger.LogInfo("[AntiCheat] Patched ZNet.RPC_PeerInfo postfix.");
+
+            // Teleport cheat detection (server-side, doesn't block vanilla portal or admin)
+            var teleportTo = AccessTools.Method(typeof(Player), "TeleportTo", new Type[] { typeof(Vector3), typeof(float), typeof(bool) });
+            if (teleportTo != null)
+            {
+                harmony.Patch(
+                    teleportTo,
+                    prefix: new HarmonyMethod(typeof(Plugin), nameof(Player_TeleportTo_Prefix))
+                );
+                Logger.LogInfo("[AntiCheat] Patched Player.TeleportTo prefix.");
+            }
+            else
+            {
+                Logger.LogWarning("[AntiCheat] Could not patch Player.TeleportTo (method not found, check Valheim version).");
+            }
         }
         catch (Exception ex)
         {
@@ -98,7 +114,7 @@ webhook_url: """"
         if (!File.Exists(path))
         {
             File.WriteAllText(path, defaultYaml);
-            Instance.Logger.LogInfo($"[AntiCheat] Created default {fileName}");
+            Logger.LogInfo($"[AntiCheat] Created default {fileName}");
         }
     }
 
@@ -182,14 +198,15 @@ webhook_url: """"
         try
         {
             LoadConfigs();
-            Instance.Logger.LogInfo($"[AntiCheat] Reloaded config: {e.Name}");
+            Logger.LogInfo($"[AntiCheat] Reloaded config: {e.Name}");
         }
         catch (Exception ex)
         {
-            Instance.Logger.LogError($"[AntiCheat] Error reloading {e.Name}: {ex}");
+            Logger.LogError($"[AntiCheat] Error reloading {e.Name}: {ex}");
         }
     }
 
+    // --- Peer checks (mods, registration, auto-ban) ---
     public static void RPC_PeerInfo_Postfix(ZNet __instance, ZRpc rpc, ZPackage pkg)
     {
         var peer = __instance.GetPeers().LastOrDefault(p => p.m_rpc == rpc);
@@ -214,8 +231,8 @@ webhook_url: """"
             {
                 kicked = true; count++;
                 string msg = $"[AntiCheat] Unauthorized mods by {steamId}: {string.Join(", ", bad)}";
-                Instance.Logger.LogWarning(msg);
-                Instance.SendDiscordLogAsync(msg);
+                Plugin.Instance.Logger.LogWarning(msg);
+                _ = Plugin.Instance.SendDiscordLogAsync(msg);
             }
         }
 
@@ -224,8 +241,8 @@ webhook_url: """"
         {
             kicked = true; count++;
             string msg = $"[AntiCheat] Unregistered character '{playerName}' ({steamId})";
-            Instance.Logger.LogWarning(msg);
-            Instance.SendDiscordLogAsync(msg);
+            Plugin.Instance.Logger.LogWarning(msg);
+            _ = Plugin.Instance.SendDiscordLogAsync(msg);
         }
 
         // Auto-ban
@@ -233,8 +250,8 @@ webhook_url: """"
         {
             kicked = true;
             string msg = $"[AntiCheat] {steamId} exceeded {count} violations — banning";
-            Instance.Logger.LogError(msg);
-            Instance.SendDiscordLogAsync(msg);
+            Plugin.Instance.Logger.LogError(msg);
+            _ = Plugin.Instance.SendDiscordLogAsync(msg);
         }
 
         Instance.Viol[steamId] = count;
@@ -242,13 +259,13 @@ webhook_url: """"
         if (kicked)
             peer.m_rpc.Invoke("Error", 3);
         else
-            Instance.Logger.LogInfo($"[AntiCheat] {playerName} ({steamId}) passed checks");
+            Plugin.Instance.Logger.LogInfo($"[AntiCheat] {playerName} ({steamId}) passed checks");
     }
 
     /// <summary>
     /// Sends a log message to Discord via webhook, if configured.
     /// </summary>
-    async void SendDiscordLogAsync(string content)
+    public async Task SendDiscordLogAsync(string content)
     {
         if (string.IsNullOrEmpty(DiscordWebhookUrl)) return;
 
@@ -292,5 +309,64 @@ webhook_url: """"
                 serializer.Serialize(Plugin.Instance.Reg)
             );
         }
+    }
+
+    // --- Teleport validation patch ---
+    public static bool Player_TeleportTo_Prefix(Player __instance, Vector3 pos, float yaw, bool distantTeleport)
+    {
+        try
+        {
+            // Only do checks on server (if player is a remote peer)
+            if (!ZNet.instance || !ZNet.instance.IsServer()) return true;
+            if (__instance == null) return true;
+
+            string playerName = __instance.GetPlayerName();
+            string steamId = __instance.GetZDOID().ToString(); // fallback if needed
+
+            // Try to get SteamID for this player, safer if peer is available
+            ZNetPeer peer = ZNet.instance.GetPeers().FirstOrDefault(p => p.m_playerName == playerName);
+            if (peer != null)
+                steamId = peer.m_rpc.GetSocket().GetHostName();
+
+            // Admins always allowed
+            if (Plugin.Instance.Admins.Contains(steamId))
+                return true;
+
+            // Portal/distant teleport: skip check (allowed)
+            if (distantTeleport)
+                return true;
+
+            // Track last known position for this player
+            if (!Plugin.Instance.LastKnownPositions.TryGetValue(steamId, out Vector3 lastPos))
+                lastPos = __instance.transform.position;
+
+            float dist = Vector3.Distance(lastPos, pos);
+
+            // Arbitrary: large instant jump, likely a cheat, unless using a portal/distantTeleport
+            if (dist > MAX_TELEPORT_DIST)
+            {
+                string msg = $"[AntiCheat] {playerName} ({steamId}) tried illegal teleport from {lastPos} to {pos} ({dist:F1}m)";
+                Plugin.Instance.Logger.LogWarning(msg);
+                _ = Plugin.Instance.SendDiscordLogAsync(msg);
+
+                // Option: Kick the player? Or just warn?
+                ZNetPeer offender = ZNet.instance.GetPeers().FirstOrDefault(p => p.m_playerName == playerName);
+                if (offender != null)
+                {
+                    // Kick
+                    offender.m_rpc.Invoke("Error", 3);
+                }
+                // Block teleport
+                return false;
+            }
+
+            // If allowed, update last known position
+            Plugin.Instance.LastKnownPositions[steamId] = pos;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Instance.Logger.LogError($"[AntiCheat] Exception in TeleportTo: {ex}");
+        }
+        return true;
     }
 }
