@@ -1,33 +1,47 @@
-# Valheim AntiCheat Server
+# Valheim ServerGuard
 
-A server-side Valheim anti-cheat plugin (BepInEx) that enforces:
+A server-side Valheim security plugin (BepInEx) that enforces fair play and prevents abuse on community servers.
+
+---
+
+## Features
 
 - **Admin Whitelist**  
-  Specific Steam IDs that bypass all checks.
+  Steam IDs listed in `admins.yaml` bypass all checks.
+
+- **No-Mods Enforcement**  
+  Detects clients reporting mod-related RPC tokens (e.g. Jotunn, ServerSync, BepInEx).  
+  - Allowed mod tokens can be listed in `ignore_mods.yaml`.  
+  - Violations are logged and can result in automatic kicks/bans.
 
 - **Registered-Character Enforcement**  
-  Only characters explicitly registered via `/register_char` or in `anticheat_registered_chars.yaml` may join.
+  Each SteamID may only use the registered character names stored in `registrations.yaml`.  
+  - New names are auto-registered until the configured limit is reached.  
+  - Exceeding the limit triggers violations and may cause a kick.
+
+- **Character Name Limit**  
+  Enforces how many distinct character names a single SteamID may use (default: 1).  
+  - Prevents abuse via alt characters.  
+  - Configurable in `settings.yaml`.
 
 - **Live-Reloadable Configs (YAML)**  
-  - **`anticheat_config.yaml`** – main settings, including Discord webhook  
-  - **`anticheat_admins.yaml`** – list of admin Steam IDs  
-  - **`anticheat_registered_chars.yaml`** – mapping of character names to Steam IDs  
-  - **`anticheat_allowed_mods.yaml`** – (optional) allowed client-reported mods  
-  Changes take effect immediately—no server restart required.
-
-- **Teleport/Position Validation (Server-Side)**
-  - Detects and blocks non-portal, non-admin, long-range teleport/position hacks.
-  - **Vanilla portals and admin teleports are always allowed.**
-  - Violations result in a server kick and Discord log (if configured).
-
-- **Discord Logging**  
-  If `webhook_url` is set in `anticheat_config.yaml`, violations and errors will also be posted to that Discord channel.
+  - **`settings.yaml`** – main settings (thresholds, enforcement, messages)  
+  - **`admins.yaml`** – Steam IDs that are exempt from checks  
+  - **`ignore_mods.yaml`** – allowed client mod tokens  
+  - **`registrations.yaml`** – per-SteamID character name lists  
+  - **`violations.yaml`** – auto-maintained record of rule violations  
+  All changes take effect instantly without restarting the server.
 
 - **Violation Tracking & Auto-Ban**  
-  Each rule violation increments a counter per player; reaching the threshold (default 3) results in an automatic ban.
+  Each rule violation increments a counter per player.  
+  Reaching the threshold (default: 3) results in an automatic ban.  
+
+- **Hot-Reload Support**  
+  File changes are detected automatically via watchers.  
+  Updated rules apply immediately.
 
 - **Extensible Rule Hooks**  
-  Easily add custom checks (e.g. speed hacks, teleport distance, inventory audits) via Harmony patches.
+  The plugin is structured to allow adding new detection rules (e.g. inventory, movement audits) through Harmony patches.
 
 ---
 
@@ -38,8 +52,8 @@ A server-side Valheim anti-cheat plugin (BepInEx) that enforces:
    dotnet restore
    dotnet build -c Release
    ```
-2. **Copy the following files to your Valheim server’s `BepInEx/plugins` folder:**
-   - `AntiCheatServer.dll`  
+2. **Copy the following files to your Valheim server’s BepInEx/plugins folder:**
+   - `ServerGuard.dll`  
    - `YamlDotNet.dll`  
    - `Newtonsoft.Json.dll`  
 3. **Start (or restart) your Valheim server.**
@@ -48,38 +62,50 @@ A server-side Valheim anti-cheat plugin (BepInEx) that enforces:
 
 ## Configuration
 
-All config files live in `BepInEx/config/` and auto-create with helpful comments if missing.
+All config files live in BepInEx/config/ServerGuard/ and auto-create with helpful comments if missing.
 
-### 1. `anticheat_config.yaml`
+### 1. `settings.yaml`
 ```yaml
-# Main AntiCheat settings
-# Paste your Discord webhook URL here (only one):
-# webhook_url: "https://discord.com/api/webhooks/XXXXXXXX/XXXXXXXXXXXXXXXXXXXXXXXX"
-webhook_url: ""
+# Main ServerGuard settings
+violationThreshold: 3
+enforce: true
+aggressiveNoModCheck: true
+requireAttestation: false
+kickMessage: "You cannot join: server security policy violation. Contact an administrator."
+banReason: "Auto-banned due to repeated security violations."
+characterLimit: 1
 ```
 
-### 2. `anticheat_admins.yaml`
+### 2. `admins.yaml`
 ```yaml
 # List of admin Steam IDs (exempt from checks)
-# Example:
-# - "76561198000000000"
-[]
+admins:
+  - "76561198000000000"
 ```
 
-### 3. `anticheat_registered_chars.yaml`
+### 3. `ignore_mods.yaml`
 ```yaml
-# Registered characters mapping: characterName: SteamID
-# Dummy example:
-# MyHero: "76561198000000000"
-{}
+# Allowed mod RPC tokens (clients with these will not be flagged)
+ignore_mods:
+  - "Jotunn"
+  - "ServerSync"
 ```
 
-### 4. `anticheat_allowed_mods.yaml`
+### 4. `registrations.yaml`
 ```yaml
-# Allowed mods (optional, for mod-reporting clients)
-# Example:
-# - "EpicLoot"
-[]
+# SteamID -> list of allowed character names
+registrations:
+  "76561198000000000":
+    - MyViking
+```
+
+### 5. `violations.yaml`
+```yaml
+# Maintained automatically – do not edit manually
+violations:
+  "76561198000000000":
+    ClientModded: 1
+    CharacterNameLimitExceeded: 2
 ```
 
 Edit and save these files; the plugin will reload them automatically—no restart needed.
@@ -88,24 +114,15 @@ Edit and save these files; the plugin will reload them automatically—no restar
 
 ## Usage
 
-- **Register your character in-game:**
-  ```text
-  /register_char
-  ```
-  This writes your current `characterName: SteamID` mapping into `anticheat_registered_chars.yaml`.
-
-- **Edit configs** under `BepInEx/config/` as shown above.
-  - Changes are applied instantly—no restart required.
-  - Violations and critical errors will appear in both your server log and (if configured) your Discord channel.
-
----
-
-## Teleport/Position Cheat Protection
-
-- **How it works:**
-  - Players who attempt to teleport a suspiciously large distance instantly (not via portals, not admins) are detected and kicked.
-- **Portals and admin teleports** are always allowed.
-- **Discord:**
-  - Violations are logged in the server log and to Discord if configured.
+- **Character Registration:**
+  - The first character a SteamID uses is automatically registered.
+  - Additional characters up to the configured limit are allowed.
+  - Beyond the limit, the player will be kicked (if enforcement is enabled).
+- **Admin Bypass:**
+  - Admins listed in admins.yaml bypass all security checks.
+- **Violation Handling:**
+  - Violations increment per player and are stored in violations.yaml.
+  - After exceeding the threshold, the player is auto-banned.
+  - Kicks and bans use the messages configured in settings.yaml.
 
 ---
