@@ -138,8 +138,14 @@ public class Plugin : BaseUnityPlugin
 		{
 			try
 			{
-				BepInEx.Logging.Logger.Listeners.Add(_discordListener = new DiscordLogListener(_settings.discordWebhookUrl, "[ServerGuard]"));
-				LogS.LogInfo("[ServerGuard] Discord logging enabled.");
+				// This is the ONLY source name we will forward
+				var allowedSource = LogS?.SourceName ?? "Valheim ServerGuard";
+
+				BepInEx.Logging.Logger.Listeners.Add(
+					_discordListener = new DiscordLogListener(_settings.discordWebhookUrl, "[ServerGuard]", allowedSource)
+				);
+
+				LogS.LogInfo($"[ServerGuard] Discord logging enabled for source '{allowedSource}'.");
 			}
 			catch (Exception ex)
 			{
@@ -293,11 +299,11 @@ public class Plugin : BaseUnityPlugin
         try
         {
             _settings = _yamlIn.Deserialize<Settings>(File.ReadAllText(SettingsYaml)) ?? new Settings();
-            LogS.LogInfo("[AntiCheat] settings.yaml loaded");
+            LogS.LogInfo("[ServerGuard] settings.yaml loaded");
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[AntiCheat] Failed to load settings.yaml: {ex.Message}");
+            LogS.LogError($"[ServerGuard] Failed to load settings.yaml: {ex.Message}");
             _settings = new Settings();
         }
     }
@@ -309,11 +315,11 @@ public class Plugin : BaseUnityPlugin
             var text = File.ReadAllText(AdminsYaml);
             var doc = _yamlIn.Deserialize<AdminsDoc>(text) ?? new AdminsDoc();
             _admins = new HashSet<string>((doc.admins ?? new List<string>()).Select(s => s.Trim()).Where(s => !string.IsNullOrWhiteSpace(s)), StringComparer.OrdinalIgnoreCase);
-            LogS.LogInfo($"[AntiCheat] admins.yaml loaded ({_admins.Count} admins)");
+            LogS.LogInfo($"[ServerGuard] admins.yaml loaded ({_admins.Count} admins)");
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[AntiCheat] Failed to load admins.yaml: {ex.Message}");
+            LogS.LogError($"[ServerGuard] Failed to load admins.yaml: {ex.Message}");
             _admins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
     }
@@ -325,11 +331,11 @@ public class Plugin : BaseUnityPlugin
             var text = File.ReadAllText(IgnoreModsYaml);
             var doc = _yamlIn.Deserialize<IgnoreModsDoc>(text) ?? new IgnoreModsDoc();
             _ignoredModTokens = new HashSet<string>((doc.ignore_mods ?? new List<string>()).Select(s => s.Trim()).Where(s => !string.IsNullOrWhiteSpace(s)), StringComparer.OrdinalIgnoreCase);
-            LogS.LogInfo($"[AntiCheat] ignore_mods.yaml loaded ({_ignoredModTokens.Count} tokens)");
+            LogS.LogInfo($"[ServerGuard] ignore_mods.yaml loaded ({_ignoredModTokens.Count} tokens)");
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[AntiCheat] Failed to load ignore_mods.yaml: {ex.Message}");
+            LogS.LogError($"[ServerGuard] Failed to load ignore_mods.yaml: {ex.Message}");
             _ignoredModTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
     }
@@ -366,11 +372,11 @@ public class Plugin : BaseUnityPlugin
 					_registrations = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 				}
 			}
-			LogS.LogInfo($"[AntiCheat] registrations.yaml loaded ({_registrations.Count} SteamIDs)");
+			LogS.LogInfo($"[ServerGuard] registrations.yaml loaded ({_registrations.Count} SteamIDs)");
 		}
 		catch (Exception ex)
 		{
-			LogS.LogError($"[AntiCheat] Failed to load registrations.yaml: {ex.Message}");
+			LogS.LogError($"[ServerGuard] Failed to load registrations.yaml: {ex.Message}");
 			_registrations = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 		}
 	}
@@ -382,11 +388,11 @@ public class Plugin : BaseUnityPlugin
             var text = File.ReadAllText(ViolationsYaml);
             var doc = _yamlIn.Deserialize<ViolationsDoc>(text) ?? new ViolationsDoc();
             _violations = doc.violations ?? new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
-            LogS.LogInfo($"[AntiCheat] violations.yaml loaded ({_violations.Count} players)");
+            LogS.LogInfo($"[ServerGuard] violations.yaml loaded ({_violations.Count} players)");
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[AntiCheat] Failed to load violations.yaml: {ex.Message}");
+            LogS.LogError($"[ServerGuard] Failed to load violations.yaml: {ex.Message}");
             _violations = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
         }
     }
@@ -628,7 +634,7 @@ public class Plugin : BaseUnityPlugin
         map[rule] = c + 1;
         SaveViolations();
 
-        LogS.LogWarning($"[AntiCheat] {platformId} violated {rule}. Count={map[rule]}/{_settings.ViolationThreshold}");
+        LogS.LogWarning($"[ServerGuard] {platformId} violated {rule}. Count={map[rule]}/{_settings.ViolationThreshold}");
 		_ = SendDiscordNow($":warning: Violation by {platformId} — **{rule}** ({map[rule]}/{_settings.ViolationThreshold})");
 
         if (_settings.Enforce && map[rule] >= _settings.ViolationThreshold)
@@ -649,7 +655,7 @@ public class Plugin : BaseUnityPlugin
             if (kickPeer != null)
             {
                 kickPeer.Invoke(znet, new object[] { znetPeer as ZNetPeer });
-                LogS.LogWarning($"[AntiCheat] Kicked peer. Reason: {reason}");
+                LogS.LogWarning($"[ServerGuard] Kicked peer. Reason: {reason}");
 				_ = SendDiscordNow($":boot: Kicked peer. Reason: {reason}");
                 return;
             }
@@ -659,13 +665,13 @@ public class Plugin : BaseUnityPlugin
             if (kickId != null)
             {
                 kickId.Invoke(znet, new object[] { pid });
-                LogS.LogWarning($"[AntiCheat] Kicked {pid}. Reason: {reason}");
+                LogS.LogWarning($"[ServerGuard] Kicked {pid}. Reason: {reason}");
 				_ = SendDiscordNow($":boot: Kicked {pid}. Reason: {reason}");
             }
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[AntiCheat] Kick failed: {ex}");
+            LogS.LogError($"[ServerGuard] Kick failed: {ex}");
         }
     }
 
@@ -680,13 +686,13 @@ public class Plugin : BaseUnityPlugin
             if (banId != null)
             {
                 banId.Invoke(znet, new object[] { platformId });
-                LogS.LogWarning($"[AntiCheat] Auto-banned {platformId}. Reason: {reason}");
+                LogS.LogWarning($"[ServerGuard] Auto-banned {platformId}. Reason: {reason}");
 				_ = SendDiscordNow($":no_entry: Auto-banned {platformId}. Reason: {reason}");
             }
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[AntiCheat] Ban failed: {ex}");
+            LogS.LogError($"[ServerGuard] Ban failed: {ex}");
         }
     }
 
@@ -702,11 +708,11 @@ public class Plugin : BaseUnityPlugin
 
                 var pid = Plugin.GetPeerPlatformId(peer);
                 var pname = Plugin.GetPeerPlayerName(peer);
-                Plugin.LogS.LogInfo($"[AntiCheat] Incoming connection: {pname} ({pid})");
+                Plugin.LogS.LogInfo($"[ServerGuard] Incoming connection: {pname} ({pid})");
 
                 if (Plugin.Instance.IsAdmin(pid))
                 {
-                    Plugin.LogS.LogInfo($"[AntiCheat] {pid} is admin – skipping checks.");
+                    Plugin.LogS.LogInfo($"[ServerGuard] {pid} is admin – skipping checks.");
                     return;
                 }
 
@@ -717,7 +723,7 @@ public class Plugin : BaseUnityPlugin
                         if (!string.IsNullOrEmpty(matchedToken) &&
                             Plugin.Instance._ignoredModTokens.Contains(matchedToken))
                         {
-                            Plugin.LogS.LogInfo($"[AntiCheat] Detected mod token '{matchedToken}' but it is allowed (ignore list).");
+                            Plugin.LogS.LogInfo($"[ServerGuard] Detected mod token '{matchedToken}' but it is allowed (ignore list).");
                         }
                         else
                         {
@@ -733,7 +739,7 @@ public class Plugin : BaseUnityPlugin
             }
             catch (Exception ex)
             {
-                Plugin.LogS.LogError($"[AntiCheat] OnNewConnection error: {ex}");
+                Plugin.LogS.LogError($"[ServerGuard] OnNewConnection error: {ex}");
             }
         }
     }
@@ -754,7 +760,7 @@ public class Plugin : BaseUnityPlugin
 				var charName = Plugin.GetPeerPlayerName(peer)?.Trim();
 
 				// Only act if we truly have a SteamID + name
-				if (!IsValidSteamId(steamId)) { Plugin.LogS.LogWarning("[AntiCheat] PeerInfo without valid SteamID; deferring."); return; }
+				if (!IsValidSteamId(steamId)) { Plugin.LogS.LogWarning("[ServerGuard] PeerInfo without valid SteamID; deferring."); return; }
 				if (string.IsNullOrWhiteSpace(charName) || string.Equals(charName, "Unknown", StringComparison.OrdinalIgnoreCase)) return;
 
 				if (Plugin.Instance.IsAdmin(steamId)) return;
@@ -779,7 +785,7 @@ public class Plugin : BaseUnityPlugin
 				{
 					names.Add(charName);
 					Plugin.Instance.SaveRegistrations();
-					Plugin.LogS.LogInfo($"[AntiCheat] Registered character #{names.Count}/{limit} for {steamId} -> '{charName}'");
+					Plugin.LogS.LogInfo($"[ServerGuard] Registered character #{names.Count}/{limit} for {steamId} -> '{charName}'");
 				}
 				else
 				{
@@ -791,13 +797,13 @@ public class Plugin : BaseUnityPlugin
 					}
 					else
 					{
-						Plugin.LogS.LogWarning($"[AntiCheat] {steamId} exceeded character limit ({limit}). Tried '{charName}'. Allowed: {string.Join(", ", names)}");
+						Plugin.LogS.LogWarning($"[ServerGuard] {steamId} exceeded character limit ({limit}). Tried '{charName}'. Allowed: {string.Join(", ", names)}");
 					}
 				}
 			}
 			catch (Exception ex)
 			{
-				Plugin.LogS.LogError($"[AntiCheat] RPC_PeerInfo error: {ex}");
+				Plugin.LogS.LogError($"[ServerGuard] RPC_PeerInfo error: {ex}");
 			}
 		}
 	}
@@ -831,7 +837,7 @@ public class Plugin : BaseUnityPlugin
         }
 
         // Could not resolve
-        Plugin.LogS.LogWarning("[AntiCheat] ResolvePeerFromRpc: unable to resolve peer from ZRpc.");
+        Plugin.LogS.LogWarning("[ServerGuard] ResolvePeerFromRpc: unable to resolve peer from ZRpc.");
         return null;
     }
 
@@ -887,7 +893,7 @@ public class Plugin : BaseUnityPlugin
         }
         catch (Exception ex)
         {
-            LogS.LogWarning($"[AntiCheat] DetectLikelyModdedClient error: {ex.Message}");
+            LogS.LogWarning($"[ServerGuard] DetectLikelyModdedClient error: {ex.Message}");
         }
 
         return false;
@@ -898,6 +904,7 @@ public class Plugin : BaseUnityPlugin
 	{
 		private readonly string _webhook;
 		private readonly string _prefix;
+		private readonly string _allowedSourceName; // only forward logs from this source
 		private readonly System.Timers.Timer _flushTimer;
 		private readonly Queue<string> _buffer = new();
 		private static readonly HttpClient _http = new HttpClient();
@@ -905,10 +912,11 @@ public class Plugin : BaseUnityPlugin
 		private const int MaxDiscordLength = 2000;     // hard limit
 		private const int MaxPostLength    = 1800;     // leave headroom for formatting
 
-		public DiscordLogListener(string webhook, string prefixTag = "[ServerGuard]")
+		public DiscordLogListener(string webhook, string prefixTag, string allowedSourceName)
 		{
 			_webhook = webhook?.Trim();
 			_prefix  = string.IsNullOrWhiteSpace(prefixTag) ? "[ServerGuard]" : prefixTag.Trim();
+			_allowedSourceName = allowedSourceName ?? string.Empty;
 
 			_flushTimer = new System.Timers.Timer(2000); // flush every 2s
 			_flushTimer.AutoReset = true;
@@ -921,12 +929,16 @@ public class Plugin : BaseUnityPlugin
 			try
 			{
 				if (string.IsNullOrWhiteSpace(_webhook)) return;
+
+				// ✅ Filter: only accept logs from THIS plugin's ManualLogSource
+				var srcName = eventArgs.Source?.SourceName ?? string.Empty;
+				if (!string.Equals(srcName, _allowedSourceName, StringComparison.Ordinal))
+					return;
+
 				var lvl = eventArgs.Level.ToString().ToUpperInvariant();
-				var src = eventArgs.Source?.SourceName ?? "BepInEx";
 				var msg = eventArgs.Data?.ToString() ?? "";
 
-				// Single line to keep payload small
-				var line = $"{_prefix} [{lvl}] [{src}] {msg}".Trim();
+				var line = $"{_prefix} [{lvl}] {msg}".Trim();
 				lock (_buffer)
 				{
 					_buffer.Enqueue(line);
@@ -952,7 +964,6 @@ public class Plugin : BaseUnityPlugin
 			_isFlushing = true;
 			try
 			{
-				// Split into chunks under ~1800 chars
 				var chunk = new StringBuilder();
 				foreach (var line in batch)
 				{
@@ -980,11 +991,8 @@ public class Plugin : BaseUnityPlugin
 		private async Task PostAsync(string content)
 		{
 			if (string.IsNullOrWhiteSpace(content)) return;
-			var payload = new
-			{
-				content = content
-			};
-			var json = JsonConvert.SerializeObject(payload);
+			var payload = new { content };
+			var json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
 			using (var req = new StringContent(json, Encoding.UTF8, "application/json"))
 			{
 				await _http.PostAsync(_webhook, req);
@@ -1038,11 +1046,11 @@ public class Plugin : BaseUnityPlugin
             try
             {
                 reloadAction();
-                LogS.LogInfo($"[AntiCheat] Reloaded: {Path.GetFileName(path)}");
+                LogS.LogInfo($"[ServerGuard] Reloaded: {Path.GetFileName(path)}");
             }
             catch (Exception ex)
             {
-                LogS.LogError($"[AntiCheat] Reload failed for {Path.GetFileName(path)}: {ex.Message}");
+                LogS.LogError($"[ServerGuard] Reload failed for {Path.GetFileName(path)}: {ex.Message}");
             }
             finally
             {
