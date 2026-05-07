@@ -15,7 +15,7 @@ using System.Net.Http;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 
-[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.1.1")]
+[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.2.0")]
 public class Plugin : BaseUnityPlugin
 {
     internal static Plugin Instance;
@@ -33,6 +33,7 @@ public class Plugin : BaseUnityPlugin
     private static readonly string SettingsYaml      = Path.Combine(ConfDir, "settings.yaml");
     private static readonly string AdminsYaml        = Path.Combine(ConfDir, "admins.yaml");
     private static readonly string IgnoreModsYaml    = Path.Combine(ConfDir, "ignore_mods.yaml");
+    private static readonly string ModPatternsYaml   = Path.Combine(ConfDir, "mod_patterns.yaml");
     private static readonly string RegistrationsYaml = Path.Combine(ConfDir, "registrations.yaml");
     private static readonly string ViolationsYaml    = Path.Combine(ConfDir, "violations.yaml");
 
@@ -44,6 +45,7 @@ public class Plugin : BaseUnityPlugin
     private Settings _settings;
     private HashSet<string> _admins = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _ignoredModTokens = new(StringComparer.OrdinalIgnoreCase);
+    private ModPatterns _modPatterns;
 
     // SteamID -> CharacterID
     private Dictionary<string, List<string>> _registrations = new(StringComparer.OrdinalIgnoreCase);
@@ -58,7 +60,7 @@ public class Plugin : BaseUnityPlugin
 	private const string RULE_CHAR_NAME_LIMIT    = "CharacterNameLimitExceeded";
 
     // File watchers (hot-reload)
-    private FileSystemWatcher _watchSettings, _watchAdmins, _watchIgnore;
+    private FileSystemWatcher _watchSettings, _watchAdmins, _watchIgnore, _watchModPatterns;
     private readonly Dictionary<string, DateTime> _lastSeenWrite = new();
 
     // -------------- Data Models --------------
@@ -67,6 +69,7 @@ public class Plugin : BaseUnityPlugin
         public int  ViolationThreshold   { get; set; } = 3;   // attempts before auto-ban
         public bool Enforce              { get; set; } = true;
         public bool AggressiveNoModCheck { get; set; } = true;
+        public bool EnableAssemblyScanning { get; set; } = true; // NEW: check loaded assemblies
         public bool RequireAttestation   { get; set; } = false;
         public string KickMessage        { get; set; } = "You cannot join: server security policy violation. Contact an administrator.";
         public string BanReason          { get; set; } = "Auto-banned due to repeated security violations.";
@@ -83,6 +86,13 @@ public class Plugin : BaseUnityPlugin
     private class IgnoreModsDoc
     {
         public List<string> ignore_mods { get; set; } = new();
+    }
+
+    private class ModPatterns
+    {
+        public List<string> rpc_tokens { get; set; } = new();
+        public List<string> assembly_namespaces { get; set; } = new();
+        public List<string> version_keywords { get; set; } = new();
     }
 
     private class RegistrationsDoc
@@ -121,6 +131,7 @@ public class Plugin : BaseUnityPlugin
         LoadSettings();
         LoadAdmins();
         LoadIgnoreMods();
+        LoadModPatterns();
         LoadRegistrations();
         LoadViolations();
 
@@ -131,7 +142,7 @@ public class Plugin : BaseUnityPlugin
         _harmony = new Harmony("com.taeguk.valheim.serverguard");
         _harmony.PatchAll();
 
-        LogS.LogInfo($"[ServerGuard] Loaded (YAML). Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}");
+        LogS.LogInfo($"[ServerGuard] Loaded (YAML). Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}. Assembly scanning: {(_settings.EnableAssemblyScanning ? "ON" : "OFF")}");
 		
 		// Start log forwarding if webhook is present
 		if (!string.IsNullOrWhiteSpace(_settings.discordWebhookUrl))
@@ -257,6 +268,7 @@ public class Plugin : BaseUnityPlugin
 			sb.AppendLine("# ServerGuard settings");
 			sb.AppendLine("# discordWebhookUrl: paste the FULL Discord Webhook URL from: Channel Settings → Integrations → Webhooks");
 			sb.AppendLine("# discordChannelLink: optional, for your reference (e.g., https://discord.com/channels/<server>/<channel>)");
+			sb.AppendLine("# enableAssemblyScanning: enable/disable assembly namespace scanning for mod detection");
 			sb.AppendLine(_yamlOut.Serialize(defaults));
 			File.WriteAllText(SettingsYaml, sb.ToString());
 		}
@@ -278,6 +290,51 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("# Example entries: Jotunn, ServerSync");
             sb.AppendLine(_yamlOut.Serialize(doc));
             File.WriteAllText(IgnoreModsYaml, sb.ToString());
+        }
+
+        if (!File.Exists(ModPatternsYaml))
+        {
+            var doc = new ModPatterns
+            {
+                rpc_tokens = new List<string>
+                {
+                    "JVL", "Jotunn",
+                    "ServerSync",
+                    "BepInEx",
+                    "ValheimPlus",
+                    "Wonderlands",
+                    "Komrade",
+                    "EpicLoot",
+                    "Seasons",
+                    "CustomUI",
+                    "ModVer",
+                    "ModInfo"
+                },
+                assembly_namespaces = new List<string>
+                {
+                    "Jotunn",
+                    "ValheimPlus",
+                    "Wonderlands",
+                    "Komrade",
+                    "EpicLoot",
+                    "Seasons",
+                    "CustomUI"
+                },
+                version_keywords = new List<string>
+                {
+                    "mod",
+                    "modded",
+                    "custom",
+                    "patched"
+                }
+            };
+            var sb = new StringBuilder();
+            sb.AppendLine("# Mod detection patterns (Phase 1 & 2)");
+            sb.AppendLine("# rpc_tokens: RPC method name tokens that indicate mods");
+            sb.AppendLine("# assembly_namespaces: Assembly namespaces to flag as modded");
+            sb.AppendLine("# version_keywords: Keywords in version strings to flag mods");
+            sb.AppendLine(_yamlOut.Serialize(doc));
+            File.WriteAllText(ModPatternsYaml, sb.ToString());
         }
 
         if (!File.Exists(RegistrationsYaml))
@@ -337,6 +394,27 @@ public class Plugin : BaseUnityPlugin
         {
             LogS.LogError($"[ServerGuard] Failed to load ignore_mods.yaml: {ex.Message}");
             _ignoredModTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private void LoadModPatterns()
+    {
+        try
+        {
+            var text = File.ReadAllText(ModPatternsYaml);
+            _modPatterns = _yamlIn.Deserialize<ModPatterns>(text) ?? new ModPatterns();
+            
+            // Ensure lists are initialized
+            _modPatterns.rpc_tokens ??= new List<string>();
+            _modPatterns.assembly_namespaces ??= new List<string>();
+            _modPatterns.version_keywords ??= new List<string>();
+            
+            LogS.LogInfo($"[ServerGuard] mod_patterns.yaml loaded ({_modPatterns.rpc_tokens.Count} RPC tokens, {_modPatterns.assembly_namespaces.Count} namespaces)");
+        }
+        catch (Exception ex)
+        {
+            LogS.LogError($"[ServerGuard] Failed to load mod_patterns.yaml: {ex.Message}");
+            _modPatterns = new ModPatterns();
         }
     }
 
@@ -841,7 +919,7 @@ public class Plugin : BaseUnityPlugin
         return null;
     }
 
-    // -------------- No-mods Detection (best-effort, server-only) --------------
+    // -------------- PHASE 1: Enhanced RPC Token Detection + PHASE 2: Assembly Scanning --------------
     private bool DetectLikelyModdedClient(ZNetPeer peer, out string reason, out string matchedToken)
     {
         reason = null;
@@ -849,6 +927,7 @@ public class Plugin : BaseUnityPlugin
 
         try
         {
+            // ========== PHASE 1: RPC Token Detection (Enhanced) ==========
             var rpcField = peer.GetType().GetField("m_rpc", BindingFlags.Instance | BindingFlags.NonPublic);
             var rpc = rpcField?.GetValue(peer);
             if (rpc != null)
@@ -859,36 +938,57 @@ public class Plugin : BaseUnityPlugin
                 {
                     foreach (var name in methods.Keys)
                     {
-                        if (name.IndexOf("JVL", StringComparison.OrdinalIgnoreCase) >= 0)
+                        // Check against dynamic mod patterns
+                        if (_modPatterns?.rpc_tokens != null && _modPatterns.rpc_tokens.Count > 0)
                         {
-                            matchedToken = "Jotunn";
-                            reason = "RPC token matched: Jotunn/JVL";
-                            return true;
-                        }
-                        else if (name.IndexOf("ServerSync", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            matchedToken = "ServerSync";
-                            reason = "RPC token matched: ServerSync";
-                            return true;
-                        }
-                        else if (name.IndexOf("BepInEx", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            matchedToken = "BepInEx";
-                            reason = "RPC token matched: BepInEx";
-                            return true;
+                            foreach (var token in _modPatterns.rpc_tokens)
+                            {
+                                if (name.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    matchedToken = token;
+                                    reason = $"RPC token matched: {token}";
+                                    LogS.LogWarning($"[ServerGuard] Phase 1 detection (RPC): {reason} (method: {name})");
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
             }
 
+            // ========== PHASE 2: Assembly Namespace Scanning ==========
+            if (_settings.EnableAssemblyScanning)
+            {
+                var detectedMods = ScanPeerAssemblies(peer);
+                if (detectedMods.Count > 0)
+                {
+                    matchedToken = string.Join(", ", detectedMods);
+                    reason = $"Assembly namespaces detected: {matchedToken}";
+                    LogS.LogWarning($"[ServerGuard] Phase 2 detection (Assembly): {reason}");
+                    return true;
+                }
+            }
+
+            // ========== PHASE 1 (continued): Version String Inspection ==========
             var versionF = peer.GetType().GetField("m_playerVersion", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
             var verObj = versionF?.GetValue(peer);
             var verStr = verObj?.ToString() ?? string.Empty;
-            if (!string.IsNullOrEmpty(verStr) && verStr.IndexOf("mod", StringComparison.OrdinalIgnoreCase) >= 0)
+            
+            if (!string.IsNullOrEmpty(verStr))
             {
-                reason = $"Player version contains 'mod' token: {verStr}";
-                matchedToken = "GenericModVersion";
-                return true;
+                if (_modPatterns?.version_keywords != null && _modPatterns.version_keywords.Count > 0)
+                {
+                    foreach (var keyword in _modPatterns.version_keywords)
+                    {
+                        if (verStr.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            reason = $"Version string contains keyword '{keyword}': {verStr}";
+                            matchedToken = keyword;
+                            LogS.LogWarning($"[ServerGuard] Phase 1 detection (Version): {reason}");
+                            return true;
+                        }
+                    }
+                }
             }
         }
         catch (Exception ex)
@@ -897,6 +997,65 @@ public class Plugin : BaseUnityPlugin
         }
 
         return false;
+    }
+
+    // ========== NEW: Phase 2 Assembly Scanning Helper ==========
+    private List<string> ScanPeerAssemblies(ZNetPeer peer)
+    {
+        var detectedMods = new List<string>();
+
+        try
+        {
+            // Get the AppDomain to scan all loaded assemblies
+            var domain = AppDomain.CurrentDomain;
+            var loadedAssemblies = domain.GetAssemblies();
+
+            if (_modPatterns?.assembly_namespaces == null || _modPatterns.assembly_namespaces.Count == 0)
+                return detectedMods;
+
+            foreach (var assembly in loadedAssemblies)
+            {
+                try
+                {
+                    var assemblyName = assembly.GetName().Name ?? string.Empty;
+                    var types = assembly.GetTypes();
+
+                    foreach (var type in types)
+                    {
+                        try
+                        {
+                            var typeName = type.FullName ?? string.Empty;
+
+                            // Check against mod namespace patterns
+                            foreach (var nsPattern in _modPatterns.assembly_namespaces)
+                            {
+                                if (typeName.IndexOf(nsPattern, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    if (!detectedMods.Contains(nsPattern))
+                                    {
+                                        detectedMods.Add(nsPattern);
+                                    }
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore individual type scanning errors
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore individual assembly scanning errors
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] ScanPeerAssemblies error: {ex.Message}");
+        }
+
+        return detectedMods;
     }
 	
 	// ---------------- Discord Log Listener ----------------
@@ -1011,6 +1170,7 @@ public class Plugin : BaseUnityPlugin
         _watchSettings = MakeWatcher(SettingsYaml, () => LoadSettings());
         _watchAdmins   = MakeWatcher(AdminsYaml,   () => LoadAdmins());
         _watchIgnore   = MakeWatcher(IgnoreModsYaml, () => LoadIgnoreMods());
+        _watchModPatterns = MakeWatcher(ModPatternsYaml, () => LoadModPatterns());
     }
 
     private void StopWatchers()
@@ -1018,6 +1178,7 @@ public class Plugin : BaseUnityPlugin
         try { _watchSettings?.Dispose(); } catch { }
         try { _watchAdmins?.Dispose(); } catch { }
         try { _watchIgnore?.Dispose(); } catch { }
+        try { _watchModPatterns?.Dispose(); } catch { }
     }
 
     private FileSystemWatcher MakeWatcher(string filePath, Action reloadAction)
