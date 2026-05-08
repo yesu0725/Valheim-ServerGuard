@@ -1,4 +1,4 @@
-# 🚀 Valheim ServerGuard v1.3.0 - Step-by-Step Deployment Guide
+# 🚀 Valheim ServerGuard - Windows Server Deployment Guide
 
 ## Prerequisites
 
@@ -6,7 +6,6 @@ Before starting, ensure you have:
 - ✅ Valheim Dedicated Server installed on your computer (from Steam)
 - ✅ .NET SDK 6.0 or higher installed ([Download here](https://dotnet.microsoft.com/en-us/download))
 - ✅ Visual Studio Code or Visual Studio installed (optional, but recommended)
-- ✅ Git installed (optional, for cloning the repo)
 
 ---
 
@@ -93,20 +92,16 @@ C:\Program Files (x86)\Steam\steamapps\dedicated_servers\valheim_server\
 
 ## 🔧 Step 3: Build ServerGuard Plugin
 
-### Step 1: Open the Project
+### Step 1: Open Command Prompt
 
 1. Navigate to where you downloaded ServerGuard
-2. Look for `Plugin.cs` in the root folder
-
-### Step 2: Prepare the Build Environment
-
-Open **Command Prompt** or **PowerShell** in the ServerGuard folder:
+2. Open **Command Prompt** or **PowerShell** in the folder
 
 ```bash
 cd C:\Valheim-ServerGuard
 ```
 
-### Step 3: Install Dependencies
+### Step 2: Install Dependencies
 
 Run this command to restore required packages:
 
@@ -119,7 +114,7 @@ dotnet restore
 Restore completed in X.XXs
 ```
 
-### Step 4: Build the Plugin
+### Step 3: Build the Plugin
 
 ```bash
 dotnet build -c Release
@@ -143,14 +138,15 @@ After building, you need to copy the plugin files to your server.
 
 ### Step 1: Locate the Built Files
 
-The compiled DLL should be in:
+The compiled files should be in:
 ```
-C:\Valheim-ServerGuard\bin\Release\
+C:\Valheim-ServerGuard\bin\Release\net6.0\
 ```
 
 Look for files named:
-- `Plugin.dll` (or similar)
-- Required dependencies (see below)
+- `Plugin.dll` (or the plugin assembly name)
+- `YamlDotNet.dll`
+- `Newtonsoft.Json.dll`
 
 ### Step 2: Copy to BepInEx Plugins Folder
 
@@ -190,9 +186,9 @@ valheim_server.exe
 
 **Expected output in console:**
 ```
-[ServerGuard] Loaded (v1.3.0). Enforcement: ON. Mode: BLOCKLIST...
+[ServerGuard] Loaded (YAML). Enforcement: ON
 [ServerGuard] settings.yaml loaded
-[ServerGuard] mod_patterns.yaml loaded
+[ServerGuard] admins.yaml loaded
 ```
 
 ✅ If you see these messages, ServerGuard started successfully!
@@ -207,12 +203,9 @@ Check if these files were auto-created:
 BepInEx/config/ServerGuard/conf/
 ├── settings.yaml              ← Main settings
 ├── admins.yaml               ← Admin whitelist
-├── ignore_mods.yaml          ← Mods to allow/block
-├── mod_patterns.yaml         ← 35+ mod tokens
+├── ignore_mods.yaml          ← Allowed mod tokens
 ├── registrations.yaml        ← Character tracking
-├── violations.yaml           ← Violation log
-├── metrics.yaml              ← Statistics
-└── README-MOD-PATTERNS.md    ← Documentation
+└── violations.yaml           ← Violation log
 ```
 
 ✅ All files should be present!
@@ -234,7 +227,7 @@ Open with **Notepad** or your favorite text editor.
 
 ### Step 2: Configure Settings
 
-Modify these key settings:
+The file contains these key settings:
 
 ```yaml
 # Enable/disable enforcement
@@ -246,31 +239,25 @@ ViolationThreshold: 3
 # Enable mod detection
 AggressiveNoModCheck: true
 
-# Enable Phase 2 assembly scanning (turn off if server lags)
-EnableAssemblyScanning: true
+# Character limit per SteamID (default: 1)
+CharacterLimit: 1
 
-# Track detection statistics
-EnableMetrics: true
-
-# Switch between blocklist (false) and whitelist (true)
-UseWhitelistMode: false
-
-# Optional: Discord webhook for alerts
+# Discord webhook URL (optional)
 discordWebhookUrl: ""
 
-# Character limit per SteamID
-CharacterLimit: 1
+# Kick message when player violates rules
+kickMessage: "You cannot join: server security policy violation. Contact an administrator."
+
+# Ban reason when threshold exceeded
+banReason: "Auto-banned due to repeated security violations."
 ```
 
 **Recommended starting config (Vanilla-only):**
 ```yaml
 Enforce: true
 AggressiveNoModCheck: true
-EnableAssemblyScanning: true
-EnableMetrics: true
-UseWhitelistMode: false
-CharacterLimit: 1
 ViolationThreshold: 3
+CharacterLimit: 1
 discordWebhookUrl: ""
 ```
 
@@ -293,30 +280,20 @@ Open with **Notepad**.
 
 ### Step 2: Add Allowed Mods
 
-The file will look like:
+For **vanilla-only server**, leave default:
 ```yaml
 ignore_mods:
   - Jotunn
   - ServerSync
 ```
 
-**For Blocklist Mode (vanilla-only):**
+For **modded server**, add mods you allow:
 ```yaml
-# These mods are ALLOWED
-ignore_mods:
-  - Jotunn
-  - ServerSync
-```
-
-**For Whitelist Mode (mod pack):**
-```yaml
-# ONLY these mods are ALLOWED
 ignore_mods:
   - Jotunn
   - ServerSync
   - ValheimPlus
   - PlanBuild
-  - EquipmentAndQuickSlots
 ```
 
 ### Step 3: Save
@@ -400,10 +377,10 @@ valheim_server.exe
 
 Look for messages like:
 ```
-[ServerGuard] Loaded (v1.3.0). Enforcement: ON. Mode: BLOCKLIST...
+[ServerGuard] Loaded (YAML). Enforcement: ON
 [ServerGuard] settings.yaml loaded
-[ServerGuard] ignore_mods.yaml loaded (2 tokens)
-[ServerGuard] mod_patterns.yaml loaded (35 RPC tokens, 20 namespaces)
+[ServerGuard] admins.yaml loaded
+[ServerGuard] ignore_mods.yaml loaded
 ```
 
 ✅ If you see these, ServerGuard is working!
@@ -417,44 +394,38 @@ Look for messages like:
 
 ### Step 4: Test with Modded Client (Optional)
 
-1. Install a mod (e.g., Jotunn) on your client
+1. Install a mod on your client
 2. Try to join your server
-3. **You should be kicked** (if Jotunn not in allowlist) ❌ or **allowed** ✅ (if in allowlist)
+3. **You should be kicked** (if mod not allowed) or **allowed** (if in ignore list)
 
 ---
 
 ## 📊 Step 11: Monitor Your Server
 
-### Step 1: Check Metrics
+### Check Violations
 
 After running the server, check:
-```
-BepInEx/config/ServerGuard/conf/metrics.yaml
-```
-
-You should see stats like:
-```yaml
-total_players_checked: 5
-total_mods_detected: 0
-phase1_rpc_detections: 0
-admin_bypasses: 1
-```
-
-### Step 2: Check Discord (if configured)
-
-Your Discord channel should show:
-- Player connections
-- Violations
-- Admin bypasses
-- Auto-bans
-
-### Step 3: Check Violation Log
-
 ```
 BepInEx/config/ServerGuard/conf/violations.yaml
 ```
 
-Should show any rule violations.
+You should see any rule violations recorded.
+
+### Check Discord (if configured)
+
+Your Discord channel should show:
+- Player connections
+- Violations
+- Auto-bans
+
+### Check Server Logs
+
+Open:
+```
+BepInEx/LogOutput.log
+```
+
+Contains detailed ServerGuard activity.
 
 ---
 
@@ -474,14 +445,6 @@ Should show any rule violations.
 3. Save
 4. **Changes apply immediately** - no restart needed!
 
-### Switch to Whitelist Mode
-
-1. Edit `settings.yaml`
-2. Change: `UseWhitelistMode: true`
-3. Edit `ignore_mods.yaml` - now only list allowed mods
-4. Save
-5. **Done!** Mode switches instantly.
-
 ### Disable a Player
 
 1. Edit `violations.yaml`
@@ -492,15 +455,6 @@ Should show any rule violations.
    ```
 3. Save
 4. They'll be auto-banned on next connection
-
-### Check Server Logs
-
-Open:
-```
-BepInEx/LogOutput.log
-```
-
-Contains detailed ServerGuard activity.
 
 ---
 
@@ -524,40 +478,21 @@ Contains detailed ServerGuard activity.
 
 **Solution:**
 1. Confirm `Plugin.dll` exists in plugins folder
-2. Check BepInEx is properly installed
+2. Check BepInEx is properly installed (run server once)
 3. Look for error messages in `BepInEx/LogOutput.log`
-4. Ensure the DLL isn't corrupted - rebuild it
+4. Ensure no file path typos
 
 ---
 
-### Problem: False Positives (Vanilla Clients Kicked)
-
-**Error:** Vanilla players getting kicked
-
-**Solution:**
-1. Set `Enforce: false` temporarily
-2. Let it run for a few hours
-3. Check `metrics.yaml` for what's triggering
-4. Remove that pattern from `mod_patterns.yaml`
-5. Re-enable: `Enforce: true`
-
----
-
-### Problem: Server Performance Degrades
+### Problem: Server Performance Issues
 
 **Error:** Server gets laggy after ServerGuard starts
 
 **Solution:**
-1. Disable Phase 2 assembly scanning:
-   ```yaml
-   EnableAssemblyScanning: false
-   ```
-2. Disable metrics:
-   ```yaml
-   EnableMetrics: false
-   ```
-3. Restart server
-4. Check if lag resolves
+1. Check `BepInEx/LogOutput.log` for errors
+2. Verify mod detection settings in `settings.yaml`
+3. Try disabling Discord logging temporarily
+4. Check system resources (CPU, RAM)
 
 ---
 
@@ -567,13 +502,13 @@ Contains detailed ServerGuard activity.
 - [ ] ServerGuard Plugin.dll copied to `BepInEx/plugins/ServerGuard/`
 - [ ] YamlDotNet.dll and Newtonsoft.Json.dll also copied
 - [ ] Server started once to generate config files
-- [ ] `settings.yaml` configured
+- [ ] `settings.yaml` configured with desired settings
 - [ ] `ignore_mods.yaml` configured with allowed mods
-- [ ] `admins.yaml` has your SteamID
-- [ ] Discord webhook added (optional)
+- [ ] `admins.yaml` has admin SteamIDs (optional)
+- [ ] Discord webhook added to settings (optional)
 - [ ] Server started successfully with ServerGuard messages
-- [ ] Vanilla client can join
-- [ ] `metrics.yaml` is updating
+- [ ] Vanilla client can join successfully
+- [ ] `violations.yaml` exists and is empty (before testing)
 
 ---
 
@@ -582,18 +517,18 @@ Contains detailed ServerGuard activity.
 Your Valheim ServerGuard is now deployed and protecting your server! 🚀
 
 **Next Steps:**
-1. **Monitor** - Watch metrics and Discord for violations
-2. **Tune** - Adjust mod patterns based on your community
-3. **Enforce** - Keep vanilla-only or whitelist specific mods
-4. **Share** - Tell your players about your mod policy
+1. **Monitor** - Watch violations in YAML and Discord
+2. **Tune** - Adjust settings based on your community
+3. **Enforce** - Decide on vanilla-only or mod-friendly policy
+4. **Communicate** - Tell your players about the security policy
 
 ---
 
 ## 📞 Need Help?
 
-- **GitHub Issues:** https://github.com/yesu0725/Valheim-ServerGuard/issues
-- **Check Logs:** `BepInEx/LogOutput.log`
-- **Review Guide:** `BepInEx/config/ServerGuard/conf/README-MOD-PATTERNS.md`
+- **GitHub Repository:** https://github.com/yesu0725/Valheim-ServerGuard
+- **Check Server Logs:** `BepInEx/LogOutput.log`
+- **Review Config:** `BepInEx/config/ServerGuard/conf/`
 
 ---
 
