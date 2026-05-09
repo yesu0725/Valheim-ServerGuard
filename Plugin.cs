@@ -16,7 +16,7 @@ using System.Threading.Tasks;
 using Newtonsoft.Json;
 
 [BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.3.0")]
-public class Plugin : BaseUnityLogger
+public class Plugin : BaseUnityPlugin
 {
     internal static Plugin Instance;
     internal static ManualLogSource LogS;
@@ -800,7 +800,7 @@ For questions or contributions, open an issue on GitHub!
             _modPatterns.assembly_namespaces ??= new List<string>();
             _modPatterns.version_keywords ??= new List<string>();
             
-            LogS.LogInfo($"[ServerGuard] mod_patterns.yaml loaded ({_modPatterns.rpc_tokens.Count} RPC tokens, {_modPatterns.assembly_namespaces.Count} namespaces, {_modPatterns.version_keywords.Count} version keywords)");
+            LogS.LogInfo($"[ServerGuard] mod_patterns.yaml loaded ({_modPatterns.rpc_tokens.Count} RPC tokens, {_modPatterns.assembly_namespaces.Count} namespaces, {_modPatterns.version_keywords.Count} keywords)");
         }
         catch (Exception ex)
         {
