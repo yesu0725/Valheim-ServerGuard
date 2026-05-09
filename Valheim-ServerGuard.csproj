@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <AssemblyName>Valheim-ServerGuard</AssemblyName>
+    <RootNamespace>ValheimServerGuard</RootNamespace>
+    <Version>1.2.0</Version>
+    <Description>Valheim Server Guard - Anti-cheat and security mod for Valheim servers</Description>
+    <Authors>yesu0725</Authors>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BepInEx -->
+    <PackageReference Include="BepInEx.Core" Version="5.4.22" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="1.1.0" />
+    
+    <!-- Harmony for patching -->
+    <PackageReference Include="HarmonyX" Version="2.10.1" />
+    
+    <!-- YAML parsing -->
+    <PackageReference Include="YamlDotNet" Version="12.3.1" />
+    
+    <!-- JSON parsing -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Reference Valheim assemblies (you may need to adjust paths based on your Valheim installation) -->
+    <Reference Include="UnityEngine">
+      <HintPath>$(VALHEIM_PATH)\valheim_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="assembly_valheim">
+      <HintPath>$(VALHEIM_PATH)\valheim_Data\Managed\assembly_valheim.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="assembly_utils">
+      <HintPath>$(VALHEIM_PATH)\valheim_Data\Managed\assembly_utils.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
