@@ -1,547 +1,271 @@
-# 📖 Valheim ServerGuard v1.3.0 - Comprehensive Configuration Guide
+# Valheim ServerGuard
 
-## 🎯 What is Valheim ServerGuard?
+Lock your Valheim dedicated server to a specific list of mods. Vanilla and wrong-modpack players are automatically kicked.
 
-Valheim ServerGuard is a **BepInEx plugin** that enforces no-mods policies on your Valheim server. It uses **hybrid detection** with:
-
-- **Phase 1:** RPC Token + Version Keyword Detection
-- **Phase 2:** Assembly Namespace Scanning (optional)
-- **Metrics:** Real-time detection statistics
-- **Whitelist/Blocklist Modes:** Flexible enforcement policies
+It works because every player runs a small companion plugin that tells the server exactly which mods they have loaded — signed with a shared password so it can't be faked. The server compares the list to your allowlist and decides whether to let them in.
 
 ---
 
-## 📋 Quick Start
+## What you need
 
-### 1. Install ServerGuard
-- Download the latest release
-- Place `Plugin.cs` in `BepInEx/plugins/ServerGuard/`
-- Start your server once to generate config files
+You'll be installing **two files**:
 
-### 2. Configure
-Edit `BepInEx/config/ServerGuard/conf/settings.yaml`:
+- **`Valheim-ServerGuard.dll`** → goes on your **server** (you, the host)
+- **`Valheim-ServerGuard-Client.dll`** → goes on **every player's** Valheim install (you and your friends)
 
-```yaml
-enforce: true                  # Enable enforcement
-aggressiveNoModCheck: true     # Enable mod detection
-useWhitelistMode: false        # Blocklist mode (default)
-enableMetrics: true            # Track statistics
-discordWebhookUrl: ""          # Optional: Discord logging
-```
-
-### 3. Manage Mods
-Edit `BepInEx/config/ServerGuard/conf/ignore_mods.yaml`:
-
-```yaml
-# Blocklist mode: mods you ALLOW
-ignore_mods:
-  - Jotunn
-  - ServerSync
-```
-
-### 4. Run & Monitor
-- Watch `metrics.yaml` for detection statistics
-- Check Discord for violations (if webhook configured)
-- Adjust patterns in `mod_patterns.yaml` based on results
+Players who don't install the client file get kicked when they try to join. That's the whole point.
 
 ---
 
-## ⚙️ Configuration Files
+## Quick setup (5 minutes)
 
-### settings.yaml
-Main plugin settings and enforcement policy.
+### Step 1 — Server side
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `Enforce` | bool | true | Enable/disable kicks and bans |
-| `ViolationThreshold` | int | 3 | Violations before auto-ban |
-| `AggressiveNoModCheck` | bool | true | Enable mod detection |
-| `EnableAssemblyScanning` | bool | true | Enable Phase 2 (expensive) |
-| `EnableMetrics` | bool | true | Track detection statistics |
-| `UseWhitelistMode` | bool | false | Allowlist instead of blocklist |
-| `CharacterLimit` | int | 1 | Max characters per SteamID |
-| `KickMessage` | string | "..." | Custom kick message |
-| `BanReason` | string | "..." | Custom ban reason |
-| `discordWebhookUrl` | string | "" | Discord webhook URL |
-| `discordChannelLink` | string | "" | Human-friendly channel reference |
-
----
-
-## 🛡️ Blocklist vs Whitelist Mode
-
-### Blocklist Mode (Default)
-```yaml
-# settings.yaml
-useWhitelistMode: false
-```
-
-**Behavior:** Block ALL mods except those listed
-
-```yaml
-# ignore_mods.yaml
-ignore_mods:
-  - Jotunn          # ✅ ALLOWED
-  - ServerSync      # ✅ ALLOWED
-  # ValheimPlus NOT listed → ❌ BLOCKED
-```
-
-**When to use:** Vanilla-only servers with minor QoL exceptions
-
----
-
-### Whitelist Mode (NEW)
-```yaml
-# settings.yaml
-useWhitelistMode: true
-```
-
-**Behavior:** Allow ONLY mods listed (everything else blocked)
-
-```yaml
-# ignore_mods.yaml
-ignore_mods:
-  - Jotunn                    # ✅ ALLOWED
-  - ServerSync                # ✅ ALLOWED
-  - EquipmentAndQuickSlots    # ✅ ALLOWED
-  # ValheimPlus NOT listed → ❌ BLOCKED
-```
-
-**When to use:** Curated mod pack servers with specific approved mods
-
----
-
-## 📊 Metrics & Statistics
-
-### metrics.yaml
-Auto-updated detection statistics (if `enableMetrics: true`).
-
-```yaml
-total_players_checked: 127
-total_mods_detected: 34
-phase1_rpc_detections: 28
-phase2_assembly_detections: 5
-version_keyword_detections: 1
-allowlist_bypasses: 8
-admin_bypasses: 3
-violations_issued: 12
-players_banned: 1
-top_detected_mods:
-  Jotunn: 12
-  ValheimPlus: 8
-  ServerSync: 7
-  PlanBuild: 5
-last_updated: 2026-05-07T18:00:00Z
-```
-
-**How to use:**
-- **track trends** - See which mods appear most
-- **tune patterns** - Add frequently-missed mods to `mod_patterns.yaml`
-- **analyze false positives** - Identify mods being incorrectly flagged
-
----
-
-## 🔍 Mod Patterns Configuration
-
-### mod_patterns.yaml
-
-Three detection pattern types work together:
-
-#### 1. RPC Tokens (Phase 1)
-```yaml
-rpc_tokens:
-  - JVL              # Jotunn framework
-  - ServerSync       # Config sync
-  - ValheimPlus      # QoL mod
-  - MyCustomMod      # Your mod token
-```
-
-**What it does:** Checks if player's RPC method names contain these strings
-
-**How to find tokens:**
-1. Look at mod's source code on GitHub
-2. Search for `RegisterRPC()` or `AddRPC()`
-3. Check the method prefix (e.g., "JVL_MyMethod" → token is "JVL")
-4. Test: enable mod locally, check ServerGuard logs for detected tokens
-
-**Performance:** ⚡ Very fast (O(n) string matching)
-
----
-
-#### 2. Assembly Namespaces (Phase 2)
-```yaml
-assembly_namespaces:
-  - Jotunn           # Jotunn.Core.*, Jotunn.Managers.*
-  - ValheimPlus      # ValheimPlus.*, ValheimPlus.*
-  - MyMod            # MyMod.*, MyMod.Patches.*
-```
-
-**What it does:** Scans all loaded .NET assemblies for types in these namespaces
-
-**When it runs:**
-- After Phase 1 (only if Phase 1 finds nothing)
-- Optional - toggle with `enableAssemblyScanning: true/false`
-
-**When to use:**
-- Catching mods that hide their RPC tokens
-- Strict vanilla-only enforcement
-
-**Performance:** ⚠️ Expensive (reflection overhead)
-- Disable for performance: `enableAssemblyScanning: false`
-- Enable for strict enforcement: `enableAssemblyScanning: true`
-
----
-
-#### 3. Version Keywords (Phase 1)
-```yaml
-version_keywords:
-  - mod
-  - modded
-  - custom
-  - patched
-  - enhanced
-  - unofficial
-```
-
-**What it does:** Checks player version string for these keywords
-
-**Example:**
-```
-Player version: "0.217.46-modded"      → Keyword "modded" detected ✅
-Player version: "0.217.46-custom"      → Keyword "custom" detected ✅
-Player version: "0.217.46"             → No keywords detected ✅
-```
-
-**Performance:** ⚡ Very fast (string search)
-
----
-
-## 📝 Default Mod Tokens
-
-### Framework Mods
-- `JVL` / `Jotunn` - Mod framework
-- `ServerSync` - Config synchronization
-- `BepInEx` - BepInEx framework
-- `ModVer` / `ModInfo` - Mod detection
-
-### Quality of Life
-- `ValheimPlus` - Many QoL features
-- `EquipmentAndQuickSlots` - Quick slots
-- `ImprovedUI` - UI enhancements
-- `Quickslots` - Item quick access
-
-### Building & Decoration
-- `PlanBuild` - Plan placement
-- `BuildCamera` - Build camera
-- `GizmoRotate` - Rotation tool
-
-### Gameplay Enhancement
-- `Wonderlands` - World generation
-- `Komrade` - Co-op features
-- `EpicLoot` - Loot system
-- `Seasons` - Season system
-- `CustomUI` - UI customization
-- `CreatureAbilityReworks` - Combat changes
-
-### Progression
-- `MaserySystem` - Mastery progression
-- `Experience` - XP system
-- `SkillTree` - Skill trees
-
-### And 15+ more...
-
----
-
-## 🚀 Example Configurations
-
-### Configuration 1: Vanilla-Only Server
-Strict - only essential QoL allowed
-
-```yaml
-# settings.yaml
-enforce: true
-aggressiveNoModCheck: true
-useWhitelistMode: false
-enableAssemblyScanning: true
-enableMetrics: true
-
-# ignore_mods.yaml
-ignore_mods:
-  - Jotunn
-  - ServerSync
-```
-
-**Result:** 
-- ✅ Jotunn/ServerSync clients allowed
-- ❌ ValheimPlus, PlanBuild, EpicLoot blocked
-- 📊 Metrics track all violations
-
----
-
-### Configuration 2: Curated Mod Pack Server
-Whitelist mode with specific approved mods
-
-```yaml
-# settings.yaml
-enforce: true
-useWhitelistMode: true
-enableAssemblyScanning: false
-
-# ignore_mods.yaml (ONLY these allowed)
-ignore_mods:
-  - Jotunn
-  - ServerSync
-  - ValheimPlus
-  - PlanBuild
-  - EquipmentAndQuickSlots
-  - MinimapAssistant
-```
-
-**Result:**
-- ✅ ONLY listed mods allowed
-- ❌ Any other mod blocked
-- 🎯 Perfect for modded servers with specific packs
-
----
-
-### Configuration 3: Development/Testing Server
-Permissive - log violations without enforcement
-
-```yaml
-# settings.yaml
-enforce: false
-aggressiveNoModCheck: true
-enableMetrics: true
-enableAssemblyScanning: false
-discordWebhookUrl: "your-webhook-url"
-
-# ignore_mods.yaml
-ignore_mods: []
-```
-
-**Result:**
-- 📋 Log all mod detections without kicking
-- 📊 Track statistics for tuning
-- 🔔 Discord alerts for analysis
-
----
-
-## 🔧 Customizing Patterns
-
-### Add a New Mod Token
-
-1. **Find the mod's RPC token:**
-   - Check GitHub repo for `RegisterRPC()` or `AddRPC()`
-   - Example: `rpc.Register("MyMod_DoSomething")`  → token is `MyMod`
-
-2. **Edit `mod_patterns.yaml`:**
+1. Copy `Valheim-ServerGuard.dll` into your server's `BepInEx/plugins/` folder.
+2. Start your server **once** and let it boot (about 30 seconds), then stop it.
+3. ServerGuard creates a config folder at `BepInEx/config/ServerGuard/conf/` and **auto-generates a password** (called `sharedSecret`) for you.
+4. Open `BepInEx/config/ServerGuard/conf/settings.yaml` and **copy the `sharedSecret:` line**. It looks like:
    ```yaml
-   rpc_tokens:
-     - JVL
-     - ServerSync
-     - MyMod        # ← Add your token
+   sharedSecret: 'ftnNxBse+Lx2H41ixsTJ637CFffq58C5rrvwwXrabYU='
+   ```
+   You'll need to give this exact value to every player.
+
+### Step 2 — Each player (including you, on your gaming PC)
+
+1. Copy `Valheim-ServerGuard-Client.dll` into the player's `BepInEx/plugins/` folder. With r2modman, this means dragging it into the active profile.
+2. Launch Valheim **once**. Wait until the main menu appears, then close the game.
+3. Open `BepInEx/config/ServerGuard/client.yaml` and paste the password the server gave you:
+   ```yaml
+   sharedSecret: "ftnNxBse+Lx2H41ixsTJ637CFffq58C5rrvwwXrabYU="
    ```
 
-3. **Save & reload:**
-   - Changes auto-reload (watch for "Reloaded: mod_patterns.yaml" in logs)
-   - No server restart needed!
+### Step 3 — Build the allowlist (one player does this once)
 
-4. **Verify:**
-   - Check `metrics.yaml` for `top_detected_mods`
-   - Confirm new mod appears in statistics
-
----
-
-### Add a New Assembly Namespace
-
-1. **Find the mod's namespace:**
-   - Check GitHub or mod DLL with dotPeek/ILSpy
-   - Example: `namespace ValheimPlusModified { ... }` → namespace is `ValheimPlusModified`
-
-2. **Edit `mod_patterns.yaml`:**
-   ```yaml
-   assembly_namespaces:
-     - Jotunn
-     - ValheimPlus
-     - ValheimPlusModified    # ← Add your namespace
+1. Have one trusted player (with the full modpack installed) launch Valheim once. The companion plugin writes a file at:
    ```
-
-3. **Enable Phase 2:**
-   ```yaml
-   # settings.yaml
-   enableAssemblyScanning: true
+   BepInEx/config/ServerGuard/mods_for_allowed_mods.yaml
    ```
+2. Open that file. It contains a ready-to-paste list of every mod they have loaded.
+3. Copy its contents and **paste them over** the `required_mods:`, `allowed_mods:`, and `banned_mods:` sections in the server's `BepInEx/config/ServerGuard/conf/allowed_mods.yaml`.
+4. Save. The server picks up the change in about 1 second — no restart needed.
 
-4. **Test & verify**
+### Step 4 — Connect
 
----
+Players join the server normally. The server log (in `BepInEx/LogOutput.log`) will show a line like this for each successful connection:
 
-## 📊 Reading Metrics
-
-### Common Patterns
-
-**Most detections from Phase 1 (RPC)?**
-```yaml
-phase1_rpc_detections: 28
-phase2_assembly_detections: 5
 ```
-→ RPC token detection working well, Phase 2 rarely needed
-
-**High Phase 2 detections?**
-```yaml
-phase1_rpc_detections: 5
-phase2_assembly_detections: 25
+[Info: Valheim ServerGuard] [ServerGuard] 76561198xxxxxxxxx attested OK (29 mods).
 ```
-→ Some mods hide RPC tokens; Phase 2 necessary for enforcement
 
-**New mods appearing?**
-```yaml
-top_detected_mods:
-  UnknownMod: 3
+If someone gets kicked, the log will say exactly why:
+
 ```
-→ Add "UnknownMod" to patterns or allowlist
+[Warning: Valheim ServerGuard] [ServerGuard] 76561198xxxxxxxxx REJECTED: DisallowedMod - Unapproved mod: <name>
+```
+
+That's the whole setup. **Everything else has sensible defaults.** The rest of this document is only relevant if you want to customize behavior.
 
 ---
 
-## 🐛 Troubleshooting
+# Advanced
 
-### False Positive: Vanilla clients kicked
-**Symptom:** "You cannot join: server security policy violation"
+Stop reading here unless something doesn't work or you want to change defaults.
 
-**Solution:**
-1. Run in log-only mode:
-   ```yaml
-   enforce: false
-   ```
-2. Check logs for what triggered it
-3. If version keyword: disable or customize
-   ```yaml
-   version_keywords: []  # Disable version checks
-   ```
-4. If RPC token: remove from patterns or whitelist
-5. If assembly: disable Phase 2
-   ```yaml
-   enableAssemblyScanning: false
-   ```
+## How the protection actually works
 
----
+```
+1. Player connects.
+2. Server sends a one-time random "challenge" to the player's companion plugin.
+3. Companion replies with: a list of every mod loaded, the challenge, a timestamp,
+   and a fingerprint (HMAC) computed using the shared password.
+4. Server verifies:
+     - the fingerprint matches (so the list wasn't tampered with),
+     - the challenge matches (so it's not a replayed message),
+     - the timestamp is recent,
+     - every mod is in the allowlist,
+     - no banned mods are present,
+     - all required mods are present.
+5. If anything fails, the player is kicked with a clear reason.
+6. If the companion plugin doesn't reply within 10 seconds, the player is kicked
+   for not having the companion plugin installed (vanilla clients fall here).
+```
 
-### False Negative: Modded client passes through
-**Symptom:** Known modded client joins without violation
+## All configuration files
 
-**Solution:**
-1. Check logs for client's RPC tokens
-2. Add missing token to `mod_patterns.yaml`
-3. Check metrics for the mod name:
-   ```yaml
-   top_detected_mods:
-     HiddenMod: 0  # Not in patterns
-   ```
-4. If assembly-based: enable Phase 2
-   ```yaml
-   enableAssemblyScanning: true
-   ```
+All on the server, under `BepInEx/config/ServerGuard/conf/`. Edits are picked up live (no restart needed) for `settings.yaml`, `admins.yaml`, and `allowed_mods.yaml`.
 
----
+| File | What it does |
+|---|---|
+| `settings.yaml` | Main switches and the shared password. |
+| `admins.yaml` | Steam IDs that bypass the mod check entirely. |
+| `allowed_mods.yaml` | The required / allowed / banned mod lists. |
+| `registrations.yaml` | Auto-managed: which character names each Steam ID has used. |
+| `violations.yaml` | Auto-managed: how many times each Steam ID has been rejected. |
+| `metrics.yaml` | Auto-managed: connection / detection counters. |
 
-### Performance Issues
-**Symptom:** Server lag after ServerGuard starts
+On every player's PC, only one file matters: `BepInEx/config/ServerGuard/client.yaml`, which holds the shared password.
 
-**Solution:**
-1. Disable Phase 2 assembly scanning:
-   ```yaml
-   enableAssemblyScanning: false
-   ```
-2. Disable metrics (minor impact):
-   ```yaml
-   enableMetrics: false
-   ```
-3. Disable Discord logging temporarily:
-   ```yaml
-   discordWebhookUrl: ""
-   ```
+## settings.yaml — every option
 
----
+| Option | Default | What it does |
+|---|---|---|
+| `enforce` | `true` | If `false`, kicks are logged but never executed. Use for dry-run testing. |
+| `violationThreshold` | `3` | After this many rejected connections of the same kind, the player is auto-banned. |
+| `kickMessage` | (built-in) | Message shown when a player is kicked. The specific reason is appended automatically. |
+| `banReason` | (built-in) | Reason recorded when an auto-ban triggers. |
+| `characterLimit` | `1` | Maximum number of distinct character names a single Steam ID can use on this server. |
+| `requireCompanion` | `true` | If `true`, players without the client plugin are kicked on timeout. Set to `false` to allow vanilla connections. |
+| `companionTimeoutSeconds` | `10` | How long the server waits for the manifest to arrive before declaring no-companion. |
+| `requireHmac` | `true` | If `true`, every manifest must be signed with the shared password. Strongly recommended. |
+| `sharedSecret` | (auto-generated) | The shared password. Auto-created on first launch. Must match `client.yaml` on every player. |
+| `allowUnlisted` | `false` | If `false`, every mod a player runs must be in `allowed_mods` or `required_mods`. If `true`, unknown mods are tolerated. |
+| `maxClockSkewSeconds` | `120` | Reject manifests whose clock is more than this many seconds off from the server's. |
+| `logPeerManifest` | `false` | If `true`, the server logs the full mod list of every connecting player. Useful for collecting plugin GUIDs to add to the allowlist. Turn off afterward — it's noisy. |
+| `enableMetrics` | `true` | Track connection / detection counters in `metrics.yaml`. |
+| `discordWebhookUrl` | `""` | If set, kicks/bans/violations are also posted to a Discord channel via webhook. |
+| `discordChannelLink` | `""` | Free-form note for your reference. Not used by the plugin. |
 
-## 📝 Admin Whitelist
+## allowed_mods.yaml — format
 
-Admins bypass ALL checks:
+Three sections. Each entry is either `GUID` or `GUID|hash`.
 
 ```yaml
-# admins.yaml
+required_mods:
+  - com.taeguk.valheim.serverguard.client    # the companion itself - leave this in
+  # - com.azu.anticheat                       # require AzuAntiCheat too, etc.
+
+allowed_mods:
+  - com.jotunn.jotunn                                          # match by GUID, any version
+  - com.jotunn.jotunn|c56246207080b854363396f2b001b389e7d3...  # match by GUID, specific DLL hash
+  - Jotunn                                                     # match by display name (less precise)
+
+banned_mods:
+  - com.example.flycheat                                       # always kicked if present
+```
+
+**GUIDs** are the strings inside `[BepInPlugin("...")]` in each mod's source code. They never change between versions, so they're the safest choice. The companion plugin's first-run export gives you GUIDs automatically — just paste them in.
+
+**Hash pinning** (the `|hash` part) locks the mod to a specific DLL. Useful if you want to forbid newer or older versions. Dropping the hash means any version with that GUID is accepted.
+
+## admins.yaml
+
+```yaml
 admins:
-  - 76561198012345678  # Server owner
-  - 76561198087654321  # Mod tester
+  - "76561198012345678"   # this Steam ID skips the entire mod check
 ```
 
-**How to get SteamID:**
-1. Visit https://steamid.io/
-2. Enter Steam username
-3. Copy the "steamID64" value
+Use sparingly. Admins are not asked for a manifest, so they can run any mods.
+
+To find your Steam ID, paste your profile URL into https://steamid.io and copy the **steamID64** number.
+
+## client.yaml (each player's PC)
+
+```yaml
+sharedSecret: "<paste the value from the server's settings.yaml>"
+```
+
+That's it. The companion reads this once at startup. If you change the password on the server, every player must update their `client.yaml`.
+
+## Refreshing the mod list
+
+When you (or a player) installs a new mod and you want to add it to the server's allowlist:
+
+1. On a client PC, **delete** `BepInEx/config/ServerGuard/mods_for_allowed_mods.yaml`.
+2. Launch Valheim once. The companion regenerates the file with the current mod list.
+3. Open it and copy the new entries into the server's `allowed_mods.yaml`.
+
+## Common log messages
+
+What you'll see in `BepInEx/LogOutput.log`.
+
+### Successful connection
+```
+[ServerGuard] Incoming connection: <name> (<steamid>)
+[ServerGuard] <steamid> attested OK (29 mods).
+```
+
+### Player has the companion but a mod isn't on the allowlist
+```
+[ServerGuard] <steamid> REJECTED: DisallowedMod - Unapproved mod: <mod-name>
+[ServerGuard] Disconnected <steamid>. Reason: ... (Unapproved mod: <mod-name>)
+```
+Fix: add the mod to `allowed_mods.yaml`, or remove it from the player's modpack.
+
+### Player is missing the companion / didn't install it
+```
+[ServerGuard] <steamid> did not deliver a manifest within 10s.
+[ServerGuard] Disconnected <steamid>. Reason: ... (Missing required companion plugin: ServerGuard.Client)
+```
+Fix: have the player install `Valheim-ServerGuard-Client.dll` and set their `client.yaml`.
+
+### Wrong password
+```
+[ServerGuard] HMAC mismatch for <steamid>. Either bad sharedSecret on client, or tampered manifest.
+[ServerGuard] Disconnected <steamid>. Reason: ... (Invalid signature)
+```
+Fix: copy the server's `sharedSecret` into the player's `client.yaml` exactly. Watch for stray quotes or trailing spaces.
+
+### Server itself
+```
+[ServerGuard] Loaded (v1.3.0). Enforcement: ON. RequireCompanion: ON. RequireHmac: ON. AllowUnlisted: OFF. Required: 1, Allowed: 28, Banned: 0. Metrics: ON
+[ServerGuard] sharedSecret in use (copy to every client.yaml): <password>
+```
+Confirms the plugin loaded and the allowlist parsed. If `Allowed: 0` despite a populated file, the YAML keys are wrong — they must be `required_mods:`, `allowed_mods:`, `banned_mods:` exactly.
+
+## Discord notifications
+
+In `settings.yaml`:
+
+```yaml
+discordWebhookUrl: 'https://discord.com/api/webhooks/12345/abcdef...'
+```
+
+Get the URL from your Discord server: **Channel Settings → Integrations → Webhooks → New Webhook → Copy URL**.
+
+You'll get real-time alerts for kicks, bans, and rejected manifests, plus a 2-second-buffered stream of all ServerGuard log events to the same channel.
+
+## Rotating the shared password
+
+If a player leaves and you want to lock them out:
+
+1. On the server, edit `settings.yaml` and replace the `sharedSecret:` value with a new random string (or just delete the line and restart — it'll auto-generate a fresh one).
+2. Send the new password to every remaining player.
+3. They each update their `client.yaml`.
+
+The departing player can no longer connect (their old password fails the HMAC check).
+
+## Auto-bans
+
+After 3 rejected connections of the same kind (configurable via `violationThreshold`), the player is auto-banned via Valheim's normal ban list. To undo:
+
+1. Server console: `unban <steamid>`
+2. Optional: open `BepInEx/config/ServerGuard/conf/violations.yaml` and remove their entry, so the count restarts at zero.
+
+## Migrating from v1.2.x
+
+If you previously used heuristic detection (`ignore_mods.yaml`, `mod_patterns.yaml`):
+
+1. Stop the server.
+2. Replace `Valheim-ServerGuard.dll` with the new one.
+3. Start the server. The old files are auto-renamed `ignore_mods.yaml.legacy` / `mod_patterns.yaml.legacy`. A fresh `allowed_mods.yaml` is created. The new `sharedSecret` is auto-generated.
+4. Have one trusted player install `Valheim-ServerGuard-Client.dll`, copy the password into their `client.yaml`, launch the game once, and use their `mods_for_allowed_mods.yaml` to populate the server's `allowed_mods.yaml`.
+5. Distribute the client DLL + password to all other players.
+
+The old YAML files (now `.legacy`) are kept for reference. You can delete them when you're ready.
+
+## Building from source
+
+See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL build from `dotnet build -c Release` after pointing `VALHEIM_PATH` at your Valheim install.
+
+## Architecture map (for code readers)
+
+| File | Role |
+|---|---|
+| [Plugin.cs](Plugin.cs) | Server plugin. Patches `ZNet.OnNewConnection` (challenge issue + manifest receiver registration) and `ZNet.RPC_PeerInfo` (character-limit enforcement). |
+| [ServerGuard.Client/ClientPlugin.cs](ServerGuard.Client/ClientPlugin.cs) | Client companion. Patches `ZNet.OnNewConnection` (registers the manifest reply handler). Builds the manifest from `Chainloader.PluginInfos` and writes `mods_for_allowed_mods.yaml` on first run. |
+| [Shared/Manifest.cs](Shared/Manifest.cs) | Shared DTO (used by both): the `ModManifest` shape, the canonical-string format used as input to HMAC, and the HMAC-SHA256 helpers. |
 
 ---
 
-## 🔗 Useful Resources
-
-- **Valheim Modding:** https://github.com/Valheim-Modding
-- **Jotunn Framework:** https://github.com/Valheim-Modding/Jotunn
-- **BepInEx:** https://github.com/BepInEx/BepInEx
-- **ServerGuard Repository:** https://github.com/yesu0725/Valheim-ServerGuard
-
----
-
-## 💡 Tips & Best Practices
-
-1. **Start Conservative**
-   - Begin with strict vanilla-only
-   - Gradually allowlist trusted mods
-   - Use log-only mode first
-
-2. **Monitor Metrics**
-   - Review `metrics.yaml` weekly
-   - Track new detected mods
-   - Adjust patterns based on trends
-
-3. **Test Changes**
-   - Edit patterns while running
-   - Changes auto-reload instantly
-   - Check logs for confirmation
-
-4. **Use Discord**
-   - Get real-time alerts for violations
-   - Archive enforcement logs
-   - Share stats with admins
-
-5. **Document Your Policy**
-   - Post allowed mods list publicly
-   - Explain enforcement approach
-   - Provide Discord webhook for appeals
-
----
-
-## ✅ Verification Checklist
-
-- [ ] Plugin installed in `BepInEx/plugins/`
-- [ ] Config files auto-generated in `BepInEx/config/ServerGuard/conf/`
-- [ ] `settings.yaml` configured for your server policy
-- [ ] `ignore_mods.yaml` populated with allowed mods
-- [ ] Admin SteamIDs in `admins.yaml`
-- [ ] Discord webhook configured (optional)
-- [ ] Metrics enabled and tracking (`metrics.yaml` updating)
-- [ ] Test with modded client - should trigger violation
-- [ ] Test with vanilla client - should pass
-- [ ] Check logs for "ServerGuard Loaded" message
-
----
-
-## 📢 Support
-
-For issues, feature requests, or mod token submissions:
-- Open an issue on GitHub
-- Include relevant logs from `BepInEx/LogOutput.log`
-- Attach metrics from `metrics.yaml`
-
----
-
-**Last Updated:** May 7, 2026
 **Version:** 1.3.0
-**Author:** taeguk
+**Repository:** https://github.com/yesu0725/Valheim-ServerGuard

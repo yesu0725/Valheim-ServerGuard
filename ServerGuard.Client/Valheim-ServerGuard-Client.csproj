@@ -2,18 +2,16 @@
 
   <PropertyGroup>
     <TargetFramework>net462</TargetFramework>
-    <AssemblyName>Valheim-ServerGuard</AssemblyName>
-    <RootNamespace>ValheimServerGuard</RootNamespace>
+    <AssemblyName>Valheim-ServerGuard-Client</AssemblyName>
+    <RootNamespace>ValheimServerGuardClient</RootNamespace>
     <Version>1.3.0</Version>
-    <Description>Valheim Server Guard - Anti-cheat and security mod for Valheim servers</Description>
+    <Description>Valheim ServerGuard Client - companion plugin that attests the client's mod list to a ServerGuard-protected server</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
   <PropertyGroup>
-    <!-- Set VALHEIM_PATH to the Valheim install root (client OR dedicated server). -->
-    <!-- Defaults try common locations if VALHEIM_PATH is not set. -->
     <ValheimManaged Condition="'$(VALHEIM_PATH)' != '' AND Exists('$(VALHEIM_PATH)\valheim_server_Data\Managed')">$(VALHEIM_PATH)\valheim_server_Data\Managed</ValheimManaged>
     <ValheimManaged Condition="'$(ValheimManaged)' == '' AND '$(VALHEIM_PATH)' != '' AND Exists('$(VALHEIM_PATH)\valheim_Data\Managed')">$(VALHEIM_PATH)\valheim_Data\Managed</ValheimManaged>
     <ValheimManaged Condition="'$(ValheimManaged)' == '' AND Exists('C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\valheim_server_Data\Managed')">C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\valheim_server_Data\Managed</ValheimManaged>
@@ -25,19 +23,16 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The client subproject has its own csproj; keep its sources out of the server build. -->
-    <Compile Remove="ServerGuard.Client\**\*.cs" />
-    <None Remove="ServerGuard.Client\**\*" />
+    <!-- Share the manifest DTO with the server project -->
+    <Compile Include="..\Shared\Manifest.cs" Link="Shared\Manifest.cs" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Pulled from nuget.org -->
     <PackageReference Include="YamlDotNet" Version="12.3.1" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- BepInEx + Harmony from a local BepInEx install -->
     <Reference Include="BepInEx">
       <HintPath>$(BepInExCore)\BepInEx.dll</HintPath>
       <Private>False</Private>
@@ -47,7 +42,6 @@
       <Private>False</Private>
     </Reference>
 
-    <!-- Valheim engine assemblies -->
     <Reference Include="UnityEngine">
       <HintPath>$(ValheimManaged)\UnityEngine.dll</HintPath>
       <Private>False</Private>

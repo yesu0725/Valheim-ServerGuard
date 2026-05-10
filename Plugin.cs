@@ -1,19 +1,22 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Collections.Generic;
+using System.Net.Http;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
 using System.Timers;
 using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
+using Newtonsoft.Json;
 using UnityEngine;
+using ValheimServerGuard.Shared;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
-using System.Net.Http;
-using System.Threading.Tasks;
-using Newtonsoft.Json;
 
 [BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.3.0")]
 public class Plugin : BaseUnityPlugin
@@ -32,11 +35,14 @@ public class Plugin : BaseUnityPlugin
 
     private static readonly string SettingsYaml      = Path.Combine(ConfDir, "settings.yaml");
     private static readonly string AdminsYaml        = Path.Combine(ConfDir, "admins.yaml");
-    private static readonly string IgnoreModsYaml    = Path.Combine(ConfDir, "ignore_mods.yaml");
-    private static readonly string ModPatternsYaml   = Path.Combine(ConfDir, "mod_patterns.yaml");
+    private static readonly string AllowedModsYaml   = Path.Combine(ConfDir, "allowed_mods.yaml");
     private static readonly string RegistrationsYaml = Path.Combine(ConfDir, "registrations.yaml");
     private static readonly string ViolationsYaml    = Path.Combine(ConfDir, "violations.yaml");
     private static readonly string MetricsYaml       = Path.Combine(ConfDir, "metrics.yaml");
+
+    // Legacy filenames (renamed to .legacy on first launch under v1.3+ if they exist)
+    private static readonly string LegacyIgnoreModsYaml  = Path.Combine(ConfDir, "ignore_mods.yaml");
+    private static readonly string LegacyModPatternsYaml = Path.Combine(ConfDir, "mod_patterns.yaml");
 
     // -------- YAML Serializer --------
     private static IDeserializer _yamlIn;
@@ -45,9 +51,16 @@ public class Plugin : BaseUnityPlugin
     // -------- In-memory state --------
     private Settings _settings;
     private HashSet<string> _admins = new(StringComparer.OrdinalIgnoreCase);
-    private HashSet<string> _ignoredModTokens = new(StringComparer.OrdinalIgnoreCase);
-    private ModPatterns _modPatterns;
     private DetectionMetrics _metrics;
+
+    // allowed_mods.yaml decoded into lookup-friendly form.
+    private List<AllowedModEntry> _requiredMods = new();
+    private List<AllowedModEntry> _allowedMods  = new();
+    private List<AllowedModEntry> _bannedMods   = new();
+
+    // SteamID -> outstanding manifest challenge. Keyed by peer.m_uid.
+    private Dictionary<long, PendingAttestation> _pending = new();
+    private readonly object _pendingLock = new object();
 
     // SteamID -> CharacterID
     private Dictionary<string, List<string>> _registrations = new(StringComparer.OrdinalIgnoreCase);
@@ -56,30 +69,50 @@ public class Plugin : BaseUnityPlugin
     private Dictionary<string, Dictionary<string, int>> _violations = new(StringComparer.OrdinalIgnoreCase);
 
     // Rule keys
-    private const string RULE_MODDED = "ClientModded";
-    private const string RULE_CHAR_NOT_REGISTERED = "CharacterNotRegistered";
-	private const string RULE_CHAR_NAME_MISMATCH = "CharacterNameMismatch";
-	private const string RULE_CHAR_NAME_LIMIT    = "CharacterNameLimitExceeded";
+    private const string RULE_COMPANION_MISSING       = "CompanionMissing";
+    private const string RULE_HMAC_INVALID            = "HmacInvalid";
+    private const string RULE_CHALLENGE_MISMATCH      = "ChallengeMismatch";
+    private const string RULE_REQUIRED_MOD_MISSING    = "RequiredModMissing";
+    private const string RULE_DISALLOWED_MOD          = "DisallowedMod";
+    private const string RULE_BANNED_MOD              = "BannedMod";
+    private const string RULE_CHAR_NAME_LIMIT         = "CharacterNameLimitExceeded";
 
     // File watchers (hot-reload)
-    private FileSystemWatcher _watchSettings, _watchAdmins, _watchIgnore, _watchModPatterns;
+    private FileSystemWatcher _watchSettings, _watchAdmins, _watchAllowed;
     private readonly Dictionary<string, DateTime> _lastSeenWrite = new();
 
     // -------------- Data Models --------------
     private class Settings
     {
-        public int  ViolationThreshold   { get; set; } = 3;   // attempts before auto-ban
+        // --- Core enforcement ---
+        public int  ViolationThreshold   { get; set; } = 3;
         public bool Enforce              { get; set; } = true;
-        public bool AggressiveNoModCheck { get; set; } = true;
-        public bool EnableAssemblyScanning { get; set; } = true; // Check loaded assemblies
-        public bool EnableMetrics        { get; set; } = true;   // NEW: Track detection stats
-        public bool UseWhitelistMode     { get; set; } = false;  // NEW: Allowlist instead of blocklist
-        public bool RequireAttestation   { get; set; } = false;
         public string KickMessage        { get; set; } = "You cannot join: server security policy violation. Contact an administrator.";
         public string BanReason          { get; set; } = "Auto-banned due to repeated security violations.";
-		public int CharacterLimit        { get; set; } = 1;
-		public string discordWebhookUrl  { get; set; } = "";
-		public string discordChannelLink { get; set; } = "";
+        public int CharacterLimit        { get; set; } = 1;
+
+        // --- Client-attestation handshake (v1.3+) ---
+        // The server requests a signed mod manifest from every connecting peer via the
+        // Valheim ServerGuard Client companion plugin. RequireCompanion=true means any
+        // peer that fails to deliver a valid manifest is kicked (vanilla / wrong-modpack).
+        public bool RequireCompanion         { get; set; } = true;
+        public int  CompanionTimeoutSeconds  { get; set; } = 10;
+        public bool RequireHmac              { get; set; } = true;
+        public string SharedSecret           { get; set; } = "";
+        public bool AllowUnlisted            { get; set; } = false;
+        public int  MaxClockSkewSeconds      { get; set; } = 120;
+        public bool LogPeerManifest          { get; set; } = false;
+
+        // --- Operational ---
+        public bool EnableMetrics        { get; set; } = true;
+        public string discordWebhookUrl  { get; set; } = "";
+        public string discordChannelLink { get; set; } = "";
+
+        // --- Deprecated (kept for backward YAML parsing only; no runtime effect) ---
+        public bool AggressiveNoModCheck   { get; set; } = false;
+        public bool EnableAssemblyScanning { get; set; } = false;
+        public bool UseWhitelistMode       { get; set; } = false;
+        public bool RequireAttestation     { get; set; } = false;
     }
 
     private class AdminsDoc
@@ -87,16 +120,38 @@ public class Plugin : BaseUnityPlugin
         public List<string> admins { get; set; } = new();
     }
 
-    private class IgnoreModsDoc
+    // allowed_mods.yaml schema. Each list entry is a string of the form:
+    //   "GuidOrName"            - matches manifest entries by GUID or Name (case-insensitive)
+    //   "GuidOrName|sha256hex"  - additionally pins the DLL hash; mismatch -> kick
+    //
+    // The [YamlMember(Alias = "...")] attributes pin the on-disk keys to snake_case
+    // regardless of the deserializer's CamelCaseNamingConvention (which would otherwise
+    // mangle `required_mods` -> `requiredMods` and silently parse zero entries).
+    private class AllowedModsDoc
     {
-        public List<string> ignore_mods { get; set; } = new();
+        [YamlMember(Alias = "required_mods", ApplyNamingConventions = false)]
+        public List<string> required_mods { get; set; } = new();
+
+        [YamlMember(Alias = "allowed_mods", ApplyNamingConventions = false)]
+        public List<string> allowed_mods  { get; set; } = new();
+
+        [YamlMember(Alias = "banned_mods", ApplyNamingConventions = false)]
+        public List<string> banned_mods   { get; set; } = new();
     }
 
-    private class ModPatterns
+    private class AllowedModEntry
     {
-        public List<string> rpc_tokens { get; set; } = new();
-        public List<string> assembly_namespaces { get; set; } = new();
-        public List<string> version_keywords { get; set; } = new();
+        public string Key;     // GUID or Name (lowercased for comparison)
+        public string Sha256;  // optional, lowercase hex
+    }
+
+    // Per-peer challenge state. Created on connection, removed on manifest receipt or timeout.
+    private class PendingAttestation
+    {
+        public string Challenge;
+        public DateTime SentAt;
+        public string SteamId;
+        public ZNetPeer Peer;
     }
 
     private class DetectionMetrics
@@ -148,8 +203,7 @@ public class Plugin : BaseUnityPlugin
         // Load YAML
         LoadSettings();
         LoadAdmins();
-        LoadIgnoreMods();
-        LoadModPatterns();
+        LoadAllowedMods();
         LoadRegistrations();
         LoadViolations();
         LoadMetrics();
@@ -161,8 +215,21 @@ public class Plugin : BaseUnityPlugin
         _harmony = new Harmony("com.taeguk.valheim.serverguard");
         _harmony.PatchAll();
 
-        var modeStr = _settings.UseWhitelistMode ? "WHITELIST" : "BLOCKLIST";
-        LogS.LogInfo($"[ServerGuard] Loaded (v1.3.0). Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}. Mode: {modeStr}. Assembly scanning: {(_settings.EnableAssemblyScanning ? "ON" : "OFF")}. Metrics: {(_settings.EnableMetrics ? "ON" : "OFF")}");
+        LogS.LogInfo(
+            $"[ServerGuard] Loaded (v1.3.0). " +
+            $"Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}. " +
+            $"RequireCompanion: {(_settings.RequireCompanion ? "ON" : "OFF")}. " +
+            $"RequireHmac: {(_settings.RequireHmac ? "ON" : "OFF")}. " +
+            $"AllowUnlisted: {(_settings.AllowUnlisted ? "ON" : "OFF")}. " +
+            $"Required: {_requiredMods.Count}, Allowed: {_allowedMods.Count}, Banned: {_bannedMods.Count}. " +
+            $"Metrics: {(_settings.EnableMetrics ? "ON" : "OFF")}");
+
+        if (_settings.RequireHmac && !string.IsNullOrEmpty(_settings.SharedSecret))
+        {
+            // Print the secret once at startup so the operator can copy it into client.yaml.
+            // Subsequent boots silently keep it.
+            LogS.LogInfo($"[ServerGuard] sharedSecret in use (copy to every client.yaml): {_settings.SharedSecret}");
+        }
 		
 		// Start log forwarding if webhook is present
 		if (!string.IsNullOrWhiteSpace(_settings.discordWebhookUrl))
@@ -273,21 +340,34 @@ public class Plugin : BaseUnityPlugin
 
         if (!File.Exists(SettingsYaml))
         {
-			var defaults = new Settings
-			{
-				discordWebhookUrl = "",
-				discordChannelLink = ""
-			};
-			var sb = new StringBuilder();
-			sb.AppendLine("# ServerGuard settings (v1.3.0)");
-			sb.AppendLine("# discordWebhookUrl: paste the FULL Discord Webhook URL from: Channel Settings → Integrations → Webhooks");
-			sb.AppendLine("# discordChannelLink: optional, for your reference");
-			sb.AppendLine("# enableAssemblyScanning: enable/disable assembly namespace scanning");
-			sb.AppendLine("# enableMetrics: enable/disable detection metrics tracking");
-			sb.AppendLine("# useWhitelistMode: if TRUE, only mods in ignore_mods.yaml are allowed (allowlist). If FALSE, all mods except ignored are blocked (blocklist)");
-			sb.AppendLine(_yamlOut.Serialize(defaults));
-			File.WriteAllText(SettingsYaml, sb.ToString());
-		}
+            var defaults = new Settings
+            {
+                SharedSecret = GenerateSharedSecret()
+            };
+            var sb = new StringBuilder();
+            sb.AppendLine("# ServerGuard settings (v1.3.0)");
+            sb.AppendLine("#");
+            sb.AppendLine("# Client-attestation handshake:");
+            sb.AppendLine("#   requireCompanion       - if true, peers without the ServerGuard.Client plugin are kicked.");
+            sb.AppendLine("#   companionTimeoutSeconds - how long to wait for the manifest before declaring 'no companion'.");
+            sb.AppendLine("#   requireHmac            - if true, manifests must carry a valid HMAC signature.");
+            sb.AppendLine("#   sharedSecret           - secret string. Must match every client's client.yaml `sharedSecret`.");
+            sb.AppendLine("#                            Generate something long and random (e.g. `openssl rand -hex 32`).");
+            sb.AppendLine("#   allowUnlisted          - if true, mods absent from allowed_mods.yaml are tolerated.");
+            sb.AppendLine("#                            Default false = strict allowlist.");
+            sb.AppendLine("#   maxClockSkewSeconds    - reject manifests whose timestamp is more than this off from server time.");
+            sb.AppendLine("#   logPeerManifest        - if true, log every connecting peer's full manifest (verbose).");
+            sb.AppendLine("#                            Useful for harvesting plugin GUIDs to populate allowed_mods.yaml.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Identity / character limits:");
+            sb.AppendLine("#   characterLimit         - max distinct character names a SteamID may use on this server.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Discord:");
+            sb.AppendLine("#   discordWebhookUrl      - full Discord Webhook URL for live event forwarding.");
+            sb.AppendLine("#");
+            sb.AppendLine(_yamlOut.Serialize(defaults));
+            File.WriteAllText(SettingsYaml, sb.ToString());
+        }
 
         if (!File.Exists(AdminsYaml))
         {
@@ -298,129 +378,74 @@ public class Plugin : BaseUnityPlugin
             File.WriteAllText(AdminsYaml, sb.ToString());
         }
 
-        if (!File.Exists(IgnoreModsYaml))
-        {
-            var doc = new IgnoreModsDoc { ignore_mods = new List<string> { "Jotunn", "ServerSync" } };
-            var sb = new StringBuilder();
-            sb.AppendLine("# Blocklist mode: mods to permit (ignored/allowlisted)");
-            sb.AppendLine("# Whitelist mode: mods that are allowed (ONLY these mods permitted)");
-            sb.AppendLine(_yamlOut.Serialize(doc));
-            File.WriteAllText(IgnoreModsYaml, sb.ToString());
-        }
+        // v1.3+ migration: rename pre-attestation files out of the way so they don't
+        // confuse admins. Their old contents wouldn't have been honored anyway.
+        TryRenameLegacy(LegacyIgnoreModsYaml,  LegacyIgnoreModsYaml  + ".legacy");
+        TryRenameLegacy(LegacyModPatternsYaml, LegacyModPatternsYaml + ".legacy");
 
-        if (!File.Exists(ModPatternsYaml))
+        if (!File.Exists(AllowedModsYaml))
         {
-            var doc = new ModPatterns
-            {
-                rpc_tokens = new List<string>
-                {
-                    // Framework mods
-                    "JVL", "Jotunn",
-                    "ServerSync",
-                    "BepInEx",
-                    "ModVer",
-                    "ModInfo",
-                    
-                    // Quality of life
-                    "ValheimPlus",
-                    "EquipmentAndQuickSlots",
-                    "ImprovedUI",
-                    "Quickslots",
-                    
-                    // Gameplay enhancement
-                    "Wonderlands",
-                    "Komrade",
-                    "EpicLoot",
-                    "Seasons",
-                    "CustomUI",
-                    "CreatureAbilityReworks",
-                    "CarryMore",
-                    "RackMultiplier",
-                    "NoMapBoat",
-                    
-                    // Building & decoration
-                    "PlanBuild",
-                    "BuildCamera",
-                    "GizmoRotate",
-                    
-                    // Progression
-                    "MaserySystem",
-                    "Experience",
-                    "SkillTree",
-                    
-                    // Combat
-                    "CombatEvolution",
-                    "BalancedArchers",
-                    "ArcheryParry",
-                    
-                    // World modifications
-                    "MinimapAssistant",
-                    "Minimap",
-                    "WorldMapAlternative",
-                    
-                    // Other common mods
-                    "ItemDrawers",
-                    "ContainerGui",
-                    "MultiUserChest",
-                    "BetterNetworking",
-                    "Pathfinding"
-                },
-                assembly_namespaces = new List<string>
-                {
-                    // Framework
-                    "Jotunn",
-                    "BepInEx",
-                    
-                    // QoL/UI
-                    "ValheimPlus",
-                    "ImprovedUI",
-                    "EquipmentAndQuickSlots",
-                    
-                    // Gameplay
-                    "Wonderlands",
-                    "Komrade",
-                    "EpicLoot",
-                    "Seasons",
-                    "CustomUI",
-                    "CreatureAbilityReworks",
-                    
-                    // Building
-                    "PlanBuild",
-                    "BuildCamera",
-                    "GizmoRotate",
-                    
-                    // Progression
-                    "MaserySystem",
-                    "SkillTree",
-                    
-                    // Combat
-                    "CombatEvolution",
-                    "BalancedArchers",
-                    
-                    // World
-                    "MinimapAssistant",
-                    "WorldMapAlternative",
-                    
-                    // Storage
-                    "ItemDrawers",
-                    "ContainerGui",
-                    "MultiUserChest"
-                },
-                version_keywords = new List<string>
-                {
-                    "mod",
-                    "modded",
-                    "custom",
-                    "patched",
-                    "enhanced",
-                    "modified"
-                }
-            };
             var sb = new StringBuilder();
-            sb.AppendLine("# Mod detection patterns (Phase 1 & 2)");
-            sb.AppendLine("# See README-MOD-PATTERNS.md for detailed documentation");
-            sb.AppendLine(_yamlOut.Serialize(doc));
-            File.WriteAllText(ModPatternsYaml, sb.ToString());
+            sb.AppendLine("# ServerGuard allowed_mods.yaml (v1.3+)");
+            sb.AppendLine("#");
+            sb.AppendLine("# Each entry references a mod by its BepInEx plugin GUID (preferred) or display Name.");
+            sb.AppendLine("# Optional `|<sha256_hex>` suffix pins the DLL hash; mismatch -> kick.");
+            sb.AppendLine("#");
+            sb.AppendLine("#   required_mods: every connecting client MUST report all of these in its manifest.");
+            sb.AppendLine("#   allowed_mods : extra mods the client may run beyond the required set.");
+            sb.AppendLine("#   banned_mods  : if any of these appear in the client manifest, the client is kicked.");
+            sb.AppendLine("#");
+            sb.AppendLine("# To harvest GUIDs from a real client connection, set logPeerManifest: true in settings.yaml.");
+            sb.AppendLine("# The names below were bootstrapped from your modpack's BepInEx LogOutput.log; replace them");
+            sb.AppendLine("# with GUIDs over time for stricter matching.");
+            sb.AppendLine();
+            sb.AppendLine("required_mods:");
+            sb.AppendLine("  - com.taeguk.valheim.serverguard.client    # the ServerGuard companion plugin");
+            sb.AppendLine();
+            sb.AppendLine("allowed_mods:");
+            // Bootstrapped from the user's client BepInEx LogOutput.log
+            foreach (var name in new[] {
+                "Armoire",
+                "AzuAntiCheat",
+                "FastLink",
+                "Recycle_N_Reclaim",
+                "BalrondShipyard",
+                "ComfyQuickSlots",
+                "Trader Overhaul",
+                "Haldor Bounties",
+                "Jotunn",
+                "Offline Companions",
+                "Newtonsoft.Json Detector",
+                "YamlDotNet Detector",
+                "Wandering Companions",
+                "Better Networking",
+                "SimpleMarket",
+                "Quick Stack - Store - Sort - Trash - Restock",
+                "PlanBuild",
+                "ImpactfulSkills",
+                "SlayerSkills",
+                "DiscordConnectorClient",
+                "Creature Level & Loot Control",
+                "Groups",
+                "Player Activity",
+                "Protective Wards",
+                "ValkyrieDeathMessages",
+                "WackysDatabase",
+                "More_World_Locations_AIO",
+                "Zen.ModLib",
+                "ZenBossStone",
+            })
+            {
+                // Quote names that may contain reserved YAML characters
+                var safe = name.IndexOfAny(new[] { ':', '|', '#', '&', '*', '!', '%', '@', '`' }) >= 0
+                    ? "\"" + name.Replace("\"", "\\\"") + "\""
+                    : name;
+                sb.AppendLine($"  - {safe}");
+            }
+            sb.AppendLine();
+            sb.AppendLine("banned_mods: []");
+            sb.AppendLine();
+            File.WriteAllText(AllowedModsYaml, sb.ToString());
         }
 
         if (!File.Exists(RegistrationsYaml))
@@ -444,303 +469,23 @@ public class Plugin : BaseUnityPlugin
             File.WriteAllText(MetricsYaml, sb.ToString());
         }
 
-        // Create README for mod patterns
-        CreateModPatternsREADME();
     }
 
-    private void CreateModPatternsREADME()
+    private static void TryRenameLegacy(string from, string to)
     {
-        var readmePath = Path.Combine(ConfDir, "README-MOD-PATTERNS.md");
-        if (File.Exists(readmePath)) return;
-
-        var content = @"# Mod Patterns Configuration Guide
-
-## Overview
-Valheim ServerGuard uses **hybrid detection** with two phases to identify modded clients:
-
-- **Phase 1:** RPC Token Detection + Version Keyword Scanning
-- **Phase 2:** Assembly Namespace Scanning (optional, toggleable)
-
-This file configures detection patterns for both phases.
-
----
-
-## Modes: Blocklist vs Whitelist
-
-### Blocklist Mode (Default)
-- **Setting:** `useWhitelistMode: false`
-- **Behavior:** Block all detected mods EXCEPT those in `ignore_mods.yaml`
-- **Use Case:** Strict vanilla-only servers with exceptions for quality-of-life mods
-
-```yaml
-# ignore_mods.yaml (Blocklist mode)
-ignore_mods:
-  - Jotunn           # Allow framework
-  - ServerSync       # Allow config sync
-  - MinimapAssistant # Allow minimap
-```
-
-### Whitelist Mode (NEW)
-- **Setting:** `useWhitelistMode: true`
-- **Behavior:** Allow ONLY mods in `ignore_mods.yaml`; block everything else
-- **Use Case:** Community servers with specific approved mod packs
-
-```yaml
-# ignore_mods.yaml (Whitelist mode)
-ignore_mods:
-  - Jotunn
-  - ServerSync
-  - MinimapAssistant
-  - EquipmentAndQuickSlots
-```
-
-Switch between modes by editing `settings.yaml`:
-
-```yaml
-useWhitelistMode: false  # Blocklist (default)
-useWhitelistMode: true   # Whitelist mode
-```
-
----
-
-## Configuration
-
-### rpc_tokens
-RPC method names that indicate a mod is present. ServerGuard checks if any registered RPC method contains one of these tokens (case-insensitive substring match).
-
-**Default tokens:**
-- `JVL` / `Jotunn` → Jotunn framework
-- `ServerSync` → Config sync mod
-- `BepInEx` → BepInEx framework
-- `ValheimPlus` → ValheimPlus QoL mod
-- `PlanBuild` / `BuildCamera` → Building mods
-- `EpicLoot` → Loot system mod
-- And 20+ more...
-
-**How to add tokens:**
-1. Open `mod_patterns.yaml`
-2. Find the `rpc_tokens:` section
-3. Add new tokens as list items:
-
-```yaml
-rpc_tokens:
-  - JVL
-  - Jotunn
-  - MyCustomMod        # Add your token here
-  - AnotherModToken
-```
-
-**How to find mod tokens:**
-- Check the mod's GitHub repository or README
-- Look for custom RPC method prefixes
-- Test with the mod enabled and check ServerGuard logs
-
----
-
-### assembly_namespaces
-.NET namespace prefixes that indicate a mod assembly is loaded. Phase 2 assembly scanning checks all loaded DLLs for types matching these namespaces.
-
-**Default namespaces:**
-- `Jotunn` → Jotunn framework types
-- `ValheimPlus` → ValheimPlus namespace
-- `PlanBuild` → Building enhancement
-- And 15+ more...
-
-**How to add namespaces:**
-```yaml
-assembly_namespaces:
-  - Jotunn
-  - ValheimPlus
-  - MyMod            # Add your namespace prefix
-  - Another.Mod.Type
-```
-
-**When Phase 2 runs:**
-- Toggled with `enableAssemblyScanning: true/false` in `settings.yaml`
-- Runs AFTER Phase 1 if Phase 1 detects nothing
-- More expensive (reflection overhead) but catches hidden mods
-- Disable for performance: `enableAssemblyScanning: false`
-
----
-
-### version_keywords
-Keywords found in player version strings that suggest a modded client.
-
-**Default keywords:**
-- `mod`
-- `modded`
-- `custom`
-- `patched`
-- `enhanced`
-- `modified`
-
-**Example:**
-If a player's client version string is `""0.217.46-modded""`, the keyword `modded` is detected.
-
-**Add custom keywords:**
-```yaml
-version_keywords:
-  - mod
-  - custom
-  - hacked          # Add new keyword
-  - unofficial
-```
-
----
-
-## Best Practices
-
-### 1. Start Conservative
-Begin with a small allowlist of trusted mods, expand as needed:
-
-```yaml
-# Blocklist mode - start strict
-ignore_mods:
-  - Jotunn
-  - ServerSync
-```
-
-### 2. Monitor Metrics
-Enable metrics to see detection patterns:
-
-```yaml
-# settings.yaml
-enableMetrics: true
-```
-
-Check `metrics.yaml` periodically:
-```yaml
-total_mods_detected: 42
-phase1_rpc_detections: 35
-phase2_assembly_detections: 7
-top_detected_mods:
-  Jotunn: 15
-  ValheimPlus: 12
-  ServerSync: 10
-```
-
-### 3. Test Before Enforcement
-Run in log-only mode first:
-
-```yaml
-# settings.yaml
-enforce: false  # Only log, don't kick
-```
-
-### 4. Use Discord Logging
-Configure webhooks to monitor violations in real-time:
-
-```yaml
-# settings.yaml
-discordWebhookUrl: https://discordapp.com/api/webhooks/...
-```
-
-### 5. Whitelist Admins
-Add admin Steam IDs to bypass all checks:
-
-```yaml
-# admins.yaml
-admins:
-  - 76561198012345678  # Admin user
-  - 76561198087654321  # Mod tester
-```
-
----
-
-## Troubleshooting
-
-### False Positives (Vanilla client detected as modded)
-**Problem:** Vanilla clients getting kicked
-**Solution:**
-1. Check logs for which token/namespace triggered it
-2. Adjust version keywords if issue is version-based
-3. Run with `enforce: false` to diagnose
-4. Consider disabling Phase 2: `enableAssemblyScanning: false`
-
-### False Negatives (Modded client passes through)
-**Problem:** Modded clients not detected
-**Solution:**
-1. Add the mod's RPC token to `rpc_tokens`
-2. Add the mod's namespace to `assembly_namespaces`
-3. Enable Phase 2 assembly scanning if disabled
-4. Check Discord logs for what mods are commonly missed
-
-### Performance Issues
-**Problem:** Server laggy after updates
-**Solution:**
-1. Disable assembly scanning: `enableAssemblyScanning: false`
-2. Disable metrics: `enableMetrics: false`
-3. Disable Discord logging temporarily
-4. Check which phase is causing slowdown in logs
-
----
-
-## Example Configurations
-
-### Vanilla-Only Server
-```yaml
-# settings.yaml
-useWhitelistMode: false
-aggressiveNoModCheck: true
-enforce: true
-
-# ignore_mods.yaml
-ignore_mods:
-  - Jotunn
-  - ServerSync
-```
-
-### Curated Mod Pack Server
-```yaml
-# settings.yaml
-useWhitelistMode: true
-enforce: true
-
-# ignore_mods.yaml (ONLY these allowed)
-ignore_mods:
-  - Jotunn
-  - ServerSync
-  - ValheimPlus
-  - MinimapAssistant
-  - EquipmentAndQuickSlots
-```
-
-### Development/Testing Server
-```yaml
-# settings.yaml
-aggressiveNoModCheck: false
-enforce: false  # Log only
-enableMetrics: true
-enableDiscordWebhook: true
-```
-
----
-
-## Updates
-
-When ServerGuard updates `mod_patterns.yaml`, it adds new tokens for recently-detected mods.
-You can safely edit the file; hot-reload will apply changes instantly.
-
-**Check for updates:**
-- Monitor GitHub releases
-- Subscribe to mod community discussions
-- Review metrics.yaml for new detected mods
-
----
-
-For questions or contributions, open an issue on GitHub!
-";
-
         try
         {
-            File.WriteAllText(readmePath, content);
-            LogS.LogInfo("[ServerGuard] Created README-MOD-PATTERNS.md");
+            if (!File.Exists(from)) return;
+            if (File.Exists(to)) File.Delete(to);
+            File.Move(from, to);
+            LogS?.LogWarning($"[ServerGuard] Renamed legacy config '{Path.GetFileName(from)}' -> '{Path.GetFileName(to)}'. The new client-attestation flow uses allowed_mods.yaml.");
         }
         catch (Exception ex)
         {
-            LogS.LogWarning($"[ServerGuard] Failed to create README: {ex.Message}");
+            LogS?.LogWarning($"[ServerGuard] Could not rename legacy file '{from}': {ex.Message}");
         }
     }
+
 
     // -------------- YAML Load / Save --------------
     private void LoadSettings()
@@ -748,6 +493,24 @@ For questions or contributions, open an issue on GitHub!
         try
         {
             _settings = _yamlIn.Deserialize<Settings>(File.ReadAllText(SettingsYaml)) ?? new Settings();
+
+            // Self-heal: if HMAC is required but no secret is configured, mint one and persist
+            // it back so subsequent boots and the operator's eyes see the same value.
+            if (_settings.RequireHmac && string.IsNullOrWhiteSpace(_settings.SharedSecret))
+            {
+                _settings.SharedSecret = GenerateSharedSecret();
+                try
+                {
+                    PersistSharedSecret(_settings.SharedSecret);
+                    LogS.LogWarning("[ServerGuard] sharedSecret was empty - generated a new one and wrote it back to settings.yaml. Copy this value into every client's client.yaml:");
+                    LogS.LogWarning($"[ServerGuard] sharedSecret: {_settings.SharedSecret}");
+                }
+                catch (Exception persistEx)
+                {
+                    LogS.LogError($"[ServerGuard] Failed to persist generated sharedSecret: {persistEx.Message}. Generated value (use this in client.yaml): {_settings.SharedSecret}");
+                }
+            }
+
             LogS.LogInfo("[ServerGuard] settings.yaml loaded");
         }
         catch (Exception ex)
@@ -773,40 +536,40 @@ For questions or contributions, open an issue on GitHub!
         }
     }
 
-    private void LoadIgnoreMods()
+    private void LoadAllowedMods()
     {
         try
         {
-            var text = File.ReadAllText(IgnoreModsYaml);
-            var doc = _yamlIn.Deserialize<IgnoreModsDoc>(text) ?? new IgnoreModsDoc();
-            _ignoredModTokens = new HashSet<string>((doc.ignore_mods ?? new List<string>()).Select(s => s.Trim()).Where(s => !string.IsNullOrWhiteSpace(s)), StringComparer.OrdinalIgnoreCase);
-            LogS.LogInfo($"[ServerGuard] ignore_mods.yaml loaded ({_ignoredModTokens.Count} tokens) - Mode: {(_settings.UseWhitelistMode ? "WHITELIST" : "BLOCKLIST")}");
+            var text = File.ReadAllText(AllowedModsYaml);
+            var doc = _yamlIn.Deserialize<AllowedModsDoc>(text) ?? new AllowedModsDoc();
+            _requiredMods = ParseAllowedList(doc.required_mods);
+            _allowedMods  = ParseAllowedList(doc.allowed_mods);
+            _bannedMods   = ParseAllowedList(doc.banned_mods);
+            LogS.LogInfo($"[ServerGuard] allowed_mods.yaml loaded (required={_requiredMods.Count}, allowed={_allowedMods.Count}, banned={_bannedMods.Count})");
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[ServerGuard] Failed to load ignore_mods.yaml: {ex.Message}");
-            _ignoredModTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            LogS.LogError($"[ServerGuard] Failed to load allowed_mods.yaml: {ex.Message}");
+            _requiredMods = new List<AllowedModEntry>();
+            _allowedMods  = new List<AllowedModEntry>();
+            _bannedMods   = new List<AllowedModEntry>();
         }
     }
 
-    private void LoadModPatterns()
+    private static List<AllowedModEntry> ParseAllowedList(List<string> raw)
     {
-        try
+        var result = new List<AllowedModEntry>();
+        if (raw == null) return result;
+        foreach (var line in raw)
         {
-            var text = File.ReadAllText(ModPatternsYaml);
-            _modPatterns = _yamlIn.Deserialize<ModPatterns>(text) ?? new ModPatterns();
-            
-            _modPatterns.rpc_tokens ??= new List<string>();
-            _modPatterns.assembly_namespaces ??= new List<string>();
-            _modPatterns.version_keywords ??= new List<string>();
-            
-            LogS.LogInfo($"[ServerGuard] mod_patterns.yaml loaded ({_modPatterns.rpc_tokens.Count} RPC tokens, {_modPatterns.assembly_namespaces.Count} namespaces, {_modPatterns.version_keywords.Count} keywords)");
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            var parts = line.Split('|');
+            var key = parts[0].Trim();
+            var sha = parts.Length > 1 ? parts[1].Trim().ToLowerInvariant() : null;
+            if (string.IsNullOrEmpty(key)) continue;
+            result.Add(new AllowedModEntry { Key = key.ToLowerInvariant(), Sha256 = sha });
         }
-        catch (Exception ex)
-        {
-            LogS.LogError($"[ServerGuard] Failed to load mod_patterns.yaml: {ex.Message}");
-            _modPatterns = new ModPatterns();
-        }
+        return result;
     }
 
     private void LoadRegistrations()
@@ -1157,25 +920,55 @@ For questions or contributions, open an issue on GitHub!
     {
         try
         {
+            if (znetPeer is not ZNetPeer peer || peer == null) return;
+            if (ZNet.instance == null) return;
+
+            var pid = GetPeerPlatformId(peer);
+
+            // Tell the client *why* it's being disconnected. Best-effort - even if this
+            // fails (e.g. socket already torn down), the Disconnect call below still runs.
+            try
+            {
+                peer.m_rpc?.Invoke("Error", 3); // ZNet.ConnectionStatus.ErrorBanned-style code
+            }
+            catch { }
+
+            // The reflection-based Kick(ZNetPeer)/Kick(string) overloads we used previously
+            // resolved to a method that *queued* a soft kick but did not actually disconnect
+            // the socket synchronously, so the handshake completed and the player got past
+            // the kick. ZNet.Disconnect(peer) is the public method that tears the connection
+            // down for real (used by Valheim's own console "kick" command path).
+            try
+            {
+                ZNet.instance.Disconnect(peer);
+                LogS.LogWarning($"[ServerGuard] Disconnected {pid}. Reason: {reason}");
+                _ = SendDiscordNow($":boot: Disconnected {pid}. Reason: {reason}");
+                return;
+            }
+            catch (Exception primaryEx)
+            {
+                LogS.LogWarning($"[ServerGuard] ZNet.Disconnect threw ({primaryEx.Message}); falling back to reflection.");
+            }
+
+            // Fallback path - older Valheim builds.
             var znet = typeof(ZNet).GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null);
             if (znet == null) return;
 
-            var kickPeer = znet.GetType().GetMethod("Kick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[] { typeof(ZNetPeer) }, null);
-            if (kickPeer != null)
+            var disconnectMethod = znet.GetType().GetMethod("Disconnect", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[] { typeof(ZNetPeer) }, null);
+            if (disconnectMethod != null)
             {
-                kickPeer.Invoke(znet, new object[] { znetPeer as ZNetPeer });
-                LogS.LogWarning($"[ServerGuard] Kicked peer. Reason: {reason}");
-				_ = SendDiscordNow($":boot: Kicked peer. Reason: {reason}");
+                disconnectMethod.Invoke(znet, new object[] { peer });
+                LogS.LogWarning($"[ServerGuard] Disconnected {pid} (reflection). Reason: {reason}");
+                _ = SendDiscordNow($":boot: Disconnected {pid}. Reason: {reason}");
                 return;
             }
 
-            var pid = GetPeerPlatformId(znetPeer);
-            var kickId = znet.GetType().GetMethod("Kick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[] { typeof(string) }, null);
-            if (kickId != null)
+            var internalKick = znet.GetType().GetMethod("InternalKick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[] { typeof(ZNetPeer) }, null);
+            if (internalKick != null)
             {
-                kickId.Invoke(znet, new object[] { pid });
-                LogS.LogWarning($"[ServerGuard] Kicked {pid}. Reason: {reason}");
-				_ = SendDiscordNow($":boot: Kicked {pid}. Reason: {reason}");
+                internalKick.Invoke(znet, new object[] { peer });
+                LogS.LogWarning($"[ServerGuard] InternalKick'd {pid}. Reason: {reason}");
+                _ = SendDiscordNow($":boot: Kicked {pid}. Reason: {reason}");
             }
         }
         catch (Exception ex)
@@ -1213,15 +1006,16 @@ For questions or contributions, open an issue on GitHub!
         {
             try
             {
+                if (peer == null || peer.m_rpc == null) return;
                 if (!ZNet.instance || !ZNet.instance.IsServer()) return;
 
-                var pid = Plugin.GetPeerPlatformId(peer);
+                var pid   = Plugin.GetPeerPlatformId(peer);
                 var pname = Plugin.GetPeerPlayerName(peer);
                 Plugin.LogS.LogInfo($"[ServerGuard] Incoming connection: {pname} ({pid})");
 
                 if (Plugin.Instance.IsAdmin(pid))
                 {
-                    Plugin.LogS.LogInfo($"[ServerGuard] {pid} is admin – skipping checks.");
+                    Plugin.LogS.LogInfo($"[ServerGuard] {pid} is admin - skipping attestation.");
                     if (Plugin.Instance._settings.EnableMetrics)
                     {
                         Plugin.Instance._metrics.admin_bypasses++;
@@ -1233,41 +1027,25 @@ For questions or contributions, open an issue on GitHub!
                 if (Plugin.Instance._settings.EnableMetrics)
                 {
                     Plugin.Instance._metrics.total_players_checked++;
+                    Plugin.Instance.SaveMetrics();
                 }
 
-                if (Plugin.Instance._settings.AggressiveNoModCheck)
+                // 1. Register the manifest receiver on this peer's ZRpc so we get a
+                //    callback when the client replies. Idempotent if it somehow runs twice.
+                peer.m_rpc.Register<string>("ServerGuard_Manifest", (rpc, json) =>
                 {
-                    if (Plugin.Instance.DetectLikelyModdedClient(peer, out var reason, out var matchedToken))
-                    {
-                        bool isAllowed = Plugin.Instance._ignoredModTokens.Contains(matchedToken);
+                    Plugin.Instance.OnManifestReceived(peer, json);
+                });
 
-                        // Blocklist mode: allowed = in ignore list
-                        // Whitelist mode: allowed = NOT in ignore list means it's blocked (opposite logic)
-                        if (Plugin.Instance._settings.UseWhitelistMode)
-                        {
-                            isAllowed = !isAllowed; // Invert for whitelist mode
-                        }
+                // 2. Generate a fresh challenge bound to this peer + session.
+                var challenge = Plugin.Instance.GenerateChallenge();
+                Plugin.Instance.RegisterPending(peer, pid, challenge);
 
-                        if (isAllowed && !string.IsNullOrEmpty(matchedToken))
-                        {
-                            Plugin.LogS.LogInfo($"[ServerGuard] Detected mod token '{matchedToken}' but it is allowed (ignore list).");
-                            if (Plugin.Instance._settings.EnableMetrics)
-                            {
-                                Plugin.Instance._metrics.allowlist_bypasses++;
-                                Plugin.Instance.SaveMetrics();
-                            }
-                        }
-                        else
-                        {
-                            Plugin.Instance.AddViolation(pid, RULE_MODDED);
-                            if (Plugin.Instance._settings.Enforce)
-                            {
-                                Plugin.Instance.TryKick(peer, $"{Plugin.Instance._settings.KickMessage} (No-mods policy)");
-                                return;
-                            }
-                        }
-                    }
-                }
+                // 3. Ask the client to attest. Companion plugin replies via ServerGuard_Manifest.
+                peer.m_rpc.Invoke("ServerGuard_RequestManifest", challenge);
+
+                // 4. Schedule a kick if the client never replies (= vanilla / wrong-version client).
+                Plugin.Instance.StartCoroutine(Plugin.Instance.AttestationTimeoutCoroutine(peer, pid));
             }
             catch (Exception ex)
             {
@@ -1362,140 +1140,261 @@ For questions or contributions, open an issue on GitHub!
         return null;
     }
 
-    private bool DetectLikelyModdedClient(ZNetPeer peer, out string reason, out string matchedToken)
-    {
-        reason = null;
-        matchedToken = null;
+    // -------------- Client Attestation --------------
 
+    private string GenerateChallenge()
+    {
+        var bytes = new byte[24];
+        using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(bytes);
+        return Convert.ToBase64String(bytes);
+    }
+
+    private static string GenerateSharedSecret()
+    {
+        // 32 bytes -> 256 bits of entropy, base64-encoded for easy copy/paste into client.yaml.
+        var bytes = new byte[32];
+        using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(bytes);
+        return Convert.ToBase64String(bytes);
+    }
+
+    // Updates the sharedSecret line in settings.yaml in-place, preserving comments and
+    // surrounding keys. If no line exists, appends one.
+    private static void PersistSharedSecret(string value)
+    {
+        var lines = File.Exists(SettingsYaml)
+            ? File.ReadAllLines(SettingsYaml).ToList()
+            : new List<string>();
+
+        var rx = new System.Text.RegularExpressions.Regex(@"^\s*sharedSecret\s*:.*$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        bool replaced = false;
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (rx.IsMatch(lines[i]))
+            {
+                lines[i] = $"sharedSecret: '{value}'";
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) lines.Add($"sharedSecret: '{value}'");
+
+        File.WriteAllLines(SettingsYaml, lines);
+    }
+
+    private void RegisterPending(ZNetPeer peer, string steamId, string challenge)
+    {
+        lock (_pendingLock)
+        {
+            _pending[peer.m_uid] = new PendingAttestation
+            {
+                Challenge = challenge,
+                SentAt    = DateTime.UtcNow,
+                SteamId   = steamId,
+                Peer      = peer
+            };
+        }
+    }
+
+    public IEnumerator AttestationTimeoutCoroutine(ZNetPeer peer, string steamId)
+    {
+        var seconds = Mathf.Max(1, _settings.CompanionTimeoutSeconds);
+        yield return new WaitForSeconds(seconds);
+
+        PendingAttestation pending;
+        lock (_pendingLock)
+        {
+            if (!_pending.TryGetValue(peer.m_uid, out pending) || pending == null) yield break;
+            _pending.Remove(peer.m_uid);
+        }
+
+        // Pending entry still present means the manifest never arrived in time.
+        LogS.LogWarning($"[ServerGuard] {steamId} did not deliver a manifest within {seconds}s. Treating as no-companion.");
+        _ = SendDiscordNow($":hourglass: No manifest from {steamId} in {seconds}s. Companion plugin missing or unreachable.");
+
+        if (_settings.RequireCompanion)
+        {
+            AddViolation(steamId, RULE_COMPANION_MISSING);
+            if (_settings.Enforce)
+            {
+                TryKick(peer, $"{_settings.KickMessage} (Missing required companion plugin: ServerGuard.Client)");
+            }
+        }
+    }
+
+    public void OnManifestReceived(ZNetPeer peer, string json)
+    {
+        string steamId = "UNKNOWN";
         try
         {
-            // ========== PHASE 1: RPC Token Detection (Enhanced) ==========
-            var rpcField = peer.GetType().GetField("m_rpc", BindingFlags.Instance | BindingFlags.NonPublic);
-            var rpc = rpcField?.GetValue(peer);
-            if (rpc != null)
+            steamId = GetPeerPlatformId(peer);
+
+            // Pop the pending attestation; ignore replies that arrive after timeout.
+            PendingAttestation pending;
+            lock (_pendingLock)
             {
-                var mMethodsF = rpc.GetType().GetField("m_methods", BindingFlags.Instance | BindingFlags.NonPublic);
-                var methods = mMethodsF?.GetValue(rpc) as IDictionary<string, Delegate>;
-                if (methods != null)
+                if (!_pending.TryGetValue(peer.m_uid, out pending) || pending == null)
                 {
-                    foreach (var name in methods.Keys)
-                    {
-                        if (_modPatterns?.rpc_tokens != null && _modPatterns.rpc_tokens.Count > 0)
-                        {
-                            foreach (var token in _modPatterns.rpc_tokens)
-                            {
-                                if (name.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    matchedToken = token;
-                                    reason = $"RPC token matched: {token}";
-                                    LogS.LogWarning($"[ServerGuard] Phase 1 detection (RPC): {reason} (method: {name})");
-                                    RecordMetricDetection(token, "RPC");
-                                    return true;
-                                }
-                            }
-                        }
-                    }
+                    LogS.LogWarning($"[ServerGuard] Manifest from {steamId} arrived with no pending challenge (timed out or duplicate). Ignoring.");
+                    return;
+                }
+                _pending.Remove(peer.m_uid);
+            }
+
+            ModManifest manifest;
+            try
+            {
+                manifest = JsonConvert.DeserializeObject<ModManifest>(json);
+            }
+            catch (Exception ex)
+            {
+                LogS.LogWarning($"[ServerGuard] Failed to parse manifest from {steamId}: {ex.Message}");
+                AddViolation(steamId, RULE_HMAC_INVALID);
+                if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Malformed manifest)");
+                return;
+            }
+            if (manifest == null)
+            {
+                LogS.LogWarning($"[ServerGuard] Empty manifest from {steamId}.");
+                AddViolation(steamId, RULE_HMAC_INVALID);
+                if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Empty manifest)");
+                return;
+            }
+
+            // 1. Challenge match (defeats cross-peer / cross-session replay).
+            if (!ModManifest.ConstantTimeEquals(manifest.Challenge ?? "", pending.Challenge ?? ""))
+            {
+                LogS.LogWarning($"[ServerGuard] Challenge mismatch from {steamId}.");
+                AddViolation(steamId, RULE_CHALLENGE_MISMATCH);
+                if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Challenge mismatch)");
+                return;
+            }
+
+            // 2. Timestamp window.
+            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (Math.Abs(nowUnix - manifest.TimestampUtc) > Math.Max(10, _settings.MaxClockSkewSeconds))
+            {
+                LogS.LogWarning($"[ServerGuard] Timestamp out of window for {steamId} (client={manifest.TimestampUtc} server={nowUnix}).");
+                AddViolation(steamId, RULE_HMAC_INVALID);
+                if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Clock skew exceeds policy)");
+                return;
+            }
+
+            // 3. HMAC.
+            if (_settings.RequireHmac)
+            {
+                if (string.IsNullOrEmpty(_settings.SharedSecret))
+                {
+                    LogS.LogError($"[ServerGuard] Cannot validate manifest from {steamId}: requireHmac=true but sharedSecret is empty on server.");
+                    if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Server misconfiguration: missing sharedSecret)");
+                    return;
+                }
+                var expected = ModManifest.ComputeHmac(manifest.CanonicalForHmac(), _settings.SharedSecret);
+                if (!ModManifest.ConstantTimeEquals(expected, manifest.Hmac ?? ""))
+                {
+                    LogS.LogWarning($"[ServerGuard] HMAC mismatch for {steamId}. Either bad sharedSecret on client, or tampered manifest.");
+                    AddViolation(steamId, RULE_HMAC_INVALID);
+                    if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Invalid signature)");
+                    return;
                 }
             }
 
-            // ========== PHASE 2: Assembly Namespace Scanning ==========
-            if (_settings.EnableAssemblyScanning)
+            // 4. Optionally log full manifest for GUID harvesting.
+            if (_settings.LogPeerManifest)
             {
-                var detectedMods = ScanPeerAssemblies(peer);
-                if (detectedMods.Count > 0)
-                {
-                    matchedToken = detectedMods[0];
-                    reason = $"Assembly namespaces detected: {string.Join(", ", detectedMods)}";
-                    LogS.LogWarning($"[ServerGuard] Phase 2 detection (Assembly): {reason}");
-                    RecordMetricDetection(matchedToken, "Assembly");
-                    return true;
-                }
+                var lines = (manifest.Mods ?? new List<ModManifestEntry>()).Select(m => $"  - {m.Guid}|{m.Name}|{m.Version}|{m.Sha256}");
+                LogS.LogInfo($"[ServerGuard] Manifest from {steamId} ({manifest.Mods?.Count ?? 0} mods):\n" + string.Join("\n", lines));
             }
 
-            // ========== PHASE 1 (continued): Version String Inspection ==========
-            var versionF = peer.GetType().GetField("m_playerVersion", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-            var verObj = versionF?.GetValue(peer);
-            var verStr = verObj?.ToString() ?? string.Empty;
-            
-            if (!string.IsNullOrEmpty(verStr))
+            // 5. Validate against allowed_mods.yaml.
+            var verdict = ValidateAgainstPolicy(manifest);
+            if (!verdict.Allowed)
             {
-                if (_modPatterns?.version_keywords != null && _modPatterns.version_keywords.Count > 0)
-                {
-                    foreach (var keyword in _modPatterns.version_keywords)
-                    {
-                        if (verStr.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            reason = $"Version string contains keyword '{keyword}': {verStr}";
-                            matchedToken = keyword;
-                            LogS.LogWarning($"[ServerGuard] Phase 1 detection (Version): {reason}");
-                            RecordMetricDetection(keyword, "Version");
-                            return true;
-                        }
-                    }
-                }
+                LogS.LogWarning($"[ServerGuard] {steamId} REJECTED: {verdict.Rule} - {verdict.Reason}");
+                _ = SendDiscordNow($":no_entry_sign: Rejected {steamId} - {verdict.Rule}: {verdict.Reason}");
+                AddViolation(steamId, verdict.Rule);
+                if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} ({verdict.Reason})");
+                return;
             }
+
+            LogS.LogInfo($"[ServerGuard] {steamId} attested OK ({manifest.Mods?.Count ?? 0} mods).");
         }
         catch (Exception ex)
         {
-            LogS.LogWarning($"[ServerGuard] DetectLikelyModdedClient error: {ex.Message}");
+            LogS.LogError($"[ServerGuard] OnManifestReceived error for {steamId}: {ex}");
         }
-
-        return false;
     }
 
-    private List<string> ScanPeerAssemblies(ZNetPeer peer)
+    private struct PolicyVerdict
     {
-        var detectedMods = new List<string>();
+        public bool Allowed;
+        public string Rule;
+        public string Reason;
+    }
 
-        try
+    private PolicyVerdict ValidateAgainstPolicy(ModManifest manifest)
+    {
+        var mods = manifest.Mods ?? new List<ModManifestEntry>();
+
+        // Index manifest by lowercase guid AND name for matching.
+        var byKey = new Dictionary<string, ModManifestEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var m in mods)
         {
-            var domain = AppDomain.CurrentDomain;
-            var loadedAssemblies = domain.GetAssemblies();
+            if (!string.IsNullOrEmpty(m?.Guid)) byKey[m.Guid.ToLowerInvariant()] = m;
+            if (!string.IsNullOrEmpty(m?.Name)) byKey[m.Name.ToLowerInvariant()] = m;
+        }
 
-            if (_modPatterns?.assembly_namespaces == null || _modPatterns.assembly_namespaces.Count == 0)
-                return detectedMods;
-
-            foreach (var assembly in loadedAssemblies)
+        // 1. banned_mods - any presence is fatal.
+        foreach (var b in _bannedMods)
+        {
+            if (byKey.TryGetValue(b.Key, out var hit))
             {
-                try
+                return new PolicyVerdict { Allowed = false, Rule = RULE_BANNED_MOD, Reason = $"Disallowed mod present: {hit.Name ?? hit.Guid}" };
+            }
+        }
+
+        // 2. required_mods - every entry must be present (with hash match if pinned).
+        foreach (var r in _requiredMods)
+        {
+            if (!byKey.TryGetValue(r.Key, out var hit))
+            {
+                return new PolicyVerdict { Allowed = false, Rule = RULE_REQUIRED_MOD_MISSING, Reason = $"Required mod missing: {r.Key}" };
+            }
+            if (!string.IsNullOrEmpty(r.Sha256) && !string.Equals(r.Sha256, hit.Sha256 ?? "", StringComparison.OrdinalIgnoreCase))
+            {
+                return new PolicyVerdict { Allowed = false, Rule = RULE_DISALLOWED_MOD, Reason = $"Required mod hash mismatch: {r.Key}" };
+            }
+        }
+
+        // 3. If allowUnlisted=false, every manifest mod must be in (required ∪ allowed).
+        if (!_settings.AllowUnlisted)
+        {
+            var allow = new Dictionary<string, AllowedModEntry>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in _requiredMods) allow[e.Key] = e;
+            foreach (var e in _allowedMods)  allow[e.Key] = e;
+
+            foreach (var m in mods)
+            {
+                AllowedModEntry rule = null;
+                if (!string.IsNullOrEmpty(m.Guid) && allow.TryGetValue(m.Guid.ToLowerInvariant(), out var byGuid)) rule = byGuid;
+                else if (!string.IsNullOrEmpty(m.Name) && allow.TryGetValue(m.Name.ToLowerInvariant(), out var byName)) rule = byName;
+
+                if (rule == null)
                 {
-                    var types = assembly.GetTypes();
-
-                    foreach (var type in types)
-                    {
-                        try
-                        {
-                            var typeName = type.FullName ?? string.Empty;
-
-                            foreach (var nsPattern in _modPatterns.assembly_namespaces)
-                            {
-                                if (typeName.IndexOf(nsPattern, StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    if (!detectedMods.Contains(nsPattern))
-                                    {
-                                        detectedMods.Add(nsPattern);
-                                    }
-                                }
-                            }
-                        }
-                        catch
-                        {
-                        }
-                    }
+                    var label = !string.IsNullOrEmpty(m.Guid) ? m.Guid : m.Name;
+                    return new PolicyVerdict { Allowed = false, Rule = RULE_DISALLOWED_MOD, Reason = $"Unapproved mod: {label}" };
                 }
-                catch
+                if (!string.IsNullOrEmpty(rule.Sha256) && !string.Equals(rule.Sha256, m.Sha256 ?? "", StringComparison.OrdinalIgnoreCase))
                 {
+                    return new PolicyVerdict { Allowed = false, Rule = RULE_DISALLOWED_MOD, Reason = $"Hash pin mismatch: {m.Name ?? m.Guid}" };
                 }
             }
         }
-        catch (Exception ex)
-        {
-            LogS.LogWarning($"[ServerGuard] ScanPeerAssemblies error: {ex.Message}");
-        }
 
-        return detectedMods;
+        return new PolicyVerdict { Allowed = true };
     }
-	
+
 	private sealed class DiscordLogListener : ILogListener, IDisposable
 	{
 		private readonly string _webhook;
@@ -1601,18 +1500,16 @@ For questions or contributions, open an issue on GitHub!
 
     private void StartWatchers()
     {
-        _watchSettings = MakeWatcher(SettingsYaml, () => LoadSettings());
-        _watchAdmins   = MakeWatcher(AdminsYaml,   () => LoadAdmins());
-        _watchIgnore   = MakeWatcher(IgnoreModsYaml, () => LoadIgnoreMods());
-        _watchModPatterns = MakeWatcher(ModPatternsYaml, () => LoadModPatterns());
+        _watchSettings = MakeWatcher(SettingsYaml,     () => LoadSettings());
+        _watchAdmins   = MakeWatcher(AdminsYaml,       () => LoadAdmins());
+        _watchAllowed  = MakeWatcher(AllowedModsYaml,  () => LoadAllowedMods());
     }
 
     private void StopWatchers()
     {
         try { _watchSettings?.Dispose(); } catch { }
         try { _watchAdmins?.Dispose(); } catch { }
-        try { _watchIgnore?.Dispose(); } catch { }
-        try { _watchModPatterns?.Dispose(); } catch { }
+        try { _watchAllowed?.Dispose(); } catch { }
     }
 
     private FileSystemWatcher MakeWatcher(string filePath, Action reloadAction)
@@ -1634,7 +1531,7 @@ For questions or contributions, open an issue on GitHub!
 
         _lastSeenWrite[path] = now;
 
-        Timer t = new Timer(debounceMs);
+        System.Timers.Timer t = new System.Timers.Timer(debounceMs);
         t.AutoReset = false;
         t.Elapsed += (s, e) =>
         {

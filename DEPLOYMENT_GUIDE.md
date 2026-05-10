@@ -1,535 +1,400 @@
-# 🚀 Valheim ServerGuard - Windows Server Deployment Guide
+# Deployment Guide — Valheim ServerGuard v1.3
 
-## Prerequisites
+A step-by-step walkthrough for installing ServerGuard on a Windows-hosted Valheim dedicated server and on each player's PC.
 
-Before starting, ensure you have:
-- ✅ Valheim Dedicated Server installed on your computer (from Steam)
-- ✅ .NET SDK 6.0 or higher installed ([Download here](https://dotnet.microsoft.com/en-us/download))
-- ✅ Visual Studio Code or Visual Studio installed (optional, but recommended)
+If you only want a quick overview, read the [README.md](README.md) instead. This document is the full version with screenshots-worth-of-detail.
 
 ---
 
-## 📍 Finding Your Valheim Server Directory
+## Before you start — checklist
 
-### Step 1: Locate Your Valheim Server Installation
+You need:
 
-**On Windows:**
+- A working **Valheim Dedicated Server** install (the `valheim_server.exe` one from Steam → Library → Tools).
+- **BepInEx 5.4.x** installed on the server. If `BepInEx/` doesn't exist in your server folder yet, install it before continuing — see the BepInEx-for-Valheim guide on Thunderstore or the BepInEx GitHub releases page.
+- The two compiled DLLs from this repo:
+  - `bin/Release/Valheim-ServerGuard.dll` (server-side)
+  - `ServerGuard.Client/bin/Release/Valheim-ServerGuard-Client.dll` (every player's PC)
 
-1. Open **Steam**
-2. Go to **Library** → **Tools**
-3. Find **Valheim Dedicated Server**
-4. Right-click → **Properties** → **Local Files** → **Browse...**
-5. You'll see a folder like: `C:\Program Files (x86)\Steam\steamapps\dedicated_servers\valheim_server`
-
-**Note the path!** You'll need it throughout this guide.
-
-Example paths:
-```
-C:\Program Files (x86)\Steam\steamapps\dedicated_servers\valheim_server
-D:\Games\Steam\steamapps\dedicated_servers\valheim_server
-```
+  If you don't have them yet, build them first — see [BUILD.md](BUILD.md).
+- Each player needs **BepInEx** running on their Valheim client. Most players already have this via [r2modman](https://thunderstore.io/c/valheim/p/ebkr/r2modman/) or Vortex.
 
 ---
 
-## 🔽 Step 1: Download ServerGuard Plugin
+## Part A — Server installation (one-time)
 
-### Option A: Download from GitHub (Recommended)
+### A1. Find your server folder
 
-1. Go to: https://github.com/yesu0725/Valheim-ServerGuard
-2. Click **Code** → **Download ZIP**
-3. Extract the ZIP file to a folder like `C:\Valheim-ServerGuard`
+Open Steam → Library → Tools → right-click **Valheim Dedicated Server** → **Properties** → **Local Files** → **Browse**.
 
-### Option B: Clone with Git
-
-Open **Command Prompt** or **PowerShell** and run:
-
-```bash
-git clone https://github.com/yesu0725/Valheim-ServerGuard.git
-cd Valheim-ServerGuard
-```
-
----
-
-## 🛠️ Step 2: Install BepInEx (Plugin Framework)
-
-BepInEx is the framework that ServerGuard runs on. Your Valheim server needs it.
-
-### Step 1: Download BepInEx
-
-1. Visit: https://github.com/BepInEx/BepInEx/releases
-2. Download the **latest release** (look for a version number like `5.4.x`)
-3. Choose the **Windows x64** version (BepInEx-5.4.x-win-x64.zip)
-4. Extract to your Valheim server directory
-
-Your structure should now look like:
-```
-C:\Program Files (x86)\Steam\steamapps\dedicated_servers\valheim_server\
-├── BepInEx/              ← New folder
-│   ├── plugins/
-│   ├── patchers/
-│   └── config/
-├── valheim_server.exe    ← Existing
-└── ...
-```
-
-### Step 2: Verify BepInEx Installation
-
-1. **Run the server once** to initialize BepInEx:
-   - Open Command Prompt
-   - Navigate to your server directory
-   - Run: `valheim_server.exe`
-   - Wait 30 seconds
-   - Press Ctrl+C to stop
-
-2. Check that `BepInEx/` folder now contains:
-   - `plugins/` folder
-   - `config/` folder
-   - `LogOutput.log` file
-
-✅ If these exist, BepInEx is installed correctly!
-
----
-
-## 🔧 Step 3: Build ServerGuard Plugin
-
-### Step 1: Open Command Prompt
-
-1. Navigate to where you downloaded ServerGuard
-2. Open **Command Prompt** or **PowerShell** in the folder
-
-```bash
-cd C:\Valheim-ServerGuard
-```
-
-### Step 2: Install Dependencies
-
-Run this command to restore required packages:
-
-```bash
-dotnet restore
-```
-
-**Expected output:**
-```
-Restore completed in X.XXs
-```
-
-### Step 3: Build the Plugin
-
-```bash
-dotnet build -c Release
-```
-
-**Expected output:**
-```
-Build succeeded.
-```
-
-**If it fails:**
-- Ensure .NET SDK 6.0+ is installed
-- Check the error messages carefully
-- Verify all files are in the right place
-
----
-
-## 📦 Step 4: Copy Plugin to Server
-
-After building, you need to copy the plugin files to your server.
-
-### Step 1: Locate the Built Files
-
-The compiled files should be in:
-```
-C:\Valheim-ServerGuard\bin\Release\net6.0\
-```
-
-Look for files named:
-- `Plugin.dll` (or the plugin assembly name)
-- `YamlDotNet.dll`
-- `Newtonsoft.Json.dll`
-
-### Step 2: Copy to BepInEx Plugins Folder
-
-1. Create a subfolder: `BepInEx/plugins/ServerGuard/`
-2. Copy these files into it:
-   - `Plugin.dll`
-   - `YamlDotNet.dll`
-   - `Newtonsoft.Json.dll`
-
-**Full path:**
-```
-C:\Program Files (x86)\Steam\steamapps\dedicated_servers\valheim_server\BepInEx\plugins\ServerGuard\
-├── Plugin.dll
-├── YamlDotNet.dll
-└── Newtonsoft.Json.dll
-```
-
-### Step 3: Verify Files Are Copied
-
-- Check the `ServerGuard/` folder has all 3 DLL files
-- If any are missing, the plugin won't work
-
----
-
-## 🚀 Step 5: Initialize ServerGuard Config Files
-
-### Step 1: Run Server to Generate Configs
-
-Open **Command Prompt** in your server directory:
-
-```bash
-cd "C:\Program Files (x86)\Steam\steamapps\dedicated_servers\valheim_server"
-valheim_server.exe
-```
-
-**Wait 2-3 minutes** for the server to fully start.
-
-**Expected output in console:**
-```
-[ServerGuard] Loaded (YAML). Enforcement: ON
-[ServerGuard] settings.yaml loaded
-[ServerGuard] admins.yaml loaded
-```
-
-✅ If you see these messages, ServerGuard started successfully!
-
-Press **Ctrl+C** to stop the server.
-
-### Step 2: Verify Config Files Created
-
-Check if these files were auto-created:
+Typical paths:
 
 ```
-BepInEx/config/ServerGuard/conf/
-├── settings.yaml              ← Main settings
-├── admins.yaml               ← Admin whitelist
-├── ignore_mods.yaml          ← Allowed mod tokens
-├── registrations.yaml        ← Character tracking
-└── violations.yaml           ← Violation log
+C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server
+D:\Steam\steamapps\common\Valheim dedicated server
 ```
 
-✅ All files should be present!
+You'll see something like this inside:
 
----
-
-## ⚙️ Step 6: Configure ServerGuard
-
-Now customize ServerGuard for your server.
-
-### Step 1: Open settings.yaml
-
-Navigate to:
 ```
-BepInEx/config/ServerGuard/conf/settings.yaml
+Valheim dedicated server\
+├── BepInEx\           ← must already exist
+│   ├── plugins\
+│   ├── config\
+│   └── core\
+├── valheim_server.exe
+└── start_headless_server.bat
 ```
 
-Open with **Notepad** or your favorite text editor.
+If `BepInEx\` is missing, install BepInEx first.
 
-### Step 2: Configure Settings
+### A2. Drop in the server plugin
 
-The file contains these key settings:
+Copy `Valheim-ServerGuard.dll` into:
 
-```yaml
-# Enable/disable enforcement
-Enforce: true
-
-# Violation threshold before auto-ban
-ViolationThreshold: 3
-
-# Enable mod detection
-AggressiveNoModCheck: true
-
-# Character limit per SteamID (default: 1)
-CharacterLimit: 1
-
-# Discord webhook URL (optional)
-discordWebhookUrl: ""
-
-# Kick message when player violates rules
-kickMessage: "You cannot join: server security policy violation. Contact an administrator."
-
-# Ban reason when threshold exceeded
-banReason: "Auto-banned due to repeated security violations."
+```
+<server>\BepInEx\plugins\Valheim-ServerGuard.dll
 ```
 
-**Recommended starting config (Vanilla-only):**
-```yaml
-Enforce: true
-AggressiveNoModCheck: true
-ViolationThreshold: 3
-CharacterLimit: 1
-discordWebhookUrl: ""
+It can sit directly inside `plugins\` — no subfolder needed.
+
+### A3. Boot the server once
+
+Run `start_headless_server.bat` (or `valheim_server.exe`) and wait until you see in the console:
+
+```
+[Info: Valheim ServerGuard] [ServerGuard] settings.yaml loaded
+[Info: Valheim ServerGuard] [ServerGuard] admins.yaml loaded (0 admins)
+[Info: Valheim ServerGuard] [ServerGuard] allowed_mods.yaml loaded (required=1, allowed=29, banned=0)
+[Info: Valheim ServerGuard] [ServerGuard] Loaded (v1.3.0). Enforcement: ON. RequireCompanion: ON. RequireHmac: ON. ...
+[Info: Valheim ServerGuard] [ServerGuard] sharedSecret in use (copy to every client.yaml): <a long base64 string>
 ```
 
-### Step 3: Save the File
+The last line is your **password**. Copy and save it somewhere — every player needs the exact same string in their config.
 
-Press **Ctrl+S** in Notepad to save.
+> If you scroll up and don't see the password, open `BepInEx/LogOutput.log` and search for `sharedSecret in use`.
 
----
+Stop the server with Ctrl+C.
 
-## 🎮 Step 7: Configure Allowed Mods
+### A4. Locate the generated config
 
-### Step 1: Open ignore_mods.yaml
-
-Navigate to:
 ```
-BepInEx/config/ServerGuard/conf/ignore_mods.yaml
-```
-
-Open with **Notepad**.
-
-### Step 2: Add Allowed Mods
-
-For **vanilla-only server**, leave default:
-```yaml
-ignore_mods:
-  - Jotunn
-  - ServerSync
+<server>\BepInEx\config\ServerGuard\conf\
+├── settings.yaml          ← server settings + the password
+├── admins.yaml            ← Steam IDs that bypass checks
+├── allowed_mods.yaml      ← the required / allowed / banned mod lists
+├── registrations.yaml     ← auto-managed
+├── violations.yaml        ← auto-managed
+└── metrics.yaml           ← auto-managed
 ```
 
-For **modded server**, add mods you allow:
-```yaml
-ignore_mods:
-  - Jotunn
-  - ServerSync
-  - ValheimPlus
-  - PlanBuild
-```
+Open `settings.yaml` to confirm `sharedSecret:` is filled in. If it's empty, add a value or delete the line and restart — ServerGuard auto-fills it on next boot.
 
-### Step 3: Save
+### A5. (Optional) Add yourself as admin
 
-Press **Ctrl+S**.
+Open `admins.yaml` and add your Steam ID:
 
----
-
-## 👤 Step 8: Add Admin Users (Optional)
-
-### Step 1: Open admins.yaml
-
-Navigate to:
-```
-BepInEx/config/ServerGuard/conf/admins.yaml
-```
-
-### Step 2: Get Your Steam ID
-
-1. Visit: https://steamid.io/
-2. Enter your Steam username
-3. Copy the **steamID64** (looks like: `76561198012345678`)
-
-### Step 3: Add to Admin List
-
-Edit the file:
 ```yaml
 admins:
-  - "76561198012345678"  # Your SteamID
-  - "76561198087654321"  # Friend's SteamID (optional)
+  - "76561198012345678"
 ```
 
-**Admins bypass ALL checks!**
+Find your ID at https://steamid.io (paste your profile URL, copy the **steamID64**).
 
-### Step 4: Save
+Admins **skip the entire mod check**, so use this for yourself only when troubleshooting.
 
-Press **Ctrl+S**.
+### A6. (Optional) Discord webhook
 
----
+Open `settings.yaml`. Set:
 
-## 🔗 Step 9: (Optional) Enable Discord Logging
-
-### Step 1: Create Discord Webhook
-
-1. Open your Discord server
-2. Go to **Channel Settings** → **Integrations** → **Webhooks**
-3. Click **New Webhook**
-4. Copy the **Webhook URL** (looks like: `https://discordapp.com/api/webhooks/...`)
-
-### Step 2: Add to settings.yaml
-
-Open `BepInEx/config/ServerGuard/conf/settings.yaml`
-
-Find and edit:
 ```yaml
-discordWebhookUrl: "https://discordapp.com/api/webhooks/YOUR_WEBHOOK_URL_HERE"
+discordWebhookUrl: 'https://discord.com/api/webhooks/<id>/<token>'
 ```
 
-### Step 3: Save
+Get the URL from Discord: server → channel → ⚙ → **Integrations → Webhooks → New Webhook → Copy URL**.
 
-Press **Ctrl+S**.
+Save the file. ServerGuard hot-reloads — no restart needed.
 
-**Now violations will be logged to Discord in real-time!**
+You should now see kicks/bans/violations posted to the channel in real time.
 
 ---
 
-## ✅ Step 10: Test the Installation
+## Part B — Client installation (every player, including the host)
 
-### Step 1: Start the Server
+Each player follows these same four steps on their own PC.
 
-Open **Command Prompt** in your server directory:
+### B1. Drop in the client plugin
 
-```bash
-cd "C:\Program Files (x86)\Steam\steamapps\dedicated_servers\valheim_server"
-valheim_server.exe
+If using **r2modmanager**:
+
+1. Open r2modman.
+2. Select your Valheim profile.
+3. Click the gear icon → **Browse profile folder**.
+4. Drop `Valheim-ServerGuard-Client.dll` into `BepInEx/plugins/`.
+
+If installing manually:
+
+```
+<your Valheim install>\BepInEx\plugins\Valheim-ServerGuard-Client.dll
 ```
 
-**Wait 3-5 minutes** for the server to fully start.
+### B2. Launch Valheim once
 
-### Step 2: Check Logs
+Start Valheim, wait until the **main menu** loads, then close the game.
 
-Look for messages like:
+This step matters: the companion plugin needs Valheim to fully start so all your other mods are loaded. On first launch it creates two files:
+
 ```
-[ServerGuard] Loaded (YAML). Enforcement: ON
-[ServerGuard] settings.yaml loaded
-[ServerGuard] admins.yaml loaded
-[ServerGuard] ignore_mods.yaml loaded
+<profile>\BepInEx\config\ServerGuard\client.yaml
+<profile>\BepInEx\config\ServerGuard\mods_for_allowed_mods.yaml
 ```
 
-✅ If you see these, ServerGuard is working!
+### B3. Paste the shared password
 
-### Step 3: Test with Vanilla Client
+Open `client.yaml` and paste the password your server admin gave you:
 
-1. Launch Valheim on your local computer
-2. Connect to your server (localhost)
-3. Create a character and join
-4. **You should join successfully** ✅
+```yaml
+sharedSecret: "ftnNxBse+Lx2H41ixsTJ637CFffq58C5rrvwwXrabYU="
+```
 
-### Step 4: Test with Modded Client (Optional)
+Watch out for:
+- **Don't change the quotes** — leave them as they are in the file (single or double, both work).
+- **No trailing spaces** after the value.
+- **No accidental line break** — the password is one long string.
 
-1. Install a mod on your client
-2. Try to join your server
-3. **You should be kicked** (if mod not allowed) or **allowed** (if in ignore list)
+### B4. Verify the companion loaded
+
+Open the BepInEx log:
+
+```
+<profile>\BepInEx\LogOutput.log
+```
+
+Find a line near the top that reads:
+
+```
+[Info: Valheim ServerGuard Client] [ServerGuard.Client] Loaded v1.3.0. Manifest entries: 29. HMAC: ON
+```
+
+If `HMAC: OFF`, your `client.yaml` doesn't have a password yet — go back to B3.
+
+If `Manifest entries:` shows a much smaller number than the mods you have installed, close the game, **delete** `mods_for_allowed_mods.yaml`, and launch again. (The companion now waits for all plugins to finish loading before counting them, so this should not happen on a fresh setup.)
 
 ---
 
-## 📊 Step 11: Monitor Your Server
+## Part C — Build the allowlist (one player, once)
 
-### Check Violations
+The server is now running, but its `allowed_mods.yaml` is mostly empty. You need to fill it with the mods your modpack uses.
 
-After running the server, check:
+### C1. Pick a "reference" client
+
+This is the player whose modpack defines what's allowed. Usually the host. They must have **every mod the server should permit** installed and working locally.
+
+### C2. Copy the export file
+
+On the reference client's PC, find:
+
 ```
-BepInEx/config/ServerGuard/conf/violations.yaml
-```
-
-You should see any rule violations recorded.
-
-### Check Discord (if configured)
-
-Your Discord channel should show:
-- Player connections
-- Violations
-- Auto-bans
-
-### Check Server Logs
-
-Open:
-```
-BepInEx/LogOutput.log
+<profile>\BepInEx\config\ServerGuard\mods_for_allowed_mods.yaml
 ```
 
-Contains detailed ServerGuard activity.
+Open it. It looks like this:
+
+```yaml
+# ServerGuard - allowed_mods snippet generated by ServerGuard.Client v1.3.0
+# Generated: 2026-05-10 09:42:01Z   Mods on this client: 29
+# ...
+
+required_mods:
+  - com.taeguk.valheim.serverguard.client|<hash>    # Valheim ServerGuard Client v1.3.0
+
+allowed_mods:
+  - advize.Armoire|<hash>                             # Armoire v1.1.5
+  - balrond.astafaraios.BalrondShipyard|<hash>        # BalrondShipyard v1.6.5
+  - com.bruce.valheim.comfyquickslots|<hash>          # ComfyQuickSlots v1.9.0
+  ...
+
+banned_mods: []
+```
+
+### C3. Paste into the server's allowed_mods.yaml
+
+On the server, open:
+
+```
+<server>\BepInEx\config\ServerGuard\conf\allowed_mods.yaml
+```
+
+**Replace** the existing `required_mods:`, `allowed_mods:`, and `banned_mods:` blocks with the three blocks from the export file.
+
+Save. The server's log will show:
+
+```
+[Info: Valheim ServerGuard] [ServerGuard] Reloaded: allowed_mods.yaml
+[Info: Valheim ServerGuard] [ServerGuard] allowed_mods.yaml loaded (required=1, allowed=28, banned=0)
+```
+
+No restart needed.
+
+### C4. Decide on hash pinning
+
+Each entry in the export comes with a `|<sha256>` suffix that **locks the mod to a specific DLL version**. This is great for security but means you'll need to refresh the list whenever a mod updates.
+
+If you'd rather accept any version of each mod, use search & replace in `allowed_mods.yaml` to remove the `|<hash>` portion. The GUID alone still uniquely identifies the mod.
 
 ---
 
-## 🎯 Quick Reference: Common Tasks
+## Part D — Smoke test
 
-### Restart the Server with New Config
+### D1. Server-side
 
-1. Stop the server: **Ctrl+C**
-2. Edit your YAML files
-3. Start the server again: `valheim_server.exe`
-4. **Changes auto-reload!** No plugins to reinstall.
+In `<server>\BepInEx\LogOutput.log` (a fresh tail) you should see, on a successful connect:
 
-### Add a New Mod to Allowlist
+```
+[Info: Valheim ServerGuard] [ServerGuard] Incoming connection: <name> (<steamid>)
+[Info: Valheim ServerGuard] [ServerGuard] <steamid> attested OK (29 mods).
+```
 
-1. Edit `ignore_mods.yaml`
-2. Add the mod name to the list
-3. Save
-4. **Changes apply immediately** - no restart needed!
+### D2. Client-side
 
-### Disable a Player
+In the player's `BepInEx/LogOutput.log`, after connecting:
 
-1. Edit `violations.yaml`
-2. Set their violation count high:
-   ```yaml
-   "76561198000000000":
-     ClientModded: 999
+```
+[Info: Valheim ServerGuard Client] [ServerGuard.Client] Registered manifest request handler on server peer.
+[Info: Valheim ServerGuard Client] [ServerGuard.Client] Sent manifest (1700 bytes, 29 mods).
+```
+
+### D3. Test rejection
+
+To prove enforcement works, add a fake banned entry to the server's `allowed_mods.yaml`:
+
+```yaml
+banned_mods:
+  - com.jotunn.jotunn   # temporarily ban Jotunn
+```
+
+Save. Have a player reconnect. They should be kicked with:
+
+```
+[ServerGuard] <steamid> REJECTED: BannedMod - Disallowed mod present: Jotunn
+```
+
+Remove the line afterwards.
+
+---
+
+## Part E — Deploying to friends
+
+Send each player two things via Discord/email/whatever:
+
+1. The file `Valheim-ServerGuard-Client.dll`.
+2. A copy-paste of the line:
    ```
-3. Save
-4. They'll be auto-banned on next connection
+   sharedSecret: "<the password from the server's settings.yaml>"
+   ```
+   …with instructions to put it in `BepInEx/config/ServerGuard/client.yaml`.
+
+That's all. Their setup is Part B (steps B1–B4).
+
+If you change the password later, redistribute the new value and have everyone update their `client.yaml`. The server hot-reloads its own; players need to relaunch Valheim.
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-### Problem: Server Won't Start
+### Server: `allowed_mods.yaml loaded (required=0, allowed=0, banned=0)` but the file looks populated
 
-**Error:** "Plugin failed to load"
+The YAML keys must be exactly `required_mods:`, `allowed_mods:`, `banned_mods:` (snake_case). If the file has `requiredMods:` or `RequiredMods:`, the parser won't find the lists.
 
-**Solution:**
-1. Check all 3 DLLs are in `BepInEx/plugins/ServerGuard/`
-2. Verify .NET SDK 6.0+ is installed
-3. Check `BepInEx/LogOutput.log` for errors
-4. Rebuild the plugin: `dotnet build -c Release`
+### Server: every connection times out with `CompanionMissing`
 
----
+Either the player isn't running `Valheim-ServerGuard-Client.dll`, or BepInEx isn't loading on their client. Have them check their own `BepInEx/LogOutput.log` for `Loading [Valheim ServerGuard Client 1.3.0]`. If absent, BepInEx isn't installed correctly on their side.
 
-### Problem: ServerGuard Not Loading
+### Server: rejections say `HmacInvalid` even with the password set
 
-**Error:** No ServerGuard messages in console
+Three causes:
+1. **Mismatched secret.** Compare the server's `settings.yaml` value to the client's `client.yaml` value byte-for-byte. Watch out for surrounding quotes and trailing whitespace.
+2. **Clock skew.** The client's system clock is more than 2 minutes off from the server's. On Windows, check `w32tm /query /status`. Alternatively raise `maxClockSkewSeconds` in `settings.yaml`.
+3. **Tampered manifest.** Genuine HMAC failure. Should not happen on a clean setup.
 
-**Solution:**
-1. Confirm `Plugin.dll` exists in plugins folder
-2. Check BepInEx is properly installed (run server once)
-3. Look for error messages in `BepInEx/LogOutput.log`
-4. Ensure no file path typos
+### Client: only some of my mods show up in `mods_for_allowed_mods.yaml`
 
----
+The export ran before BepInEx finished loading. **Delete** `mods_for_allowed_mods.yaml` and launch Valheim again. The companion now defers manifest collection until all plugins are loaded; on a fresh setup this should produce a complete list.
 
-### Problem: Server Performance Issues
+### Player got kicked but then got back in / stayed connected
 
-**Error:** Server gets laggy after ServerGuard starts
+Means the server-side disconnect call didn't fire properly. Make sure you're running `Valheim-ServerGuard.dll` v1.3.0 — the kick path was rewritten to use `ZNet.Disconnect(peer)` for a hard tear-down.
 
-**Solution:**
-1. Check `BepInEx/LogOutput.log` for errors
-2. Verify mod detection settings in `settings.yaml`
-3. Try disabling Discord logging temporarily
-4. Check system resources (CPU, RAM)
+### A test player hit `violationThreshold` and got auto-banned
 
----
+In the server console:
 
-## 📝 Checklist for Successful Deployment
+```
+unban <steamid>
+```
 
-- [ ] BepInEx installed in server directory
-- [ ] ServerGuard Plugin.dll copied to `BepInEx/plugins/ServerGuard/`
-- [ ] YamlDotNet.dll and Newtonsoft.Json.dll also copied
-- [ ] Server started once to generate config files
-- [ ] `settings.yaml` configured with desired settings
-- [ ] `ignore_mods.yaml` configured with allowed mods
-- [ ] `admins.yaml` has admin SteamIDs (optional)
-- [ ] Discord webhook added to settings (optional)
-- [ ] Server started successfully with ServerGuard messages
-- [ ] Vanilla client can join successfully
-- [ ] `violations.yaml` exists and is empty (before testing)
+Optionally remove their entry from `BepInEx/config/ServerGuard/conf/violations.yaml` so the counter resets.
 
----
+### I want to allow vanilla connections temporarily
 
-## 🎊 You're Done!
+In `settings.yaml`:
 
-Your Valheim ServerGuard is now deployed and protecting your server! 🚀
+```yaml
+requireCompanion: false
+```
 
-**Next Steps:**
-1. **Monitor** - Watch violations in YAML and Discord
-2. **Tune** - Adjust settings based on your community
-3. **Enforce** - Decide on vanilla-only or mod-friendly policy
-4. **Communicate** - Tell your players about the security policy
+Save. The server hot-reloads. Vanilla clients are admitted (they still have to pass the rest of the policy if `allowUnlisted: false`, so set that too if you want to allow any mod set):
+
+```yaml
+requireCompanion: false
+allowUnlisted: true
+```
+
+Reverse afterward.
 
 ---
 
-## 📞 Need Help?
+## Maintenance
 
-- **GitHub Repository:** https://github.com/yesu0725/Valheim-ServerGuard
-- **Check Server Logs:** `BepInEx/LogOutput.log`
-- **Review Config:** `BepInEx/config/ServerGuard/conf/`
+### Adding a new mod to the modpack
+
+1. The reference player installs the mod locally.
+2. Delete their `mods_for_allowed_mods.yaml`.
+3. Launch Valheim once.
+4. Open the regenerated file, copy the new entry into the server's `allowed_mods.yaml`.
+5. Server hot-reloads.
+
+### Updating an existing mod (with hash pinning)
+
+If you pinned hashes, the mod's new version will fail validation. Either:
+- Repeat the "add a new mod" flow above to refresh the hash, **or**
+- Drop the `|<hash>` suffix from the entry to accept any version.
+
+### Removing a mod
+
+Delete the line from `allowed_mods.yaml`. Players running it will be kicked on next connect (with reason `Unapproved mod: <name>`).
+
+### Rotating the shared password
+
+1. Edit `settings.yaml` on the server, replace `sharedSecret:` with a new random value.
+   - Or: delete the `sharedSecret:` line and restart the server. ServerGuard regenerates one and writes it back.
+2. Distribute the new value to every player.
+3. Each player edits their `client.yaml` and relaunches Valheim.
+
+The server hot-reloads its own setting, so players currently connected stay connected — but new connections require the new password.
 
 ---
 
-**Happy protecting your Valheim server!** ⚔️🛡️
+## Reference: where things live
+
+| What | Where |
+|---|---|
+| Server plugin DLL | `<server>\BepInEx\plugins\Valheim-ServerGuard.dll` |
+| Server config | `<server>\BepInEx\config\ServerGuard\conf\` |
+| Server log | `<server>\BepInEx\LogOutput.log` |
+| Client plugin DLL | `<player profile>\BepInEx\plugins\Valheim-ServerGuard-Client.dll` |
+| Client config | `<player profile>\BepInEx\config\ServerGuard\client.yaml` |
+| Client export (drop-in for server) | `<player profile>\BepInEx\config\ServerGuard\mods_for_allowed_mods.yaml` |
+| Client log | `<player profile>\BepInEx\LogOutput.log` |
+
+For everything else (option semantics, format details, advanced settings) see the [README.md](README.md) — Advanced section.
