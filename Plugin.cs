@@ -867,6 +867,28 @@ public class Plugin : BaseUnityPlugin
 
     private bool IsAdmin(string platformId) => _admins.Contains(platformId);
 
+    // Renders "<CharacterName> (<SteamID>)" for logs and Discord messages.
+    //
+    // The name is pulled from registrations.yaml. If the SteamID has multiple
+    // characters registered, all of them are listed comma-separated. If the
+    // SteamID has never logged in before (no entry in the dict), "NewPlayer"
+    // is shown - subsequent connections, once Patch_RPC_PeerInfo has recorded
+    // their character, will display the real name.
+    private string FormatPlayer(string steamId)
+    {
+        if (string.IsNullOrWhiteSpace(steamId)) return "NewPlayer (UNKNOWN)";
+
+        if (_registrations != null
+            && _registrations.TryGetValue(steamId, out var names)
+            && names != null
+            && names.Count > 0)
+        {
+            return $"{string.Join(", ", names)} ({steamId})";
+        }
+
+        return $"NewPlayer ({steamId})";
+    }
+
     private void RecordMetricDetection(string modToken, string detectionMethod)
     {
         if (!_settings.EnableMetrics || _metrics == null) return;
@@ -901,8 +923,9 @@ public class Plugin : BaseUnityPlugin
             SaveMetrics();
         }
 
-        LogS.LogWarning($"[ServerGuard] {platformId} violated {rule}. Count={map[rule]}/{_settings.ViolationThreshold}");
-		_ = SendDiscordNow($":warning: Violation by {platformId} — **{rule}** ({map[rule]}/{_settings.ViolationThreshold})");
+        var who = FormatPlayer(platformId);
+        LogS.LogWarning($"[ServerGuard] {who} violated {rule}. Count={map[rule]}/{_settings.ViolationThreshold}");
+		_ = SendDiscordNow($":warning: Violation by {who} — **{rule}** ({map[rule]}/{_settings.ViolationThreshold})");
 
         if (_settings.Enforce && map[rule] >= _settings.ViolationThreshold)
         {
@@ -912,7 +935,7 @@ public class Plugin : BaseUnityPlugin
                 _metrics.players_banned++;
                 SaveMetrics();
             }
-			_ = SendDiscordNow($":no_entry: Auto-banned {platformId}. Reason: {_settings.BanReason}");
+			_ = SendDiscordNow($":no_entry: Auto-banned {who}. Reason: {_settings.BanReason}");
         }
     }
 
@@ -924,6 +947,7 @@ public class Plugin : BaseUnityPlugin
             if (ZNet.instance == null) return;
 
             var pid = GetPeerPlatformId(peer);
+            var who = FormatPlayer(pid);
 
             // Tell the client *why* it's being disconnected. Best-effort - even if this
             // fails (e.g. socket already torn down), the Disconnect call below still runs.
@@ -941,8 +965,8 @@ public class Plugin : BaseUnityPlugin
             try
             {
                 ZNet.instance.Disconnect(peer);
-                LogS.LogWarning($"[ServerGuard] Disconnected {pid}. Reason: {reason}");
-                _ = SendDiscordNow($":boot: Disconnected {pid}. Reason: {reason}");
+                LogS.LogWarning($"[ServerGuard] Disconnected {who}. Reason: {reason}");
+                _ = SendDiscordNow($":boot: Disconnected {who}. Reason: {reason}");
                 return;
             }
             catch (Exception primaryEx)
@@ -958,8 +982,8 @@ public class Plugin : BaseUnityPlugin
             if (disconnectMethod != null)
             {
                 disconnectMethod.Invoke(znet, new object[] { peer });
-                LogS.LogWarning($"[ServerGuard] Disconnected {pid} (reflection). Reason: {reason}");
-                _ = SendDiscordNow($":boot: Disconnected {pid}. Reason: {reason}");
+                LogS.LogWarning($"[ServerGuard] Disconnected {who} (reflection). Reason: {reason}");
+                _ = SendDiscordNow($":boot: Disconnected {who}. Reason: {reason}");
                 return;
             }
 
@@ -967,8 +991,8 @@ public class Plugin : BaseUnityPlugin
             if (internalKick != null)
             {
                 internalKick.Invoke(znet, new object[] { peer });
-                LogS.LogWarning($"[ServerGuard] InternalKick'd {pid}. Reason: {reason}");
-                _ = SendDiscordNow($":boot: Kicked {pid}. Reason: {reason}");
+                LogS.LogWarning($"[ServerGuard] InternalKick'd {who}. Reason: {reason}");
+                _ = SendDiscordNow($":boot: Kicked {who}. Reason: {reason}");
             }
         }
         catch (Exception ex)
@@ -988,8 +1012,9 @@ public class Plugin : BaseUnityPlugin
             if (banId != null)
             {
                 banId.Invoke(znet, new object[] { platformId });
-                LogS.LogWarning($"[ServerGuard] Auto-banned {platformId}. Reason: {reason}");
-				_ = SendDiscordNow($":no_entry: Auto-banned {platformId}. Reason: {reason}");
+                var who = FormatPlayer(platformId);
+                LogS.LogWarning($"[ServerGuard] Auto-banned {who}. Reason: {reason}");
+				_ = SendDiscordNow($":no_entry: Auto-banned {who}. Reason: {reason}");
             }
         }
         catch (Exception ex)
@@ -1010,12 +1035,11 @@ public class Plugin : BaseUnityPlugin
                 if (!ZNet.instance || !ZNet.instance.IsServer()) return;
 
                 var pid   = Plugin.GetPeerPlatformId(peer);
-                var pname = Plugin.GetPeerPlayerName(peer);
-                Plugin.LogS.LogInfo($"[ServerGuard] Incoming connection: {pname} ({pid})");
+                Plugin.LogS.LogInfo($"[ServerGuard] Incoming connection: {Plugin.Instance.FormatPlayer(pid)}");
 
                 if (Plugin.Instance.IsAdmin(pid))
                 {
-                    Plugin.LogS.LogInfo($"[ServerGuard] {pid} is admin - skipping attestation.");
+                    Plugin.LogS.LogInfo($"[ServerGuard] {Plugin.Instance.FormatPlayer(pid)} is admin - skipping attestation.");
                     if (Plugin.Instance._settings.EnableMetrics)
                     {
                         Plugin.Instance._metrics.admin_bypasses++;
@@ -1090,7 +1114,7 @@ public class Plugin : BaseUnityPlugin
 				{
 					names.Add(charName);
 					Plugin.Instance.SaveRegistrations();
-					Plugin.LogS.LogInfo($"[ServerGuard] Registered character #{names.Count}/{limit} for {steamId} -> '{charName}'");
+					Plugin.LogS.LogInfo($"[ServerGuard] Registered character #{names.Count}/{limit} for {Plugin.Instance.FormatPlayer(steamId)} -> '{charName}'");
 				}
 				else
 				{
@@ -1101,7 +1125,7 @@ public class Plugin : BaseUnityPlugin
 					}
 					else
 					{
-						Plugin.LogS.LogWarning($"[ServerGuard] {steamId} exceeded character limit ({limit}). Tried '{charName}'. Allowed: {string.Join(", ", names)}");
+						Plugin.LogS.LogWarning($"[ServerGuard] {Plugin.Instance.FormatPlayer(steamId)} exceeded character limit ({limit}). Tried '{charName}'. Allowed: {string.Join(", ", names)}");
 					}
 				}
 			}
@@ -1210,8 +1234,9 @@ public class Plugin : BaseUnityPlugin
         }
 
         // Pending entry still present means the manifest never arrived in time.
-        LogS.LogWarning($"[ServerGuard] {steamId} did not deliver a manifest within {seconds}s. Treating as no-companion.");
-        _ = SendDiscordNow($":hourglass: No manifest from {steamId} in {seconds}s. Companion plugin missing or unreachable.");
+        var label = FormatPlayer(steamId);
+        LogS.LogWarning($"[ServerGuard] {label} did not deliver a manifest within {seconds}s. Treating as no-companion.");
+        _ = SendDiscordNow($":hourglass: No manifest from {label} in {seconds}s. Companion plugin missing or unreachable.");
 
         if (_settings.RequireCompanion)
         {
@@ -1229,6 +1254,7 @@ public class Plugin : BaseUnityPlugin
         try
         {
             steamId = GetPeerPlatformId(peer);
+            var who = FormatPlayer(steamId);
 
             // Pop the pending attestation; ignore replies that arrive after timeout.
             PendingAttestation pending;
@@ -1236,7 +1262,7 @@ public class Plugin : BaseUnityPlugin
             {
                 if (!_pending.TryGetValue(peer.m_uid, out pending) || pending == null)
                 {
-                    LogS.LogWarning($"[ServerGuard] Manifest from {steamId} arrived with no pending challenge (timed out or duplicate). Ignoring.");
+                    LogS.LogWarning($"[ServerGuard] Manifest from {who} arrived with no pending challenge (timed out or duplicate). Ignoring.");
                     return;
                 }
                 _pending.Remove(peer.m_uid);
@@ -1249,14 +1275,14 @@ public class Plugin : BaseUnityPlugin
             }
             catch (Exception ex)
             {
-                LogS.LogWarning($"[ServerGuard] Failed to parse manifest from {steamId}: {ex.Message}");
+                LogS.LogWarning($"[ServerGuard] Failed to parse manifest from {who}: {ex.Message}");
                 AddViolation(steamId, RULE_HMAC_INVALID);
                 if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Malformed manifest)");
                 return;
             }
             if (manifest == null)
             {
-                LogS.LogWarning($"[ServerGuard] Empty manifest from {steamId}.");
+                LogS.LogWarning($"[ServerGuard] Empty manifest from {who}.");
                 AddViolation(steamId, RULE_HMAC_INVALID);
                 if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Empty manifest)");
                 return;
@@ -1265,7 +1291,7 @@ public class Plugin : BaseUnityPlugin
             // 1. Challenge match (defeats cross-peer / cross-session replay).
             if (!ModManifest.ConstantTimeEquals(manifest.Challenge ?? "", pending.Challenge ?? ""))
             {
-                LogS.LogWarning($"[ServerGuard] Challenge mismatch from {steamId}.");
+                LogS.LogWarning($"[ServerGuard] Challenge mismatch from {who}.");
                 AddViolation(steamId, RULE_CHALLENGE_MISMATCH);
                 if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Challenge mismatch)");
                 return;
@@ -1275,7 +1301,7 @@ public class Plugin : BaseUnityPlugin
             var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             if (Math.Abs(nowUnix - manifest.TimestampUtc) > Math.Max(10, _settings.MaxClockSkewSeconds))
             {
-                LogS.LogWarning($"[ServerGuard] Timestamp out of window for {steamId} (client={manifest.TimestampUtc} server={nowUnix}).");
+                LogS.LogWarning($"[ServerGuard] Timestamp out of window for {who} (client={manifest.TimestampUtc} server={nowUnix}).");
                 AddViolation(steamId, RULE_HMAC_INVALID);
                 if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Clock skew exceeds policy)");
                 return;
@@ -1286,14 +1312,14 @@ public class Plugin : BaseUnityPlugin
             {
                 if (string.IsNullOrEmpty(_settings.SharedSecret))
                 {
-                    LogS.LogError($"[ServerGuard] Cannot validate manifest from {steamId}: requireHmac=true but sharedSecret is empty on server.");
+                    LogS.LogError($"[ServerGuard] Cannot validate manifest from {who}: requireHmac=true but sharedSecret is empty on server.");
                     if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Server misconfiguration: missing sharedSecret)");
                     return;
                 }
                 var expected = ModManifest.ComputeHmac(manifest.CanonicalForHmac(), _settings.SharedSecret);
                 if (!ModManifest.ConstantTimeEquals(expected, manifest.Hmac ?? ""))
                 {
-                    LogS.LogWarning($"[ServerGuard] HMAC mismatch for {steamId}. Either bad sharedSecret on client, or tampered manifest.");
+                    LogS.LogWarning($"[ServerGuard] HMAC mismatch for {who}. Either bad sharedSecret on client, or tampered manifest.");
                     AddViolation(steamId, RULE_HMAC_INVALID);
                     if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} (Invalid signature)");
                     return;
@@ -1304,25 +1330,25 @@ public class Plugin : BaseUnityPlugin
             if (_settings.LogPeerManifest)
             {
                 var lines = (manifest.Mods ?? new List<ModManifestEntry>()).Select(m => $"  - {m.Guid}|{m.Name}|{m.Version}|{m.Sha256}");
-                LogS.LogInfo($"[ServerGuard] Manifest from {steamId} ({manifest.Mods?.Count ?? 0} mods):\n" + string.Join("\n", lines));
+                LogS.LogInfo($"[ServerGuard] Manifest from {who} ({manifest.Mods?.Count ?? 0} mods):\n" + string.Join("\n", lines));
             }
 
             // 5. Validate against allowed_mods.yaml.
             var verdict = ValidateAgainstPolicy(manifest);
             if (!verdict.Allowed)
             {
-                LogS.LogWarning($"[ServerGuard] {steamId} REJECTED: {verdict.Rule} - {verdict.Reason}");
-                _ = SendDiscordNow($":no_entry_sign: Rejected {steamId} - {verdict.Rule}: {verdict.Reason}");
+                LogS.LogWarning($"[ServerGuard] {who} REJECTED: {verdict.Rule} - {verdict.Reason}");
+                _ = SendDiscordNow($":no_entry_sign: Rejected {who} - {verdict.Rule}: {verdict.Reason}");
                 AddViolation(steamId, verdict.Rule);
                 if (_settings.Enforce) TryKick(peer, $"{_settings.KickMessage} ({verdict.Reason})");
                 return;
             }
 
-            LogS.LogInfo($"[ServerGuard] {steamId} attested OK ({manifest.Mods?.Count ?? 0} mods).");
+            LogS.LogInfo($"[ServerGuard] {who} attested OK ({manifest.Mods?.Count ?? 0} mods).");
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[ServerGuard] OnManifestReceived error for {steamId}: {ex}");
+            LogS.LogError($"[ServerGuard] OnManifestReceived error for {FormatPlayer(steamId)}: {ex}");
         }
     }
 
