@@ -24,6 +24,10 @@ BepInEx/config/
 BepInEx/patchers/
 BepInEx/LogOutput.log
 
+# Thunderstore build output (the manifest/DLL/changelog/readme/icon are tracked;
+# only the packaged zips are build artifacts that don't belong in git)
+Thunderstore files/**/*.zip
+
 # OS
 .DS_Store
 Thumbs.db
