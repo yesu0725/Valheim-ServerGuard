@@ -1,8 +1,8 @@
 {
   "name": "Valheim_ServerGuard_Client",
-  "description": "Companion plugin for Valheim ServerGuard. Reports your loaded mods to a ServerGuard-protected server. Required on every player's client when joining such a server.",
-  "version_number": "1.3.0",
-  "website_url": "https://discord.gg/kZZqWfkeKU",
+  "description": "Companion plugin for Valheim ServerGuard. Required when joining a ServerGuard-protected server. Tells the server which mods you have loaded so it can let you in.",
+  "version_number": "1.4.0",
+  "website_url": "https://github.com/yesu0725/Valheim-ServerGuard",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2333",
     "ValheimModding-YamlDotNet-16.3.1",

@@ -1,32 +1,50 @@
 # Changelog
 
-Versions follow the plugin's internal version (`Plugin.cs` → `[BepInPlugin]`) on GitHub.
+## 1.4.0
+
+Big feature drop — anti-cheat, admin tools, and Discord cleanup.
+
+### New: anti-cheat
+- **Devcommands gate.** Players can't type `devcommands`, `god`, `fly`, `spawn`, etc. on your server. Vanilla cheat commands are blocked client-side and reported to you.
+- **Animation-cancel gate.** Blocks the classic emote / sheathe attack-cancel exploit (used to spam secondary attacks faster than vanilla allows).
+- **Movement-speed sanity check.** Flags players moving impossibly fast across the ground.
+- **Inventory validation.** Flags unknown items and over-sized stacks server-side.
+- **Skill-level cap.** Catches players with skill levels above the cap (default 100 + tolerance).
+
+### New: forensic tools
+- **Build/destroy heatmap.** Every piece place / destroy is logged to a daily CSV with attribution, including creature destroys (Troll smashes your base = logged as "Troll").
+- **Death log.** When a player dies, an entry is posted to your public Discord with the cause (creature name, PvP killer with SteamID, or environmental cause like "drowned"/"fell").
+- **Modset fingerprint.** Each server publishes a short hash (e.g. `8ce8906e`) that uniquely identifies its modpack — players can verify they're connecting with the matching pack.
+
+### New: admin console commands
+Press **F5** to open the console, then type `sg help`. You'll get a moderation toolkit without leaving the game:
+- `sg status`, `sg reload`, `sg modset`, `sg selftest`
+- `sg whois <name>`, `sg violations`, `sg pardon`, `sg kick`
+- `sg build at <x> <z>` / `by <name>` / `today` — query the heatmap
+- `sg destroyed at|by|today` and `sg placed at|by|today` — filter to destroys or placements only
+
+### Discord channel split
+- **Public channel** = community-friendly events only: `joined`, `left`, `kicked`, `died`. Safe to share with all players.
+- **Admin channel** (new) = curated moderation events: violations, config reloads, admin command audit, daily summary. Set `discordWebhookUrlAdmin` in `settings.yaml`.
+- **Admins are hidden from the public channel.** Their join/leave/death events go to the admin channel only.
+- **Daily summary** posts a one-paragraph digest each UTC midnight (joins, leaves, kicks, bans, top kick reasons).
+
+### New: ping / latency log
+Optional admin-only feature: posts each player's first ping after join and their session-average on disconnect. Helps spot VPN / proxy users. Default off.
+
+### Other improvements
+- **Self-test on boot.** Smoke-tests config (HMAC, webhook URLs, file permissions). Alerts the admin channel on any failure.
+- **Player death cause messages.** Now show creature names, killer SteamID for PvP, or environmental cause (burned / drowned / fell / etc.).
+- **Per-rule "counts as violation"** toggle so you can tune which rules can lead to auto-ban vs which are just informational.
+- **Hot-reload** of all config files — edit `settings.yaml` / `admins.yaml` / `allowed_mods.yaml` and the server picks it up within a second.
+- **Mod-set fingerprint mismatch detection.** When a player connects with the right mods but different versions, the admin channel notes it.
+
+### Bug fixes
+- Admin connection event now shows up properly.
+- Hammer-removed pieces now log correctly with attribution.
+- Build positions now record the real world coords (not the prefab origin).
+- Several Mono compatibility fixes for current Valheim builds.
 
 ## 1.3.0
 
-First release of the client-attestation architecture. The previous heuristic detection (RPC token sniffing, assembly namespace scanning, version-keyword matching) was unreliable — Phase 2 in particular was scanning the *server's* own AppDomain, not the client's, and produced a 100% false-positive rate. v1.3 replaces all of it.
-
-### How it works now
-- Every player runs a small companion plugin (`Valheim-ServerGuard-Client.dll`) that builds a list of their loaded BepInEx plugins (GUID + name + version + SHA-256 hash).
-- The server challenges each connecting peer for that list, HMAC-SHA256 signed with a shared secret to prevent forgery and replay attacks.
-- The server validates the signature, checks every mod against `allowed_mods.yaml` (`required_mods` / `allowed_mods` / `banned_mods`), and admits or kicks accordingly.
-- Vanilla / wrong-modpack clients don't have the companion plugin → no manifest arrives → kicked on timeout.
-
-### What's new
-- **Auto-generated shared secret.** On first launch the server mints a 256-bit base64 password and writes it into `settings.yaml`. Upgrading from a config with an empty `sharedSecret` also self-heals — a fresh value is generated, written back, and logged so the operator can copy it to each client's `client.yaml`.
-- **Companion-side `mods_for_allowed_mods.yaml` export.** On first launch the client plugin enumerates every loaded mod and writes a ready-to-paste YAML snippet (GUID-keyed, optionally hash-pinned, sorted by display name) at `BepInEx/config/ServerGuard/mods_for_allowed_mods.yaml`. Drop its contents into the server's `allowed_mods.yaml` to bootstrap the allowlist.
-- **Deferred client manifest build.** The companion now waits past BepInEx's chainloader before enumerating plugins, so even mods that load after ServerGuard.Client are included. The manifest is also rebuilt on every server request to handle late-loading mods.
-- **GUID-keyed allowlist with optional SHA-256 hash pinning.** Entries can be `GUID`, `GUID|sha256` (pin a specific DLL), or display-name fallback.
-- **Discord & log messages identify players by character name.** Every line and webhook event now shows `CharacterName (SteamID)` instead of bare SteamIDs, sourced from `registrations.yaml`. Brand-new Steam IDs appear as `NewPlayer (id)` until they pick a character; multi-character Steam IDs are listed comma-separated.
-- **`characterLimit` setting.** Caps how many distinct character names a single Steam ID can use on this server (default 1).
-
-### Bug fixes in 1.3
-- `allowed_mods.yaml` no longer parses as empty. The YAML deserializer's camelCase convention had been mangling the snake_case keys (`required_mods`, `allowed_mods`, `banned_mods`) before lookup, so zero entries matched. Fixed via explicit `[YamlMember(Alias = …)]` annotations.
-- Kicks now actually disconnect the player. The previous reflection-based `Kick(ZNetPeer)` resolved to a Valheim method that soft-queued the disconnect; the handshake outpaced it. Now uses `ZNet.Disconnect(peer)` directly (the path Valheim's console `kick` uses).
-
-### Removed / deprecated
-- `mod_patterns.yaml`, `ignore_mods.yaml`, `enableAssemblyScanning`, `useWhitelistMode`, `aggressiveNoModCheck`, `requireAttestation` — gone. Old files are auto-renamed to `.legacy` on first launch; deprecated settings are silently ignored.
-
-## 1.2.0 and earlier
-
-Internal preview builds with heuristic detection. Not published on Thunderstore.
+Initial public release. Mod allowlist with HMAC-signed attestation, per-peer auto-ban for repeat violations, hot-reload of configs, Discord webhook integration.
