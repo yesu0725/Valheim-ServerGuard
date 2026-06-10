@@ -9,16 +9,18 @@
 bin/
 obj/
 
-# Unity
+# Unity (leftover template rules — *.csproj removed because project files are tracked)
 Library/
 Temp/
-*.csproj
 *.unityproj
 *.sln
 *.sln.docstates
 *.pidb.meta
 *.pdb
 *.mdb
+
+# Claude Code worktrees (auto-created by Claude Code, not source)
+.claude/worktrees/
 # BepInEx configs & logs (optional to ignore)
 BepInEx/config/
 BepInEx/patchers/
