@@ -42,7 +42,8 @@ Valheim-ServerGuard/
 │   ├── discord-routing.md
 │   ├── settings-reference.md
 │   ├── build-and-release.md
-│   └── known-errors.md
+│   ├── known-errors.md
+│   └── IMPLEMENTATION_SUMMARY.md
 ├── Plugin.cs                          ← server plugin (~4100 lines)
 ├── ServerGuard.Client/
 │   └── ClientPlugin.cs                ← client plugin (~1340 lines)
@@ -87,3 +88,4 @@ Valheim-ServerGuard/
 | [`claude/settings-reference.md`](claude/settings-reference.md) | Adding a new setting, understanding all current settings |
 | [`claude/build-and-release.md`](claude/build-and-release.md) | Building, bumping version, releasing to Thunderstore and GitHub |
 | [`claude/known-errors.md`](claude/known-errors.md) | Debugging — every error hit in this project and its fix |
+| [`claude/IMPLEMENTATION_SUMMARY.md`](claude/IMPLEMENTATION_SUMMARY.md) | High-level feature and code structure overview — good first read for a new session |

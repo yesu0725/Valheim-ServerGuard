@@ -267,5 +267,5 @@ See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL bu
 
 ---
 
-**Version:** 1.3.0
+**Version:** 1.4.0
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

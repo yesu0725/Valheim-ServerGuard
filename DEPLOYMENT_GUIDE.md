@@ -13,10 +13,10 @@ You need:
 - A working **Valheim Dedicated Server** install (the `valheim_server.exe` one from Steam → Library → Tools).
 - **BepInEx 5.4.x** installed on the server. If `BepInEx/` doesn't exist in your server folder yet, install it before continuing — see the BepInEx-for-Valheim guide on Thunderstore or the BepInEx GitHub releases page.
 - The two compiled DLLs from this repo:
-  - `bin/Release/Valheim-ServerGuard.dll` (server-side)
-  - `ServerGuard.Client/bin/Release/Valheim-ServerGuard-Client.dll` (every player's PC)
+  - `Thunderstore files/Valheim-ServerGuard (server)/Valheim-ServerGuard.dll` (server-side)
+  - `Thunderstore files/Valheim-ServerGuard (client)/Valheim-ServerGuard-Client.dll` (every player's PC)
 
-  If you don't have them yet, build them first — see [BUILD.md](BUILD.md).
+  These are the release-ready DLLs committed to the repo. If you want to build from source instead, see [BUILD.md](BUILD.md).
 - Each player needs **BepInEx** running on their Valheim client. Most players already have this via [r2modman](https://thunderstore.io/c/valheim/p/ebkr/r2modman/) or Vortex.
 
 ---

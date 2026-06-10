@@ -67,7 +67,7 @@ dotnet build -c Release
 The output DLL lands at:
 
 ```
-bin\Release\net462\Valheim-ServerGuard.dll
+bin\Release\Valheim-ServerGuard.dll
 ```
 
 Single-line equivalent:
@@ -83,7 +83,7 @@ dotnet build Valheim-ServerGuard.csproj -c Release
 Copy the built DLL into the BepInEx plugins folder of your dedicated server:
 
 ```powershell
-Copy-Item "bin\Release\net462\Valheim-ServerGuard.dll" `
+Copy-Item "bin\Release\Valheim-ServerGuard.dll" `
           "<server-root>\BepInEx\plugins\Valheim-ServerGuard.dll"
 ```
 
