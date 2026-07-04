@@ -4,6 +4,15 @@ Lock your Valheim dedicated server to a specific list of mods. Vanilla and wrong
 
 It works because every player runs a small companion plugin that tells the server exactly which mods they have loaded — signed with a shared password so it can't be faked. The server compares the list to your allowlist and decides whether to let them in.
 
+Beyond the mod allowlist, it also includes anti-cheat gates, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
+
+### New in 1.6.0
+
+- **Raid alerts** — random-event raids are posted to Discord using their real in-game name (e.g. "The Horde Is Attacking") with coordinates and pause/resume/end updates.
+- **Shout logging** — player `/s` shouts are forwarded to the public Discord channel.
+- **Cheat-item removal** — configured items (`SwordCheat`, `SledgeCheat` by default) are stripped from non-admin inventories on login.
+- **Quick Login panel** *(client, optional, off by default)* — a one-click title-screen join for your server: logo, description, live player count, and direct connect with no IP/password prompt. See the [Quick Login wiki page](https://github.com/yesu0725/Valheim-ServerGuard/wiki/Quick-Login).
+
 ---
 
 ## What you need
@@ -267,5 +276,5 @@ See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL bu
 
 ---
 
-**Version:** 1.4.0
+**Version:** 1.6.0
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

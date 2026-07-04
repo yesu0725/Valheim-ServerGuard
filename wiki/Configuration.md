@@ -107,6 +107,28 @@ See **[Forensic Logs](Forensic-Logs)**.
 | `pingLogSampleSeconds` | `5` | Sample interval. |
 | `enableMetrics` | `true` | Internal counters at `BepInEx/config/ServerGuard/metrics.yaml`. |
 
+## Cheat item removal
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enableCheatItemRemoval` | `true` | On login, the companion removes the listed items from any non-admin player's inventory (after they spawn). |
+| `cheatItems` | `[SwordCheat, SledgeCheat]` | Prefab names to remove. Add more entries to strip other items. Admins are always exempt. |
+
+```yaml
+enableCheatItemRemoval: true
+cheatItems:
+  - SwordCheat
+  - SledgeCheat
+```
+
+## Raid alerts
+
+Raid / random-event start, pause, resume, and end are posted to the **public** Discord channel automatically (no setting to enable — it follows `discordWebhookUrl`). Events are named with their in-game title (e.g. "The Horde Is Attacking") rather than the internal code name.
+
+## Quick Login panel (client-side)
+
+The title-screen one-click login panel is configured on each **client** in `client.yaml`, not in the server's `settings.yaml`. See **[Quick Login Panel](Quick-Login)**.
+
 ## Files written by the plugin
 
 | Path | Purpose |

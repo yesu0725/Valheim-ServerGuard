@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.0
+
+Companion update for ServerGuard 1.6.0 server. Required version match — install both at the same time.
+
+### New: Quick Login panel (optional, off by default)
+- Adds a panel to the **title screen** so you can join your server with **one click** — no server browser, no IP entry, no password prompt.
+- Clicking **Connect** takes you to character selection; after you pick a character you connect straight to the configured server. (You can also click **Start Game** first, pick a character, then **Connect** — the panel stays on screen.)
+- Shows the server **logo** (PNG/JPG), **name**, **description**, and a **live player count** (queried while you sit on the menu).
+- Uses the game's own font and button styling.
+- Enable and configure it in `BepInEx/config/ServerGuard/client.yaml` (`quickLoginEnabled`, `serverAddress`, `serverPort`, `serverPassword`, `serverName`, `serverDescription`, `serverLogoPath`). Place the logo image in `BepInEx/config/ServerGuard/`.
+
+### New: player-facing
+- **Shout reporting.** When you `/s` shout, the companion forwards it so the server can post it to the public Discord channel.
+- **Cheat-item removal.** If the server enables it, configured cheat items (e.g. `SwordCheat`, `SledgeCheat`) are removed from your inventory on login unless you're an admin.
+
 ## 1.4.0
 
 Companion update for ServerGuard 1.4.0 server. Required version match — install both at the same time.

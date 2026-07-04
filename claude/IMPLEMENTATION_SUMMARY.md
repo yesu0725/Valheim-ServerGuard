@@ -311,6 +311,8 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 
 ## Version
 
+**1.6.0** — merge of the two lineages into one codebase. Keeps the 1.4.0 anti-cheat gates, `sg` admin console, build/death forensics, two-channel Discord routing, and self-test; adds raid event logging with **in-game display names** (via `RaidDisplayNames` map on `Patch_SetRandomEvent`/`Patch_ResetRandomEvent`), player shout logging (`ServerGuard_Chat` ZRpc), cheat-item removal on login (`ServerGuard_RemoveItems` ZRpc; `enableCheatItemRemoval`/`cheatItems`), and the client-side **Quick Login** title-screen panel (direct connect via `m_queuedJoinServer` re-asserted in an `OnCharacterStart` prefix; static `FejdStartup.ServerPassword` skips the password prompt).
+
 **1.5.0** — player shout logging (client-reported via `ServerGuard_Chat` ZRpc; whisper logging removed — architecture limitation), player death logging with attacker attribution (client-reported via `ServerGuard_PlayerDeath` ZRpc, admin deaths suppressed), explicit player join/leave Discord notifications, explicit admin login/logout Discord notifications.
 
 **1.4.0** — dual-webhook Discord routing, maintenance mode, server lifecycle notifications (boot/shutdown), raid event logging with pause detection, `countAsViolation` per-rule counting control, full settings.yaml restoration (all options visible on fresh install), `discordWebhookUrlAdmin` backward-compat alias.
@@ -318,13 +320,13 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 **1.3.0** — first release of the client-attestation architecture.
 
 The version string is set independently in:
-- `Plugin.cs` — `[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.5.0")]` + hardcoded `v1.5.0` in log/config strings
-- `ClientPlugin.cs` — `public const string VERSION = "1.5.0";`
-- `Valheim-ServerGuard.csproj` — `<Version>1.5.0</Version>`
-- `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` — `<Version>1.5.0</Version>`
-- `Thunderstore files/Valheim-ServerGuard (server)/manifest.json` — `"version_number": "1.5.0"`
-- `Thunderstore files/Valheim-ServerGuard (client)/manifest.json` — `"version_number": "1.5.0"`
-- `README.md`, `IMPLEMENTATION_SUMMARY.md`, `DEPLOYMENT_GUIDE.md`, `BUILD.md` — inline version references
+- `Plugin.cs` — `[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.0")]` + hardcoded `v1.6.0` in log/config strings
+- `ClientPlugin.cs` — `public const string VERSION = "1.6.0";`
+- `Valheim-ServerGuard.csproj` — `<Version>1.6.0</Version>`
+- `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` — `<Version>1.6.0</Version>`
+- `Thunderstore files/Valheim-ServerGuard (server)/manifest.json` — `"version_number": "1.6.0"`
+- `Thunderstore files/Valheim-ServerGuard (client)/manifest.json` — `"version_number": "1.6.0"`
+- `README.md`, `claude/IMPLEMENTATION_SUMMARY.md`, `DEPLOYMENT_GUIDE.md`, `BUILD.md` — inline version references
 - Both Thunderstore `README.md` and `CHANGELOG.md` files
 
 Bump all locations together when releasing. Add a new `## x.y.z` section at the top of each `CHANGELOG.md`; do not rename the previous heading.

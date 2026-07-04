@@ -15,6 +15,10 @@ Player-facing events only. Safe to share with your whole community.
 | Player kicked | `🚪 Erik (76561198064360681) was kicked — wrong password` |
 | Player auto-banned | `⛔ Erik (76561198064360681) was auto-banned — too many strikes` |
 | Player died | `💀 Erik (76561198064360681) died at [-1234, 567] — killed by a Troll` |
+| Player shouted | `📣 **Erik** shouted: they're at the docks!` |
+| Raid started | `⚔️ **The Horde Is Attacking** has started! Location: X:123, Z:-456` |
+| Raid paused / resumed | `⏸️ **The Horde Is Attacking** is paused — no players in the event area.` |
+| Raid ended | `✅ **The Horde Is Attacking** is over!` |
 
 **Admins are hidden from this channel.** Their joins, leaves, deaths, and kicks all route to the admin channel instead. Players never see admins coming and going.
 
@@ -24,7 +28,7 @@ Curated moderation events. Use a private channel that only moderators can see.
 
 | Event | Example |
 |---|---|
-| Server boot | `🚀 ServerGuard online v1.4.0  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
+| Server boot | `🚀 ServerGuard online v1.6.0  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
 | Hot-reload | `🔄 allowed_mods.yaml reloaded — req=1 allow=29 ban=0` |
 | Counted violation | `⚠️ Erik (765…) violated DevcommandAttempt (1/3) — fly` |
 | Informational rule | `👁 Erik (765…) triggered HashMismatch (informational — not counted) — Jotunn` |

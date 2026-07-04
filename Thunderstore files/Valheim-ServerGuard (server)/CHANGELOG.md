@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.0
+
+Social/QoL feature drop on top of the 1.4.0 anti-cheat + admin toolkit (everything from 1.4.0 is still here).
+
+### New
+- **Raid event alerts.** When a random event / raid begins, pauses (no players in the area), resumes, or ends, ServerGuard posts to the public Discord channel using the **actual in-game event name** (e.g. "The Horde Is Attacking", "You Are Being Hunted") instead of the internal code name, with world coordinates.
+- **Player shout logging.** Player shouts (`/s`) are forwarded by the companion and posted to the public Discord channel (chat can no longer be observed server-side, so the companion reports them).
+- **Cheat-item removal.** On login, non-admin players have configured cheat items stripped from their inventory (`SwordCheat`, `SledgeCheat` by default). Configure via `enableCheatItemRemoval` and `cheatItems` in `settings.yaml`; admins are exempt.
+
+### Companion
+- Requires companion plugin **v1.6.0** (adds the optional title-screen Quick Login panel — see the client changelog).
+
 ## 1.4.0
 
 Big feature drop — anti-cheat, admin tools, and Discord cleanup.

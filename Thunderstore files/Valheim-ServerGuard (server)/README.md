@@ -6,7 +6,9 @@ A single mod that handles the messy parts of running a dedicated Valheim server 
 
 - **Locks your server to a specific modpack.** Players running the wrong mods are kicked at the door.
 - **Blocks common cheats.** `devcommands` / `god` / `fly` / `spawn` and other console cheats are silently neutered. Emote attack-cancel exploit is blocked. Suspicious movement speed and skill levels are flagged.
-- **Sends events to Discord.** Public channel for player events (joined / kicked / died). Optional admin channel for moderation events (violations / config reloads / daily summary).
+- **Sends events to Discord.** Public channel for player events (joined / kicked / died / **shouts** / **raid alerts**). Optional admin channel for moderation events (violations / config reloads / daily summary).
+- **Announces raids by their real name.** Random-event raids are posted to Discord using the in-game event name (e.g. "The Horde Is Attacking") with coordinates, plus pause/resume/end updates.
+- **Strips cheat items on login.** Configured items (`SwordCheat`, `SledgeCheat` by default) are removed from non-admin players' inventories when they join.
 - **Provides admin commands in the game console.** Open the F5 console, type `sg help`. Kick, pardon, query the build log, hot-reload config — without leaving the game.
 - **Records build / destroy events to CSV.** Useful when investigating grief reports.
 
@@ -38,6 +40,6 @@ This mod is **free to use as is**. Voluntary support is appreciated.
 
 ---
 
-**Version:** 1.4.0
+**Version:** 1.6.0
 **Source / issues / wiki:** https://github.com/yesu0725/Valheim-ServerGuard
 **Companion (required on every client):** `TaegukGaming-Valheim_ServerGuard_Client`
