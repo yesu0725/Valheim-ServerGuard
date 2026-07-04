@@ -3,15 +3,18 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Bootstrap;
 using BepInEx.Logging;
 using HarmonyLib;
 using Newtonsoft.Json;
 using UnityEngine;
+using UnityEngine.UI;
 using ValheimServerGuard.Shared;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
@@ -23,7 +26,7 @@ namespace ValheimServerGuardClient
     {
         public const string GUID    = "com.taeguk.valheim.serverguard.client";
         public const string NAME    = "Valheim ServerGuard Client";
-        public const string VERSION = "1.3.0";
+        public const string VERSION = "1.5.0";
 
         internal static ClientPlugin Instance;
         internal static ManualLogSource LogS;
@@ -31,6 +34,18 @@ namespace ValheimServerGuardClient
 
         private string _sharedSecret = "";
         private List<ModManifestEntry> _cachedManifest;
+
+        // Quick Login
+        private ClientSettings _clientSettings = new ClientSettings();
+        private GameObject     _quickLoginPanel;
+        // TMP_Text or UnityEngine.UI.Text — updated via SetAnyText.
+        private Component      _playerCountText;
+
+        // One-shot quick-join state. Armed when Connect is clicked; re-asserted in the
+        // OnCharacterStart prefix so the game connects directly. Cleared on back-out.
+        private bool           _quickJoinArmed;
+        private object         _armedJoinData;
+        private string         _armedPassword;
 
         private static readonly string ConfDir    = Path.Combine(Paths.ConfigPath, "ServerGuard");
         private static readonly string ClientYaml = Path.Combine(ConfDir, "client.yaml");
@@ -42,6 +57,17 @@ namespace ValheimServerGuardClient
         private class ClientSettings
         {
             public string SharedSecret { get; set; } = "";
+
+            // Quick Login panel (shown on the game's title screen)
+            public bool   QuickLoginEnabled   { get; set; } = false;
+            public string ServerAddress       { get; set; } = "";
+            public int    ServerPort          { get; set; } = 2456;
+            public string ServerPassword      { get; set; } = "";
+            public string ServerName          { get; set; } = "";
+            public string ServerDescription   { get; set; } = "";
+            // Filename relative to BepInEx/config/ServerGuard/ (e.g. "logo.png").
+            // Supported formats: PNG, JPG.  Leave empty to show no logo.
+            public string ServerLogoPath      { get; set; } = "";
         }
 
         private void Awake()
@@ -196,10 +222,24 @@ namespace ValheimServerGuardClient
                 {
                     var sb = new StringBuilder();
                     sb.AppendLine("# Valheim ServerGuard - Client config");
+                    sb.AppendLine("");
                     sb.AppendLine("# sharedSecret MUST match the server's settings.yaml `sharedSecret` value");
                     sb.AppendLine("# verbatim. The server will reject manifests whose HMAC does not match.");
                     sb.AppendLine("# Leave empty only if the server has `requireHmac: false` (insecure).");
                     sb.AppendLine("sharedSecret: \"\"");
+                    sb.AppendLine("");
+                    sb.AppendLine("# ---------------------------------------------------------------");
+                    sb.AppendLine("# Quick Login panel (title screen)");
+                    sb.AppendLine("# When enabled, a panel is shown on the main menu so players can");
+                    sb.AppendLine("# connect to your server with one click — no IP/password dialog.");
+                    sb.AppendLine("# ---------------------------------------------------------------");
+                    sb.AppendLine("quickLoginEnabled: false");
+                    sb.AppendLine("serverAddress: \"\"       # e.g. 192.168.1.1 or my.server.com");
+                    sb.AppendLine("serverPort: 2456");
+                    sb.AppendLine("serverPassword: \"\"     # stored in plain text; leave empty for public servers");
+                    sb.AppendLine("serverName: \"\"         # displayed as the panel heading");
+                    sb.AppendLine("serverDescription: \"\" # shown below the name");
+                    sb.AppendLine("serverLogoPath: \"\"    # PNG/JPG filename in BepInEx/config/ServerGuard/");
                     File.WriteAllText(ClientYaml, sb.ToString());
                 }
 
@@ -208,7 +248,8 @@ namespace ValheimServerGuardClient
                     .IgnoreUnmatchedProperties()
                     .Build();
                 var doc = deser.Deserialize<ClientSettings>(File.ReadAllText(ClientYaml)) ?? new ClientSettings();
-                _sharedSecret = doc.SharedSecret ?? "";
+                _sharedSecret   = doc.SharedSecret ?? "";
+                _clientSettings = doc;
             }
             catch (Exception ex)
             {
@@ -306,6 +347,18 @@ namespace ValheimServerGuardClient
                         }
                     });
 
+                    peer.m_rpc.Register<string>("ServerGuard_RemoveItems", (rpc, itemList) =>
+                    {
+                        try
+                        {
+                            ClientPlugin.Instance?.OnRemoveItemsReceived(itemList);
+                        }
+                        catch (Exception ex)
+                        {
+                            ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] RemoveItems handler error: {ex.Message}");
+                        }
+                    });
+
                     ClientPlugin.LogS.LogInfo("[ServerGuard.Client] Registered manifest request handler on server peer.");
                 }
                 catch (Exception ex)
@@ -313,6 +366,909 @@ namespace ValheimServerGuardClient
                     ClientPlugin.LogS?.LogError($"[ServerGuard.Client] Register handler failed: {ex.Message}");
                 }
             }
+        }
+
+        // -------------- Player death report --------------
+        //
+        // When the LOCAL player dies on a multiplayer client, send a death report to
+        // the server. The server formats and posts to public Discord.
+        //
+        // Payload format (pipe-separated, invariant-culture floats):
+        //   posX|posY|posZ|attackerKind|attackerLabel|causeHint
+        //
+        // We use reflection to read m_lastHit (Player) and its fields, because field
+        // visibility on these types varies across Valheim builds.
+
+        // Cached reflection handles for the death report path.
+        private static FieldInfo  _playerLastHitField;
+        private static MethodInfo _hitGetAttackerMethod;
+        private static FieldInfo  _hitDamageField;
+
+        // Player.OnDeath is `protected`, so nameof can't see it. String literal works
+        // because Harmony resolves the target by reflection at patch-attach time.
+        [HarmonyPatch(typeof(Player), "OnDeath")]
+        public static class Patch_Player_OnDeath_Report
+        {
+            // Prefix so we read m_lastHit BEFORE the death sequence clears it.
+            public static void Prefix(Player __instance)
+            {
+                try
+                {
+                    if (__instance == null) return;
+                    if (__instance != Player.m_localPlayer) return;
+
+                    // Only on a real multiplayer client (not host / single-player).
+                    if (ZNet.instance == null || ZNet.instance.IsServer()) return;
+
+                    ClientPlugin.Instance?.SendDeathReport(__instance);
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Death hook error: {ex.Message}");
+                }
+            }
+        }
+
+        internal void SendDeathReport(Player p)
+        {
+            try
+            {
+                var serverRpc = ZNet.instance?.GetServerRPC();
+                if (serverRpc == null) return;
+
+                var pos = p.transform.position;
+
+                string attackerKind  = "environment";
+                string attackerLabel = "";
+                string causeHint     = "";
+
+                // m_lastHit lookup. Cached after first resolution.
+                if (_playerLastHitField == null)
+                {
+                    foreach (var f in typeof(Player).GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                    {
+                        if (f.FieldType == typeof(HitData))
+                        {
+                            _playerLastHitField = f;
+                            break;
+                        }
+                    }
+                }
+
+                object lastHit = _playerLastHitField?.GetValue(p);
+                if (lastHit is HitData hit && hit != null)
+                {
+                    // Cause hint = dominant damage type (best-effort).
+                    causeHint = DominantDamageType(hit);
+
+                    // Resolve attacker.
+                    if (_hitGetAttackerMethod == null)
+                    {
+                        _hitGetAttackerMethod = typeof(HitData).GetMethod("GetAttacker",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    }
+
+                    Character attacker = null;
+                    if (_hitGetAttackerMethod != null)
+                    {
+                        try { attacker = _hitGetAttackerMethod.Invoke(hit, null) as Character; }
+                        catch { /* attacker may be unresolvable (left zone, despawned) */ }
+                    }
+
+                    if (attacker != null)
+                    {
+                        if (attacker is Player ap)
+                        {
+                            if (ap == p)
+                            {
+                                attackerKind  = "self";
+                                attackerLabel = "";
+                            }
+                            else
+                            {
+                                attackerKind  = "player";
+                                attackerLabel = ap.GetPlayerName() ?? "";
+                            }
+                        }
+                        else
+                        {
+                            attackerKind = "creature";
+                            // Hover name returns the localized display name like "Skeleton".
+                            try { attackerLabel = attacker.GetHoverName() ?? attacker.name ?? ""; }
+                            catch { attackerLabel = attacker.name ?? ""; }
+                        }
+                    }
+                }
+
+                // Strip our delimiter chars from any client-supplied string.
+                attackerLabel = (attackerLabel ?? "").Replace('|', ' ').Replace('\n', ' ').Trim();
+                causeHint     = (causeHint     ?? "").Replace('|', ' ').Replace('\n', ' ').Trim();
+
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                var payload = string.Format(inv,
+                    "{0:F1}|{1:F1}|{2:F1}|{3}|{4}|{5}",
+                    pos.x, pos.y, pos.z,
+                    attackerKind, attackerLabel, causeHint);
+
+                try
+                {
+                    serverRpc.Invoke("ServerGuard_PlayerDeath", payload);
+                    LogS.LogInfo($"[ServerGuard.Client] Death report sent ({attackerKind} / {attackerLabel} / {causeHint}).");
+                }
+                catch (Exception ex)
+                {
+                    LogS?.LogWarning($"[ServerGuard.Client] Death report RPC failed: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] SendDeathReport error: {ex.Message}");
+            }
+        }
+
+        // Reads HitData.m_damage and returns the name of the damage type with the
+        // highest amount. Uses reflection because the struct layout name changes.
+        private static string DominantDamageType(HitData hit)
+        {
+            if (hit == null) return "";
+
+            // Cache the m_damage field once.
+            if (_hitDamageField == null)
+            {
+                foreach (var f in typeof(HitData).GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (f.Name.Equals("m_damage", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _hitDamageField = f;
+                        break;
+                    }
+                }
+            }
+            if (_hitDamageField == null) return "";
+
+            object dmg;
+            try { dmg = _hitDamageField.GetValue(hit); }
+            catch { return ""; }
+            if (dmg == null) return "";
+
+            // Iterate float fields on the damage struct: m_blunt, m_slash, m_pierce,
+            // m_chop, m_pickaxe, m_fire, m_frost, m_lightning, m_poison, m_spirit.
+            string topName = "";
+            float topVal = 0f;
+            foreach (var f in dmg.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (f.FieldType != typeof(float)) continue;
+                float v;
+                try { v = (float)f.GetValue(dmg); }
+                catch { continue; }
+                if (v > topVal)
+                {
+                    topVal  = v;
+                    topName = f.Name;
+                }
+            }
+
+            // Strip leading "m_" if present and TitleCase.
+            if (topName.StartsWith("m_", StringComparison.Ordinal)) topName = topName.Substring(2);
+            if (topName.Length > 0) topName = char.ToUpperInvariant(topName[0]) + topName.Substring(1);
+            return topName;
+        }
+
+        // ====================== Chat reporting ======================
+        //
+        // Current Valheim builds send chat once PER RECIPIENT (per-user text
+        // permission checks), so a dedicated server only routes — never handles —
+        // chat packets, and a self-send (only player online) never reaches the
+        // server at all. The only reliable interception point is the sending
+        // client: Chat.SendText is the single entry point for /s, /w and normal
+        // chat (whispers go through Talker.Say internally, but always via here).
+
+        // Bind parameters by index (__0/__1) so the patch attaches regardless of
+        // parameter names in the running Valheim build.
+        [HarmonyPatch(typeof(Chat), "SendText")]
+        public static class Patch_Chat_SendText_Report
+        {
+            public static void Prefix(Talker.Type __0, string __1)
+            {
+                try
+                {
+                    if (ZNet.instance == null || ZNet.instance.IsServer()) return;
+                    if (__0 != Talker.Type.Shout) return;
+                    if (string.IsNullOrWhiteSpace(__1)) return;
+
+                    ClientPlugin.Instance?.SendChatReport((int)__0, __1);
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Chat hook error: {ex.Message}");
+                }
+            }
+        }
+
+        // Payload: "<type>|<text>". Server resolves name/SteamID from the peer.
+        internal void SendChatReport(int type, string text)
+        {
+            try
+            {
+                var serverRpc = ZNet.instance?.GetServerRPC();
+                if (serverRpc == null) return;
+
+                text = text.Replace('\n', ' ').Trim();
+                if (text.Length > 256) text = text.Substring(0, 256);
+                if (text.Length == 0) return;
+
+                serverRpc.Invoke("ServerGuard_Chat", $"{type}|{text}");
+                LogS?.LogInfo($"[ServerGuard.Client] Shout report sent.");
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Chat report failed: {ex.Message}");
+            }
+        }
+
+        // ====================== Cheat item removal ======================
+        //
+        // The server sends a comma-separated list of prefab names to remove from
+        // the player's inventory. Removal is deferred until the player has fully
+        // spawned into the world and their inventory is accessible.
+
+        internal void OnRemoveItemsReceived(string itemList)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(itemList)) return;
+                var prefabNames = itemList
+                    .Split(',')
+                    .Select(s => s.Trim())
+                    .Where(s => !string.IsNullOrEmpty(s))
+                    .ToArray();
+                if (prefabNames.Length == 0) return;
+                StartCoroutine(RemoveItemsFromInventory(prefabNames));
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] OnRemoveItemsReceived error: {ex.Message}");
+            }
+        }
+
+        private IEnumerator RemoveItemsFromInventory(string[] prefabNames)
+        {
+            // Wait up to 90 s for the player to spawn with a valid inventory.
+            float elapsed = 0f;
+            while (elapsed < 90f)
+            {
+                if (Player.m_localPlayer != null && Player.m_localPlayer.GetInventory() != null)
+                    break;
+                yield return new WaitForSeconds(0.5f);
+                elapsed += 0.5f;
+            }
+
+            if (Player.m_localPlayer == null) yield break;
+
+            try
+            {
+                var inventory = Player.m_localPlayer.GetInventory();
+                if (inventory == null) yield break;
+
+                var toRemove = new List<ItemDrop.ItemData>();
+                foreach (var item in inventory.GetAllItems())
+                {
+                    if (item?.m_dropPrefab == null) continue;
+                    if (prefabNames.Contains(item.m_dropPrefab.name, StringComparer.OrdinalIgnoreCase))
+                        toRemove.Add(item);
+                }
+
+                foreach (var item in toRemove)
+                    inventory.RemoveItem(item);
+
+                if (toRemove.Count > 0)
+                    LogS?.LogWarning($"[ServerGuard.Client] Removed {toRemove.Count} cheat item(s) from inventory: {string.Join(", ", toRemove.Select(i => i.m_dropPrefab.name))}");
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] RemoveItemsFromInventory error: {ex.Message}");
+            }
+        }
+
+        // ====================== Quick Login UI ======================
+        //
+        // When QuickLoginEnabled is true a panel is injected into the main-menu
+        // canvas that shows the server logo, name, description and live player
+        // count. Clicking Connect initiates the same join flow as the in-game
+        // "Join Game" button, with the configured password pre-filled.
+
+        // ---- FejdStartup.SetupGui patch ----
+        // SetupGui is called every time the title screen is shown (including after
+        // returning from a session). We use Postfix to ensure the vanilla UI is
+        // already built before we add our panel.
+        [HarmonyPatch(typeof(FejdStartup), "SetupGui")]
+        public static class Patch_FejdStartup_SetupGui
+        {
+            // If SetupGui is ever renamed/removed in a future Valheim build, skip this
+            // patch cleanly instead of throwing — a thrown patch aborts PatchAll for the
+            // whole assembly, which would take the critical attestation patches down too.
+            public static bool Prepare()
+            {
+                var exists = AccessTools.Method(typeof(FejdStartup), "SetupGui") != null;
+                if (!exists)
+                    ClientPlugin.LogS?.LogWarning("[ServerGuard.Client] FejdStartup.SetupGui not found — Quick Login panel disabled for this build.");
+                return exists;
+            }
+
+            public static void Postfix(FejdStartup __instance)
+            {
+                try
+                {
+                    ClientPlugin.Instance?.BuildQuickLoginPanel(__instance);
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] SetupGui patch error: {ex.Message}");
+                }
+            }
+        }
+
+        // ---- Quick-join: force the direct JoinServer() path ----
+        // When armed (Connect was clicked), re-assert the queued server right before
+        // OnCharacterStart reads GetServerToJoin().IsValid, so it connects directly
+        // instead of showing the world/server browser.
+        [HarmonyPatch(typeof(FejdStartup), "OnCharacterStart")]
+        public static class Patch_FejdStartup_OnCharacterStart
+        {
+            public static bool Prepare() => AccessTools.Method(typeof(FejdStartup), "OnCharacterStart") != null;
+
+            public static void Prefix(FejdStartup __instance)
+            {
+                var self = ClientPlugin.Instance;
+                if (self == null || !self._quickJoinArmed) return;
+                ClientPlugin.LogS?.LogInfo("[ServerGuard.Client] OnCharacterStart: re-asserting quick-join target.");
+                self.ReassertServerToJoin(__instance);   // one-shot: clears the arm
+            }
+        }
+
+        // Leaving character selection disarms the pending quick-join so a later
+        // single-player start is never redirected to the server.
+        [HarmonyPatch(typeof(FejdStartup), "OnSelelectCharacterBack")]
+        public static class Patch_FejdStartup_CharacterBack
+        {
+            public static bool Prepare() => AccessTools.Method(typeof(FejdStartup), "OnSelelectCharacterBack") != null;
+
+            public static void Postfix() => ClientPlugin.Instance?.DisarmQuickJoin();
+        }
+
+        // ---- Panel construction ----
+        internal void BuildQuickLoginPanel(FejdStartup menu)
+        {
+            if (_clientSettings == null || !_clientSettings.QuickLoginEnabled) return;
+            if (string.IsNullOrWhiteSpace(_clientSettings.ServerAddress)) return;
+
+            // Destroy any previous instance (e.g. returning from a session).
+            if (_quickLoginPanel != null)
+            {
+                Destroy(_quickLoginPanel);
+                _quickLoginPanel = null;
+                _playerCountText = null;
+            }
+
+            // Parent to a container that stays active across BOTH the main menu and the
+            // character-selection screen so the panel persists when the menu hides. The
+            // character-select screen's parent is exactly such a persistent GUI root;
+            // fall back to the first canvas if it can't be found.
+            Transform guiRoot = null;
+            var csScreen = GetField(menu, "m_characterSelectScreen") as GameObject;
+            if (csScreen != null && csScreen.transform.parent != null)
+                guiRoot = csScreen.transform.parent;
+            if (guiRoot == null)
+            {
+                var canvas = menu.GetComponentInChildren<Canvas>(true);
+                guiRoot = canvas != null ? canvas.transform : null;
+            }
+            if (guiRoot == null)
+            {
+                LogS?.LogWarning("[ServerGuard.Client] BuildQuickLoginPanel: no GUI root found.");
+                return;
+            }
+
+            // ---- Root panel ----
+            _quickLoginPanel = new GameObject("SG_QuickLogin");
+            _quickLoginPanel.transform.SetParent(guiRoot, false);
+
+            // Anchor to the top-right corner with a fixed size so the panel occupies
+            // only the upper-right region, not the full screen height.
+            var rt = _quickLoginPanel.AddComponent<RectTransform>();
+            rt.anchorMin = new Vector2(1f, 1f);
+            rt.anchorMax = new Vector2(1f, 1f);
+            rt.pivot     = new Vector2(1f, 1f);
+            rt.sizeDelta = new Vector2(320f, 440f);
+            rt.anchoredPosition = new Vector2(-30f, -70f);
+
+            var bg = _quickLoginPanel.AddComponent<Image>();
+            bg.color = new Color(0.05f, 0.05f, 0.05f, 0.82f);
+
+            // ---- Logo (optional) ----
+            float contentTop = -10f;
+            if (!string.IsNullOrWhiteSpace(_clientSettings.ServerLogoPath))
+            {
+                var tex = LoadTexture(Path.Combine(ConfDir, _clientSettings.ServerLogoPath));
+                if (tex != null)
+                {
+                    var logoGo  = CreateChild("SG_Logo", _quickLoginPanel.transform);
+                    var logoRt  = logoGo.AddComponent<RectTransform>();
+                    logoRt.anchorMin = new Vector2(0.05f, 1f);
+                    logoRt.anchorMax = new Vector2(0.95f, 1f);
+                    logoRt.pivot     = new Vector2(0.5f, 1f);
+                    logoRt.anchoredPosition = new Vector2(0f, contentTop);
+                    float aspect = (float)tex.width / tex.height;
+                    float logoH  = Mathf.Min(120f, 300f / aspect);
+                    logoRt.sizeDelta = new Vector2(0f, logoH);
+                    var img = logoGo.AddComponent<Image>();
+                    img.sprite = Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height), new Vector2(0.5f, 0.5f));
+                    img.preserveAspect = true;
+                    contentTop -= (logoH + 8f);
+                }
+            }
+
+            // Use the menu button's TMP label as the font/style template so the panel
+            // text matches the Connect button exactly. Fall back to the version label.
+            var tmpTemplate = GetMenuButtonLabelTemplate(menu)
+                ?? GetField(menu, "m_versionLabel") as Component;
+
+            // ---- Server name ----
+            contentTop = AddThemedLabel("SG_Name", _quickLoginPanel.transform, tmpTemplate,
+                _clientSettings.ServerName, 24f, false, Color.white, contentTop, 32f);
+
+            // ---- Description ----
+            if (!string.IsNullOrWhiteSpace(_clientSettings.ServerDescription))
+            {
+                contentTop = AddThemedLabel("SG_Desc", _quickLoginPanel.transform, tmpTemplate,
+                    _clientSettings.ServerDescription, 16f, false, new Color(0.85f, 0.85f, 0.85f, 1f), contentTop, 64f);
+            }
+
+            // ---- Player count ----
+            _playerCountText = CreateThemedLabelComponent("SG_PlayerCount", _quickLoginPanel.transform,
+                tmpTemplate, "Players: querying...", 17f, false, new Color(0.7f, 0.9f, 0.7f, 1f),
+                contentTop - 6f, 26f);
+
+            // ---- Connect button (cloned from a vanilla menu button for theme + font) ----
+            AddConnectButton(menu, _quickLoginPanel.transform);
+
+            // Draw above sibling menu/character-select panels.
+            _quickLoginPanel.transform.SetAsLastSibling();
+
+            // Kick off a background player-count refresh.
+            StartCoroutine(RefreshPlayerCount(
+                _clientSettings.ServerAddress,
+                _clientSettings.ServerPort));
+        }
+
+        // ---- Helpers ----
+
+        private static GameObject CreateChild(string name, Transform parent)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            return go;
+        }
+
+        private static object GetField(object obj, string name)
+        {
+            var f = obj?.GetType().GetField(name,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            return f?.GetValue(obj);
+        }
+
+        // Returns the TMP text component used by a main-menu button, so panel labels
+        // can share the same font as the (cloned) Connect button.
+        private static Component GetMenuButtonLabelTemplate(FejdStartup menu)
+        {
+            var buttons = GetField(menu, "m_menuButtons") as Button[];
+            var template = buttons?.FirstOrDefault(b => b != null);
+            if (template == null) return null;
+            foreach (var comp in template.GetComponentsInChildren<Component>(true))
+            {
+                if (comp == null) continue;
+                var tn = comp.GetType().Name;
+                if (tn == "TextMeshProUGUI" || tn == "TMP_Text")
+                    return comp;
+            }
+            return null;
+        }
+
+        // Clones the given TMP template (Valheim's version label) into a word-wrapped
+        // label at the top of the panel. Returns the new contentTop. Falls back to a
+        // UnityEngine.UI.Text with Arial if no TMP template is available.
+        private float AddThemedLabel(string name, Transform parent, Component tmpTemplate,
+            string text, float fontSize, bool bold, Color color, float topOffset, float height)
+        {
+            CreateThemedLabelComponent(name, parent, tmpTemplate, text, fontSize, bold, color, topOffset, height);
+            return topOffset - (height + 4f);
+        }
+
+        // Creates a themed label and returns the text Component (TMP_Text or UI.Text)
+        // so callers can update it later (e.g. the live player count).
+        private Component CreateThemedLabelComponent(string name, Transform parent, Component tmpTemplate,
+            string text, float fontSize, bool bold, Color color, float topOffset, float height)
+        {
+            var go = tmpTemplate != null
+                ? Instantiate(tmpTemplate.gameObject, parent, false)
+                : CreateChild(name, parent);
+            go.name = name;
+            go.SetActive(true);
+
+            // Cloned menu-button labels carry a ContentSizeFitter/LayoutElement that
+            // auto-size the label to one line and defeat word wrap — strip them so our
+            // fixed width takes effect and text wraps inside the panel.
+            var csf = go.GetComponent<ContentSizeFitter>();
+            if (csf != null) Destroy(csf);
+            var le = go.GetComponent<LayoutElement>();
+            if (le != null) Destroy(le);
+
+            var rt = go.GetComponent<RectTransform>() ?? go.AddComponent<RectTransform>();
+            rt.anchorMin = new Vector2(0.05f, 1f);
+            rt.anchorMax = new Vector2(0.95f, 1f);
+            rt.pivot     = new Vector2(0.5f, 1f);
+            rt.anchoredPosition = new Vector2(0f, topOffset);
+            rt.sizeDelta = new Vector2(0f, height);
+            rt.localScale = Vector3.one;
+
+            if (tmpTemplate != null)
+            {
+                var tmp = go.GetComponent(tmpTemplate.GetType());
+                SetTmpProperty(tmp, "text", text);
+                SetTmpProperty(tmp, "fontSize", fontSize);
+                SetTmpProperty(tmp, "color", color);
+                SetTmpProperty(tmp, "enableAutoSizing", false);
+                SetTmpProperty(tmp, "enableWordWrapping", true);
+                SetTmpEnum(tmp, "overflowMode", "Overflow");
+                SetTmpEnum(tmp, "alignment", "Top");
+                SetTmpEnum(tmp, "fontStyle", bold ? "Bold" : "Normal");
+                return tmp;
+            }
+
+            // Fallback (no TMP available).
+            var t = go.AddComponent<Text>();
+            t.font       = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            t.fontSize   = Mathf.RoundToInt(fontSize);
+            t.fontStyle  = bold ? FontStyle.Bold : FontStyle.Normal;
+            t.color      = color;
+            t.alignment  = TextAnchor.UpperCenter;
+            t.horizontalOverflow = HorizontalWrapMode.Wrap;
+            t.verticalOverflow   = VerticalWrapMode.Overflow;
+            t.text = text;
+            return t;
+        }
+
+        // Clones a real Valheim main-menu button so the Connect button inherits the
+        // game's button graphic, hover sfx and font. Falls back to a plain green
+        // button if no template can be found.
+        private void AddConnectButton(FejdStartup menu, Transform parent)
+        {
+            var buttons = GetField(menu, "m_menuButtons") as Button[];
+            var template = buttons?.FirstOrDefault(b => b != null);
+
+            if (template != null)
+            {
+                var go = Instantiate(template.gameObject, parent, false);
+                go.name = "SG_ConnectBtn";
+                go.SetActive(true);
+
+                var rt = go.GetComponent<RectTransform>();
+                rt.anchorMin = new Vector2(0.5f, 0f);
+                rt.anchorMax = new Vector2(0.5f, 0f);
+                rt.pivot     = new Vector2(0.5f, 0f);
+                rt.anchoredPosition = new Vector2(0f, 16f);
+                rt.sizeDelta = new Vector2(240f, 48f);
+                rt.localScale = Vector3.one;
+
+                SetAnyText(go, "Connect");
+
+                var btn = go.GetComponent<Button>();
+                btn.onClick = new Button.ButtonClickedEvent();
+                btn.onClick.AddListener(() => ConnectToConfiguredServer(menu));
+                return;
+            }
+
+            // Fallback: plain themed button.
+            var btnGo = CreateChild("SG_ConnectBtn", parent);
+            var brt = btnGo.AddComponent<RectTransform>();
+            brt.anchorMin = new Vector2(0.5f, 0f);
+            brt.anchorMax = new Vector2(0.5f, 0f);
+            brt.pivot     = new Vector2(0.5f, 0f);
+            brt.anchoredPosition = new Vector2(0f, 16f);
+            brt.sizeDelta = new Vector2(240f, 44f);
+            btnGo.AddComponent<Image>().color = new Color(0.15f, 0.45f, 0.15f, 1f);
+            var fb = btnGo.AddComponent<Button>();
+
+            var txtGo = CreateChild("SG_ConnectBtnText", btnGo.transform);
+            var trt = txtGo.AddComponent<RectTransform>();
+            trt.anchorMin = Vector2.zero; trt.anchorMax = Vector2.one;
+            trt.offsetMin = Vector2.zero; trt.offsetMax = Vector2.zero;
+            var txt = txtGo.AddComponent<Text>();
+            txt.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            txt.fontSize = 18; txt.fontStyle = FontStyle.Bold; txt.color = Color.white;
+            txt.alignment = TextAnchor.MiddleCenter; txt.text = "Connect";
+
+            fb.onClick.AddListener(() => ConnectToConfiguredServer(menu));
+        }
+
+        // Sets the label text on a cloned object regardless of whether it uses
+        // TextMeshPro or legacy UnityEngine.UI.Text.
+        private static void SetAnyText(GameObject go, string text)
+        {
+            foreach (var comp in go.GetComponentsInChildren<Component>(true))
+            {
+                if (comp == null) continue;
+                var tn = comp.GetType().Name;
+                if (tn == "TextMeshProUGUI" || tn == "TMP_Text")
+                    SetTmpProperty(comp, "text", text);
+                else if (comp is Text uiText)
+                    uiText.text = text;
+            }
+        }
+
+        private static void SetAnyText(Component comp, string text)
+        {
+            if (comp == null) return;
+            if (comp is Text uiText) { uiText.text = text; return; }
+            SetTmpProperty(comp, "text", text);
+        }
+
+        private static void SetTmpProperty(object tmp, string prop, object val)
+        {
+            if (tmp == null) return;
+            var p = tmp.GetType().GetProperty(prop,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p != null && p.CanWrite)
+            {
+                try { p.SetValue(tmp, val, null); } catch { }
+            }
+        }
+
+        private static void SetTmpEnum(object tmp, string prop, string enumName)
+        {
+            if (tmp == null) return;
+            var p = tmp.GetType().GetProperty(prop,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p == null) return;
+            try
+            {
+                var v = Enum.Parse(p.PropertyType, enumName);
+                p.SetValue(tmp, v, null);
+            }
+            catch { }
+        }
+
+        private static Texture2D LoadTexture(string path)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    LogS?.LogWarning($"[ServerGuard.Client] Logo file not found: {path}");
+                    return null;
+                }
+                var data = File.ReadAllBytes(path);
+                var tex  = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+
+                // In this Unity version LoadImage is NOT an instance method on Texture2D —
+                // it was moved into the static UnityEngine.ImageConversion class (in
+                // UnityEngine.ImageConversionModule). We can't reference that module
+                // directly (netstandard 2.1 vs our net462 target), so resolve it at
+                // runtime. Try the modern static extension first, then the legacy
+                // instance method as a fallback for older builds.
+                var convType = AppDomain.CurrentDomain.GetAssemblies()
+                    .Select(a => { try { return a.GetType("UnityEngine.ImageConversion"); } catch { return null; } })
+                    .FirstOrDefault(t => t != null);
+                var staticLoad = convType?.GetMethod("LoadImage",
+                    BindingFlags.Static | BindingFlags.Public,
+                    null, new[] { typeof(Texture2D), typeof(byte[]) }, null);
+                if (staticLoad != null)
+                {
+                    var ok = staticLoad.Invoke(null, new object[] { tex, data });
+                    if (ok is bool b && !b)
+                        LogS?.LogWarning("[ServerGuard.Client] ImageConversion.LoadImage returned false — unsupported image (use PNG or JPG).");
+                    return tex;
+                }
+
+                var instLoad = typeof(Texture2D).GetMethod("LoadImage",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                    null, new[] { typeof(byte[]) }, null);
+                if (instLoad != null)
+                {
+                    instLoad.Invoke(tex, new object[] { data });
+                    return tex;
+                }
+
+                LogS?.LogWarning("[ServerGuard.Client] Could not resolve LoadImage; logo not displayed.");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] LoadTexture failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        // ---- Connect logic ----
+        //
+        // Valheim's FejdStartup.OnCharacterStart branches on GetServerToJoin().IsValid:
+        // if a server is queued it calls JoinServer() directly (no browser/IP/password);
+        // otherwise it falls through to ShowStartGame() (the world/server selection).
+        //
+        // The queued server can be cleared between menu navigation and the moment
+        // OnCharacterStart checks it, so instead of relying on the timing we ARM the
+        // join here and re-assert the queued server in a Prefix on OnCharacterStart
+        // (see Patch_FejdStartup_OnCharacterStart). That guarantees the direct
+        // JoinServer() path is taken. The arming is one-shot and is cleared if the
+        // player backs out of character selection, so normal single-player starts are
+        // never hijacked.
+        private void ConnectToConfiguredServer(FejdStartup menu)
+        {
+            try
+            {
+                if (menu == null) return;
+
+                var valheimAsm = typeof(FejdStartup).Assembly;
+                var dedType  = valheimAsm.GetType("ServerJoinDataDedicated");
+                var joinType = valheimAsm.GetType("ServerJoinData");
+                if (dedType == null || joinType == null)
+                {
+                    LogS?.LogWarning("[ServerGuard.Client] ServerJoinData types not found; cannot connect.");
+                    return;
+                }
+
+                // ServerJoinData(ServerJoinDataDedicated(host, port))
+                var dedCtor = dedType.GetConstructor(new[] { typeof(string), typeof(ushort) });
+                var dedicated = dedCtor.Invoke(new object[] { _clientSettings.ServerAddress, (ushort)_clientSettings.ServerPort });
+                var joinCtor = joinType.GetConstructor(new[] { dedType });
+
+                // Arm the one-shot quick-join.
+                _armedJoinData  = joinCtor.Invoke(new[] { dedicated });
+                _armedPassword  = _clientSettings.ServerPassword ?? "";
+                _quickJoinArmed = true;
+
+                // Apply immediately too (harmless; the prefix re-asserts at join time).
+                ReassertServerToJoin(menu, keepArmed: true);
+
+                var charScreen = GetField(menu, "m_characterSelectScreen") as GameObject;
+                bool onCharSelect = charScreen != null && charScreen.activeInHierarchy;
+
+                if (onCharSelect)
+                {
+                    // Character already selected — connect now.
+                    var onCharStart = typeof(FejdStartup).GetMethod("OnCharacterStart",
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    onCharStart.Invoke(menu, null);
+                    LogS?.LogInfo($"[ServerGuard.Client] Connecting to {_clientSettings.ServerAddress}:{_clientSettings.ServerPort} with selected character.");
+                }
+                else
+                {
+                    // Main menu — hide it and open character selection (vanilla "Start Game").
+                    var onStartGame = typeof(FejdStartup).GetMethod("OnStartGame",
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    onStartGame.Invoke(menu, null);
+                    LogS?.LogInfo($"[ServerGuard.Client] Quick-join armed for {_clientSettings.ServerAddress}:{_clientSettings.ServerPort}; select a character to connect.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] ConnectToConfiguredServer failed: {ex.Message}");
+            }
+        }
+
+        // Re-applies the armed server + password onto FejdStartup so OnCharacterStart
+        // sees a valid server to join and connects directly. One-shot unless keepArmed.
+        //
+        // IMPORTANT (verified by IL): OnCharacterStart checks m_queuedJoinServer — NOT
+        // m_joinServer (which is what SetServerToJoin sets). If m_queuedJoinServer is
+        // valid it copies it into m_joinServer, clears the queue and calls JoinServer();
+        // otherwise it falls into ShowStartGame() (the world-selection panel). So the
+        // queued field is the one we must write.
+        internal void ReassertServerToJoin(FejdStartup menu, bool keepArmed = false)
+        {
+            try
+            {
+                if (menu == null || _armedJoinData == null) return;
+
+                var queuedField = typeof(FejdStartup).GetField("m_queuedJoinServer",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (queuedField != null)
+                {
+                    queuedField.SetValue(menu, _armedJoinData);
+                }
+                else
+                {
+                    // Older builds may not have the queued field; fall back to the setter.
+                    LogS?.LogWarning("[ServerGuard.Client] m_queuedJoinServer not found; falling back to SetServerToJoin.");
+                    var setServer = typeof(FejdStartup).GetMethod("SetServerToJoin",
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    setServer?.Invoke(menu, new[] { _armedJoinData });
+                }
+
+                // ServerPassword is a STATIC property. ZNet.RPC_ClientHandshake reads it
+                // during the connection handshake — when set, the in-game password
+                // dialog is skipped entirely. (An Instance-flags lookup returns null and
+                // silently does nothing — that was the cause of the password prompt.)
+                var passProp = typeof(FejdStartup).GetProperty("ServerPassword",
+                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?? typeof(FejdStartup).GetProperty("ServerPassword",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (passProp != null)
+                {
+                    var target = passProp.GetGetMethod(true)?.IsStatic == true ? null : (object)menu;
+                    passProp.SetValue(target, _armedPassword ?? "", null);
+                }
+
+                LogS?.LogInfo("[ServerGuard.Client] Quick-join server + password asserted on FejdStartup.");
+                if (!keepArmed) _quickJoinArmed = false;
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] ReassertServerToJoin failed: {ex.Message}");
+            }
+        }
+
+        internal void DisarmQuickJoin() => _quickJoinArmed = false;
+
+        // ---- Live player count (A2S_INFO query) ----
+        // Sends a minimal Source Engine server-info query (UDP) to port+1 and
+        // parses the response player count. Updates _playerCountText on success.
+        private IEnumerator RefreshPlayerCount(string host, int gamePort)
+        {
+            // Give the UI a frame to render before blocking.
+            yield return null;
+
+            var result = "Players: ?";
+            try
+            {
+                // A2S_INFO query: 4-byte FF header + 0x54 + "Source Engine Query\0"
+                byte[] request = new byte[25];
+                request[0] = request[1] = request[2] = request[3] = 0xFF;
+                request[4] = 0x54;
+                Encoding.ASCII.GetBytes("Source Engine Query\0").CopyTo(request, 5);
+
+                // Valheim's query port is the game port (some sources say +1; try both).
+                int[] ports = { gamePort, gamePort + 1 };
+                byte[] response = null;
+
+                foreach (var port in ports)
+                {
+                    try
+                    {
+                        using var udp = new UdpClient();
+                        udp.Client.ReceiveTimeout = 2000;
+                        udp.Connect(host, port);
+                        udp.Send(request, request.Length);
+                        var ep = new System.Net.IPEndPoint(System.Net.IPAddress.Any, 0);
+                        response = udp.Receive(ref ep);
+                        if (response != null && response.Length > 14) break;
+                        response = null;
+                    }
+                    catch { response = null; }
+                }
+
+                if (response != null && response.Length > 14 && response[4] == 0x49)
+                {
+                    // Skip header (5), protocol (1), then scan past null-terminated strings:
+                    // Name, Map, Folder, Game (4 strings), then 2-byte ID, then player count.
+                    int idx = 6;
+                    for (int skip = 0; skip < 4 && idx < response.Length; skip++)
+                        while (idx < response.Length && response[idx++] != 0) { }
+                    idx += 2; // skip AppID (short)
+                    if (idx < response.Length)
+                    {
+                        int players    = response[idx];
+                        int maxPlayers = idx + 1 < response.Length ? response[idx + 1] : 0;
+                        result = maxPlayers > 0
+                            ? $"Players: {players} / {maxPlayers}"
+                            : $"Players: {players}";
+                    }
+                }
+            }
+            catch { /* offline or unreachable — leave result as "?" */ }
+
+            if (_playerCountText != null)
+                SetAnyText(_playerCountText, result);
         }
     }
 }

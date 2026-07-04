@@ -106,7 +106,7 @@ See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for full server-side configuratio
 Install the .NET Framework 4.6.2 targeting pack, or use a recent .NET SDK (6+) which ships with the necessary reference assemblies on Windows.
 
 ### Plugin loads but does nothing
-Confirm BepInEx itself is installed and running — check `BepInEx\LogOutput.log` for a line like `[Info: ServerGuard] Loaded (v1.3.0). ...`.
+Confirm BepInEx itself is installed and running — check `BepInEx\LogOutput.log` for a line like `[Info: ServerGuard] Loaded (v1.5.0). ...`.
 
 ### Mismatched HarmonyX / BepInEx versions
 The project pins `BepInEx.Core 5.4.22` and `HarmonyX 2.10.1`. If your server runs BepInEx 6 (IL2CPP / Mono pre-release), you must update those package versions and possibly adjust patch signatures.

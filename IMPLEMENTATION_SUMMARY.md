@@ -1,4 +1,4 @@
-# Implementation Summary — Valheim ServerGuard v1.3
+# Implementation Summary — Valheim ServerGuard v1.5
 
 This is a technical summary of how ServerGuard works for someone who wants to read or modify the code. For installation/usage docs see [README.md](README.md) and [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md).
 
@@ -37,17 +37,31 @@ Vanilla clients don't have the companion plugin, so they never reply — and get
 │ (server)                 │      │   ClientPlugin.cs          │
 │                          │      │ (client)                   │
 │ • Awake                  │      │                            │
-│ • EnsureFolders          │      │ • Awake                    │
-│ • Load*Yaml              │      │ • EnsureConfig             │
-│ • Patch_OnNewConnection  │      │ • DeferredInit             │
-│   - register receiver    │      │ • BuildManifestCache       │
-│   - send challenge       │      │ • ExportAllowedModsSnippet │
-│   - schedule timeout     │      │ • Patch_RegisterClientHandler
-│ • OnManifestReceived     │      │   - register reply handler │
-│   - validate HMAC        │      │ • BuildManifestJson        │
-│   - check policy         │      │   (rebuilt on every request)
-│ • Patch_RPC_PeerInfo     │      └────────────────────────────┘
-│   (character limit)      │
+│   - boot notification    │      │ • Awake                    │
+│ • OnDestroy              │      │ • EnsureConfig             │
+│   - shutdown notif.      │      │ • DeferredInit             │
+│ • Load*Yaml              │      │ • BuildManifestCache       │
+│ • Patch_OnNewConnection  │      │ • ExportAllowedModsSnippet │
+│   - register receiver    │      │ • Patch_RegisterClientHandler
+│   - send challenge       │      │   - register reply handler │
+│   - schedule timeout     │      │ • BuildManifestJson        │
+│ • OnManifestReceived     │      │   (rebuilt on every request)
+│   - validate HMAC        │      └────────────────────────────┘
+│   - check policy         │
+│ • Patch_RPC_PeerInfo     │
+│   (login notifications,  │
+│    character limit)      │
+│ • Patch_Disconnect       │
+│   (logout notifications) │
+│ • OnChatReceived         │
+│   - shouts → public      │
+│ • OnPlayerDeathReceived  │
+│   - deaths → public      │
+│   - admin deaths skipped │
+│ • Patch_SetRandomEvent   │
+│ • Patch_ResetRandomEvent │
+│   (raid event logging)   │
+│ • SendPublic / SendAdmin │
 │ • TryKick / TryBan       │
 └──────────────────────────┘
 ```
@@ -125,12 +139,14 @@ Tampering with a real manifest fails because any change to the JSON re-derives a
 
 | File | Schema | Hot-reload |
 |---|---|---|
-| `settings.yaml` | C# class `Settings` (camelCase keys via `CamelCaseNamingConvention`) | yes |
+| `settings.yaml` | C# class `Settings` with nested `CountAsViolation` (camelCase keys via `CamelCaseNamingConvention`) | yes |
 | `admins.yaml` | `AdminsDoc { admins: [string] }` | yes |
 | `allowed_mods.yaml` | `AllowedModsDoc { required_mods, allowed_mods, banned_mods : [string] }` — explicitly snake_case via `[YamlMember(Alias=…, ApplyNamingConventions=false)]` | yes |
 | `registrations.yaml` | `RegistrationsDoc { registrations: { steamId → [characterName] } }` | no (auto-managed) |
 | `violations.yaml` | `ViolationsDoc { violations: { steamId → { rule → count } } }` | no (auto-managed) |
 | `metrics.yaml` | `DetectionMetrics` counters | no (auto-managed) |
+
+`Settings` now contains a nested `CountAsViolation` class with one `bool` property per rule. Default-generated `settings.yaml` is written as an explicit string template (not via the `OmitDefaults` YAML serializer) so all options are visible on a fresh install.
 
 Hot-reload is implemented in [Plugin.cs](Plugin.cs) via three `FileSystemWatcher` instances with a 200 ms debounce, plus a YAML re-parse on each event.
 
@@ -175,19 +191,92 @@ The reflection-based `Kick(ZNetPeer)` lookup found a Valheim method that queued 
 
 ## Violation tracking
 
-Each policy failure increments a counter in `violations.yaml` keyed by `(steamId, rule)`. When any single rule's count crosses `violationThreshold` (default 3), `TryBan` calls `ZNet.Ban(steamId)`.
+Each policy failure goes through `AddViolation(platformId, rule)`. Before incrementing any counter, `RuleCounts(rule)` consults the `countAsViolation` section of `settings.yaml`:
 
-| Rule | Trigger |
-|---|---|
-| `CompanionMissing` | No manifest within `companionTimeoutSeconds`. |
-| `HmacInvalid` | HMAC mismatch / parse failure / clock outside skew window. |
-| `ChallengeMismatch` | Manifest's challenge doesn't match what the server issued. |
-| `RequiredModMissing` | A `required_mods` entry is absent from the manifest. |
-| `DisallowedMod` | A manifest mod isn't in `allowed_mods` (when `allowUnlisted: false`), or hash pin mismatch. |
-| `BannedMod` | A `banned_mods` entry is present in the manifest. |
-| `CharacterNameLimitExceeded` | Player exceeded `characterLimit`. Tracked separately in `Patch_RPC_PeerInfo`. |
+- If the rule's flag is `true` (the default for all unrecognised rules): the counter in `violations.yaml` is incremented, a Discord warning is sent, and if the count reaches `violationThreshold` the player is auto-banned.
+- If the flag is `false`: the event is still logged and a "log-only" Discord note is sent, but the counter is **not** incremented and no ban is triggered.
 
-Each violation also fires a Discord webhook event (if configured) with the rule and current count.
+| Rule | Trigger | `countAsViolation` default |
+|---|---|---|
+| `CompanionMissing` | No manifest within `companionTimeoutSeconds`. | `false` |
+| `HmacInvalid` | HMAC mismatch / parse failure / clock outside skew window. | `false` |
+| `ChallengeMismatch` | Manifest's challenge doesn't match what the server issued. | `false` |
+| `RequiredModMissing` | A `required_mods` entry is absent from the manifest. | `false` |
+| `DisallowedMod` | A manifest mod isn't in `allowed_mods` (when `allowUnlisted: false`), or hash pin mismatch. | `false` |
+| `BannedMod` | A `banned_mods` entry is present in the manifest. | `false` |
+| `CharacterNameLimitExceeded` | Player exceeded `characterLimit`. Tracked separately in `Patch_RPC_PeerInfo`. | `true` |
+| `DevcommandAttempt` | Devcommand usage (reserved). | `true` |
+| `SpeedHack` | Movement speed above threshold (reserved). | `true` |
+| `IllegalItem` | Illegal item stack detected (reserved). | `true` |
+| `StackOverflow` | Stack overflow exploit detected (reserved). | `true` |
+| `AnimationCancel` | Animation-cancel exploit (reserved). | `false` |
+| `SkillOverflow` | Skill above cap (reserved). | `true` |
+
+The `countAsViolation` defaults are conservative — attestation failures (`CompanionMissing`, `HmacInvalid`, etc.) are log-only by default so a misconfigured client doesn't immediately rack up bans. Gameplay integrity rules (`SpeedHack`, `IllegalItem`, etc.) count by default. All defaults can be overridden in `settings.yaml`.
+
+---
+
+## Discord integration (v1.5)
+
+### Dual-webhook routing
+
+v1.4 splits Discord output into two channels with clear ownership:
+
+| Destination | Method | Events |
+|---|---|---|
+| Public (`discordWebhookUrl`) | `SendPublic()` | Server boot/shutdown, player joins/leaves, player shouts, player deaths (non-admin), raid start/pause/resume/end |
+| Admin (`discordAdminWebhookUrl`) | `SendAdmin()` | Admin login/logout, kicks, bans, violations, rejections, timeouts |
+
+`SendPublic()` respects `maintenanceMode`: when true it reroutes to the admin webhook instead. `SendAdmin()` is unconditional. Both are `async Task` methods on the Plugin instance, called fire-and-forget (`_ = SendPublic(…)`) from event handlers except in `OnDestroy()` where the shutdown notification is sent synchronously (`.GetAwaiter().GetResult()`) before cleanup runs.
+
+**Backward-compat alias:** `Settings` also declares a `discordWebhookUrlAdmin` property (the pre-v1.4 key name). `ResolvedAdminWebhookUrl` returns `discordAdminWebhookUrl` if set, otherwise falls back to `discordWebhookUrlAdmin`. This means old `settings.yaml` files migrate without any manual key rename.
+
+### Server lifecycle notifications
+
+- **Boot** — `SendPublic()` fires at the end of `Awake()`, after all YAML is loaded and Harmony patches are applied.
+- **Shutdown** — fired synchronously at the top of `OnDestroy()`, before Harmony is unpatched and before the HTTP client is torn down, so it reliably exits even on crash-level shutdowns.
+
+### Shout logging (`ServerGuard_Chat` RPC)
+
+Current Valheim sends chat per-recipient (not broadcast), so a dedicated server only routes packets — never handles them. The companion client patches `Chat.SendText` and sends a `ServerGuard_Chat` ZRpc to the server when the local player shouts (`Talker.Type.Shout = 2`). The server's `OnChatReceived` handler verifies `type == 2`, bounds the text to 256 chars, resolves name/SteamID from the server-side peer (not the client payload), and calls `SendPublic()`.
+
+### Player join/leave and admin login/logout notifications
+
+- **Player join** — `Patch_RPC_PeerInfo.Postfix` fires after a peer's info is registered. Non-admin players get a `:video_game: joined` message on `SendPublic()`; admins get a `:shield: logged in` message on `SendAdmin()`.
+- **Player leave** — `Patch_Disconnect.Prefix` fires before tear-down. Peers with no character name yet (failed attestation, pre-login) are skipped. Admins go to `SendAdmin()`, players to `SendPublic()`.
+
+### Death logging (`ServerGuard_PlayerDeath` RPC)
+
+The server cannot know who killed a dying player — that state lives only on the owning client. The companion patches `Player.OnDeath` as a **Prefix** (before the game clears `m_lastHit`) and sends a `ServerGuard_PlayerDeath` ZRpc to the server.
+
+**Payload format:** `posX|posY|posZ|attackerKind|attackerLabel|causeHint` (pipe-separated, invariant-culture floats).
+
+| `attackerKind` | Meaning | Discord output |
+|---|---|---|
+| `player` | Killed by another player | `killed by **Name** (SteamID)` — SteamID resolved via `registrations.yaml` |
+| `creature` | Killed by a mob | `killed by a **Skeleton**` |
+| `self` | Suicide / fall on own weapons | `took their own life` |
+| `environment` | No attacker entity | `burned to death` / `froze to death` / `fell to their death` / etc. via `HumanizeDeathCause()` |
+
+Admin deaths are **fully suppressed** — console-logged only, nothing posted to Discord. `attackerLabel` and `causeHint` are bounded to 48 and 24 characters respectively so a malicious client can't flood Discord. Name/SteamID are resolved server-side from the peer, not from the payload.
+
+### Raid event logging (`Patch_SetRandomEvent`, `Patch_ResetRandomEvent`)
+
+`Patch_SetRandomEvent` targets `RandEventSystem.SetRandomEvent(RandomEvent ev, Vector3 pos)` via `TargetMethod()` (private method). Harmony injects `ev` and `pos` directly by parameter name. A deduplication check (`ev.m_name == _currentRaidName`) prevents double-announcing if the method is called multiple times for the same event.
+
+`Patch_ResetRandomEvent` is a Prefix on the public `ResetRandomEvent()`. Prefix (not Postfix) is used so `OnRaidEnded()` fires while the Plugin's tracked `_currentRaidName` is still set.
+
+**Pause detection** runs in a coroutine (`MonitorRaidEvent`) that polls every 5 seconds while an event is active:
+
+```
+GetCurrentRandomEvent() != null  →  event is set/running
+GetActiveEvent()        == null  →  no players in the event area
+→ combined: event is paused (timer frozen)
+```
+
+State transitions trigger Discord messages:
+- active → paused: `:pause_button:` message with coordinates
+- paused → active: `:arrow_forward:` resume message
 
 ---
 
@@ -209,9 +298,9 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 
 | File | Contents |
 |---|---|
-| [Plugin.cs](Plugin.cs) | Server entry point, all server logic, the two Harmony patches, all helpers |
+| [Plugin.cs](Plugin.cs) | Server entry point, all server logic, Harmony patches (`Patch_OnNewConnection`, `Patch_RPC_PeerInfo`, `Patch_Disconnect`, `Patch_SetRandomEvent`, `Patch_ResetRandomEvent`), RPC handlers (`OnChatReceived`, `OnPlayerDeathReceived`), all helpers, `SendPublic`/`SendAdmin` |
 | [Shared/Manifest.cs](Shared/Manifest.cs) | `ModManifest`, `ModManifestEntry`, canonical-string builder, HMAC helpers, `ConstantTimeEquals` |
-| [ServerGuard.Client/ClientPlugin.cs](ServerGuard.Client/ClientPlugin.cs) | Client entry point, manifest builder, deferred init coroutine, first-run export, the one Harmony patch |
+| [ServerGuard.Client/ClientPlugin.cs](ServerGuard.Client/ClientPlugin.cs) | Client entry point, manifest builder, deferred init coroutine, first-run export, Harmony patches (`Patch_RegisterClientHandler`, `Patch_Chat_SendText_Report`, `Patch_Player_OnDeath_Report`) |
 | [Valheim-ServerGuard.csproj](Valheim-ServerGuard.csproj) | Server build config; auto-detects Valheim install via `$VALHEIM_PATH` |
 | [ServerGuard.Client/Valheim-ServerGuard-Client.csproj](ServerGuard.Client/Valheim-ServerGuard-Client.csproj) | Client build config; links `../Shared/Manifest.cs` |
 | [BUILD.md](BUILD.md) | How to build both DLLs from source |
@@ -222,10 +311,20 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 
 ## Version
 
-**1.3.0** — first release of the client-attestation architecture. The version is set independently in:
-- `Plugin.cs` — `[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.3.0")]`
-- `ClientPlugin.cs` — `public const string VERSION = "1.3.0";`
-- `Valheim-ServerGuard.csproj` — `<Version>1.3.0</Version>`
-- `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` — `<Version>1.3.0</Version>`
+**1.5.0** — player shout logging (client-reported via `ServerGuard_Chat` ZRpc; whisper logging removed — architecture limitation), player death logging with attacker attribution (client-reported via `ServerGuard_PlayerDeath` ZRpc, admin deaths suppressed), explicit player join/leave Discord notifications, explicit admin login/logout Discord notifications.
 
-Bump all four together when releasing.
+**1.4.0** — dual-webhook Discord routing, maintenance mode, server lifecycle notifications (boot/shutdown), raid event logging with pause detection, `countAsViolation` per-rule counting control, full settings.yaml restoration (all options visible on fresh install), `discordWebhookUrlAdmin` backward-compat alias.
+
+**1.3.0** — first release of the client-attestation architecture.
+
+The version string is set independently in:
+- `Plugin.cs` — `[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.5.0")]` + hardcoded `v1.5.0` in log/config strings
+- `ClientPlugin.cs` — `public const string VERSION = "1.5.0";`
+- `Valheim-ServerGuard.csproj` — `<Version>1.5.0</Version>`
+- `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` — `<Version>1.5.0</Version>`
+- `Thunderstore files/Valheim-ServerGuard (server)/manifest.json` — `"version_number": "1.5.0"`
+- `Thunderstore files/Valheim-ServerGuard (client)/manifest.json` — `"version_number": "1.5.0"`
+- `README.md`, `IMPLEMENTATION_SUMMARY.md`, `DEPLOYMENT_GUIDE.md`, `BUILD.md` — inline version references
+- Both Thunderstore `README.md` and `CHANGELOG.md` files
+
+Bump all locations together when releasing. Add a new `## x.y.z` section at the top of each `CHANGELOG.md`; do not rename the previous heading.

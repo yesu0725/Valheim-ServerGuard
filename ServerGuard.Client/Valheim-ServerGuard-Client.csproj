@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard-Client</AssemblyName>
     <RootNamespace>ValheimServerGuardClient</RootNamespace>
-    <Version>1.3.0</Version>
+    <Version>1.5.0</Version>
     <Description>Valheim ServerGuard Client - companion plugin that attests the client's mod list to a ServerGuard-protected server</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
@@ -56,6 +56,18 @@
     </Reference>
     <Reference Include="assembly_utils">
       <HintPath>$(ValheimManaged)\assembly_utils.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(ValheimManaged)\UnityEngine.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(ValheimManaged)\UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(ValheimManaged)\UnityEngine.UIModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
