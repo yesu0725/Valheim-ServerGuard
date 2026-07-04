@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard</AssemblyName>
     <RootNamespace>ValheimServerGuard</RootNamespace>
-    <Version>1.5.0</Version>
+    <Version>1.6.0</Version>
     <Description>Valheim Server Guard - Anti-cheat and security mod for Valheim servers</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
@@ -65,5 +65,25 @@
       <Private>False</Private>
     </Reference>
   </ItemGroup>
+
+  <!--
+    Post-build: copy the freshly-built server DLL into the local dedicated server's
+    BepInEx plugins folder for fast iteration. The Condition guards make it a silent
+    no-op on any machine that doesn't have that exact path - safe to commit.
+    Override the destination with the SERVERGUARD_TEST_SERVER_DIR env var if needed.
+  -->
+  <Target Name="CopyToTestServer" AfterTargets="Build">
+    <PropertyGroup>
+      <_ServerGuardTestServerDir Condition="'$(SERVERGUARD_TEST_SERVER_DIR)' != ''">$(SERVERGUARD_TEST_SERVER_DIR)</_ServerGuardTestServerDir>
+      <_ServerGuardTestServerDir Condition="'$(_ServerGuardTestServerDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins</_ServerGuardTestServerDir>
+    </PropertyGroup>
+    <Copy
+      SourceFiles="$(OutputPath)$(AssemblyName).dll"
+      DestinationFolder="$(_ServerGuardTestServerDir)"
+      Condition="Exists('$(_ServerGuardTestServerDir)')"
+      SkipUnchangedFiles="false" />
+    <Message Importance="high" Text="[ServerGuard] Server DLL copied to: $(_ServerGuardTestServerDir)" Condition="Exists('$(_ServerGuardTestServerDir)')" />
+    <Message Importance="high" Text="[ServerGuard] Skipped server-DLL copy (path missing): $(_ServerGuardTestServerDir)" Condition="!Exists('$(_ServerGuardTestServerDir)')" />
+  </Target>
 
 </Project>

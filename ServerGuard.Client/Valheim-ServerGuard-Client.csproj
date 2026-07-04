@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard-Client</AssemblyName>
     <RootNamespace>ValheimServerGuardClient</RootNamespace>
-    <Version>1.5.0</Version>
+    <Version>1.6.0</Version>
     <Description>Valheim ServerGuard Client - companion plugin that attests the client's mod list to a ServerGuard-protected server</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
@@ -71,5 +71,25 @@
       <Private>False</Private>
     </Reference>
   </ItemGroup>
+
+  <!--
+    Post-build: copy the freshly-built client DLL into the r2modman test profile so
+    the next Valheim launch picks it up automatically. Condition guards make it a
+    silent no-op on machines without that folder - safe to commit.
+    Override the destination with the SERVERGUARD_TEST_CLIENT_DIR env var if needed.
+  -->
+  <Target Name="CopyToTestClient" AfterTargets="Build">
+    <PropertyGroup>
+      <_ServerGuardTestClientDir Condition="'$(SERVERGUARD_TEST_CLIENT_DIR)' != ''">$(SERVERGUARD_TEST_CLIENT_DIR)</_ServerGuardTestClientDir>
+      <_ServerGuardTestClientDir Condition="'$(_ServerGuardTestClientDir)' == ''">C:\Users\yesu0725\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\Mod Test Profile\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client</_ServerGuardTestClientDir>
+    </PropertyGroup>
+    <Copy
+      SourceFiles="$(OutputPath)$(AssemblyName).dll"
+      DestinationFolder="$(_ServerGuardTestClientDir)"
+      Condition="Exists('$(_ServerGuardTestClientDir)')"
+      SkipUnchangedFiles="false" />
+    <Message Importance="high" Text="[ServerGuard.Client] Client DLL copied to: $(_ServerGuardTestClientDir)" Condition="Exists('$(_ServerGuardTestClientDir)')" />
+    <Message Importance="high" Text="[ServerGuard.Client] Skipped client-DLL copy (path missing): $(_ServerGuardTestClientDir)" Condition="!Exists('$(_ServerGuardTestClientDir)')" />
+  </Target>
 
 </Project>

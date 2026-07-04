@@ -1,10 +1,63 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 
 namespace ValheimServerGuard.Shared
 {
+    // Stable, cross-process fingerprint of a "set of mods." Both the server (from its
+    // allowlist) and the client (from its loaded BepInEx plugins) compute it the same
+    // way, so the two values can be compared at attestation time and surfaced to
+    // operators/players as a short string ("the server's modpack is a3f9b2c1").
+    //
+    // Two flavours:
+    //   STRICT - keyed by (lowercase-key | sha256). Two parties match only if every mod
+    //            is present at the exact same binary. Use for hardened deployments.
+    //   LOOSE  - keyed by lowercase-key only. Two parties match if they have the SAME
+    //            set of mod identifiers regardless of version/binary. Use for friendly
+    //            "are we on the same modpack" comparison across version bumps.
+    // NOTE on signatures: we deliberately use KeyValuePair<string,string> instead of
+    // C# value tuples. Valheim's Mono runtime doesn't ship System.ValueTuple, so any
+    // ValueTuple-bearing field in a compiler-generated closure throws TypeLoadException
+    // at Awake (observed on the client). KeyValuePair lives in System.Collections.Generic
+    // which is always loaded.
+    public static class ModsetFingerprint
+    {
+        public static string ComputeStrict(IEnumerable<KeyValuePair<string, string>> entries)
+            => Sha256Hex(Canonicalize(entries, withHash: true));
+
+        public static string ComputeLoose(IEnumerable<KeyValuePair<string, string>> entries)
+            => Sha256Hex(Canonicalize(entries, withHash: false));
+
+        // Short, human-shareable prefix (8 hex chars = 32 bits of identifier).
+        public static string Short(string fullHex)
+            => string.IsNullOrEmpty(fullHex) || fullHex.Length < 8 ? (fullHex ?? "") : fullHex.Substring(0, 8);
+
+        private static string Canonicalize(IEnumerable<KeyValuePair<string, string>> entries, bool withHash)
+        {
+            if (entries == null) return "";
+            var lines = entries
+                .Where(e => !string.IsNullOrWhiteSpace(e.Key))
+                .Select(e => withHash
+                    ? $"{(e.Key ?? "").ToLowerInvariant()}|{(e.Value ?? "").ToLowerInvariant()}"
+                    : (e.Key ?? "").ToLowerInvariant())
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(s => s, StringComparer.Ordinal)
+                .ToList();
+            return lines.Count == 0 ? "" : string.Join("\n", lines);
+        }
+
+        private static string Sha256Hex(string input)
+        {
+            using (var sha = SHA256.Create())
+            {
+                var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input ?? ""));
+                return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+            }
+        }
+    }
+
     [Serializable]
     public class ModManifestEntry
     {

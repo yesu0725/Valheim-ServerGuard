@@ -107,20 +107,13 @@ On every player's PC, only one file matters: `BepInEx/config/ServerGuard/client.
 
 ## settings.yaml — every option
 
-### Core enforcement
-
 | Option | Default | What it does |
 |---|---|---|
 | `enforce` | `true` | If `false`, kicks are logged but never executed. Use for dry-run testing. |
-| `violationThreshold` | `3` | After this many counted violations of the same rule, the player is auto-banned. |
+| `violationThreshold` | `3` | After this many rejected connections of the same kind, the player is auto-banned. |
 | `kickMessage` | (built-in) | Message shown when a player is kicked. The specific reason is appended automatically. |
 | `banReason` | (built-in) | Reason recorded when an auto-ban triggers. |
-| `characterLimit` | `2` | Maximum number of distinct character names a single Steam ID can use on this server. |
-
-### Client-attestation handshake
-
-| Option | Default | What it does |
-|---|---|---|
+| `characterLimit` | `1` | Maximum number of distinct character names a single Steam ID can use on this server. |
 | `requireCompanion` | `true` | If `true`, players without the client plugin are kicked on timeout. Set to `false` to allow vanilla connections. |
 | `companionTimeoutSeconds` | `10` | How long the server waits for the manifest to arrive before declaring no-companion. |
 | `requireHmac` | `true` | If `true`, every manifest must be signed with the shared password. Strongly recommended. |
@@ -128,71 +121,9 @@ On every player's PC, only one file matters: `BepInEx/config/ServerGuard/client.
 | `allowUnlisted` | `false` | If `false`, every mod a player runs must be in `allowed_mods` or `required_mods`. If `true`, unknown mods are tolerated. |
 | `maxClockSkewSeconds` | `120` | Reject manifests whose clock is more than this many seconds off from the server's. |
 | `logPeerManifest` | `false` | If `true`, the server logs the full mod list of every connecting player. Useful for collecting plugin GUIDs to add to the allowlist. Turn off afterward — it's noisy. |
-
-### Discord
-
-| Option | Default | What it does |
-|---|---|---|
-| `discordWebhookUrl` | `""` | Public Discord webhook URL. Receives server boot/shutdown, player joins/leaves, shouts, deaths, and raid event notifications. |
-| `discordAdminWebhookUrl` | `""` | Admin-only Discord webhook URL. Receives kicks, bans, violations, and admin login/logout events. (`discordWebhookUrlAdmin` is accepted as a backward-compat alias.) |
-| `discordChannelLink` | `""` | Free-form note for your reference. Not used by the plugin. |
-| `discordPublicMode` | `true` | If `true`, public events go to `discordWebhookUrl`. If `false`, everything is routed to the admin webhook. |
-| `maintenanceMode` | `false` | When `true`, all public-channel messages are redirected to the admin webhook instead. Takes effect immediately on save. |
-| `dailySummaryEnabled` | `true` | Post a daily summary to Discord. |
-| `dailySummaryChannel` | `admin` | Which webhook receives the daily summary: `public` or `admin`. |
-
-### Violation counting
-
-`countAsViolation` is a sub-section that controls whether each rule type increments the violation counter (and can therefore trigger an auto-ban). Set a rule to `false` to log/notify only, without counting toward the threshold.
-
-```yaml
-countAsViolation:
-  companionMissing: false         # no manifest delivered in time
-  hmacInvalid: false              # bad signature / parse failure / clock skew
-  challengeMismatch: false        # challenge in manifest didn't match what server issued
-  requiredModMissing: false       # a required_mods entry is absent
-  disallowedMod: false            # unlisted mod or hash pin mismatch
-  bannedMod: false                # a banned_mods entry is present
-  hashMismatch: false             # (alias for disallowedMod pin mismatch)
-  characterNameLimitExceeded: true
-  devcommandAttempt: true
-  speedHack: true
-  illegalItem: true
-  stackOverflow: true
-  animationCancel: false
-  skillOverflow: true
-```
-
-### Active security gates
-
-These settings are parsed and stored; full enforcement implementations are forthcoming.
-
-| Option | Default | What it does |
-|---|---|---|
-| `enableDevcommandGate` | `true` | Detect and flag devcommand usage. |
-| `enableSpeedCheck` | `true` | Flag movement speeds above `speedCheckMaxMetersPerSecond`. |
-| `speedCheckMaxMetersPerSecond` | `30` | Max allowed movement speed (m/s). |
-| `speedCheckSampleSeconds` | `1` | Sampling window for speed checks. |
-| `speedCheckConsecutiveStrikes` | `3` | Consecutive over-speed samples before flagging. |
-| `speedCheckTeleportToleranceMeters` | `60` | Distance that counts as a teleport (not flagged). |
-| `enableInventoryCheck` | `true` | Check for illegal item stacks. |
-| `inventoryCheckLogOnly` | `true` | If `true`, log violations but don't kick. |
-| `inventoryCheckStackTolerance` | `1` | Extra items allowed above the stack maximum. |
-| `enableAnimationCancelGate` | `true` | Detect animation-cancel exploits. |
-| `enableSkillCap` | `true` | Flag skills above `skillCapMaxLevel`. |
-| `skillCapMaxLevel` | `100` | Maximum allowed skill level. |
-| `skillCapTolerance` | `5` | Tolerance above the cap before flagging. |
-
-### Logging
-
-| Option | Default | What it does |
-|---|---|---|
 | `enableMetrics` | `true` | Track connection / detection counters in `metrics.yaml`. |
-| `enableDeathLog` | `true` | Log player death events. |
-| `enableBuildLog` | `true` | Log player build events. |
-| `buildLogRetentionDays` | `30` | Days to retain the build log. |
-| `enableSelfTest` | `true` | Run a self-test at startup. |
-| `pingLogSampleSeconds` | `5` | Interval for logging peer ping samples. |
+| `discordWebhookUrl` | `""` | If set, kicks/bans/violations are also posted to a Discord channel via webhook. |
+| `discordChannelLink` | `""` | Free-form note for your reference. Not used by the plugin. |
 
 ## allowed_mods.yaml — format
 
@@ -276,45 +207,22 @@ Fix: copy the server's `sharedSecret` into the player's `client.yaml` exactly. W
 
 ### Server itself
 ```
-[ServerGuard] Loaded (v1.5.0). Enforcement: ON. RequireCompanion: ON. RequireHmac: ON. AllowUnlisted: OFF. Required: 1, Allowed: 28, Banned: 0. Metrics: ON
+[ServerGuard] Loaded (v1.3.0). Enforcement: ON. RequireCompanion: ON. RequireHmac: ON. AllowUnlisted: OFF. Required: 1, Allowed: 28, Banned: 0. Metrics: ON
 [ServerGuard] sharedSecret in use (copy to every client.yaml): <password>
 ```
 Confirms the plugin loaded and the allowlist parsed. If `Allowed: 0` despite a populated file, the YAML keys are wrong — they must be `required_mods:`, `allowed_mods:`, `banned_mods:` exactly.
 
 ## Discord notifications
 
-ServerGuard supports two separate webhooks — one for your server's public channel and one for admins only.
-
 In `settings.yaml`:
 
 ```yaml
-discordWebhookUrl:      'https://discord.com/api/webhooks/<id>/<token>'   # public channel
-discordAdminWebhookUrl: 'https://discord.com/api/webhooks/<id>/<token>'   # admin channel
+discordWebhookUrl: 'https://discord.com/api/webhooks/12345/abcdef...'
 ```
 
-Get each URL from Discord: **Channel Settings → Integrations → Webhooks → New Webhook → Copy URL**.
+Get the URL from your Discord server: **Channel Settings → Integrations → Webhooks → New Webhook → Copy URL**.
 
-### What goes where
-
-| Event | Channel |
-|---|---|
-| Server boot / shutdown | Public (admin if maintenance mode is on) |
-| Player joins / leaves | Public (admin if maintenance mode is on) |
-| Player shouts | Public (admin if maintenance mode is on) |
-| Player deaths (non-admin) | Public (admin if maintenance mode is on) |
-| Raid started / paused / resumed / ended | Public (admin if maintenance mode is on) |
-| Admin login / logout | Admin always |
-| Kicks, bans, violations, rejections | Admin always |
-
-Either webhook is optional — omit the one you don't need and those events are simply not posted.
-
-### Maintenance mode
-
-```yaml
-maintenanceMode: true
-```
-
-When enabled, all events that would normally go to the public webhook are redirected to the admin webhook instead. This lets you take the server down for maintenance without players seeing bot noise. Because `settings.yaml` is hot-reloaded, you can toggle this while the server is running — or set it before booting so even the startup notification goes to admin only.
+You'll get real-time alerts for kicks, bans, and rejected manifests, plus a 2-second-buffered stream of all ServerGuard log events to the same channel.
 
 ## Rotating the shared password
 
@@ -353,11 +261,11 @@ See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL bu
 
 | File | Role |
 |---|---|
-| [Plugin.cs](Plugin.cs) | Server plugin. Patches `ZNet.OnNewConnection` (challenge + manifest + RPC receivers), `ZNet.RPC_PeerInfo` (login notifications, character-limit), `ZNet.Disconnect` (logout notifications), `RandEventSystem.SetRandomEvent` / `ResetRandomEvent` (raid event logging). Receives `ServerGuard_Chat` (shout log) and `ServerGuard_PlayerDeath` (death log) ZRpcs from the companion. |
-| [ServerGuard.Client/ClientPlugin.cs](ServerGuard.Client/ClientPlugin.cs) | Client companion. Patches `ZNet.OnNewConnection` (manifest reply handler), `Chat.SendText` (shout reporting), `Player.OnDeath` (death reporting). Builds the manifest from `Chainloader.PluginInfos` and writes `mods_for_allowed_mods.yaml` on first run. |
+| [Plugin.cs](Plugin.cs) | Server plugin. Patches `ZNet.OnNewConnection` (challenge issue + manifest receiver registration) and `ZNet.RPC_PeerInfo` (character-limit enforcement). |
+| [ServerGuard.Client/ClientPlugin.cs](ServerGuard.Client/ClientPlugin.cs) | Client companion. Patches `ZNet.OnNewConnection` (registers the manifest reply handler). Builds the manifest from `Chainloader.PluginInfos` and writes `mods_for_allowed_mods.yaml` on first run. |
 | [Shared/Manifest.cs](Shared/Manifest.cs) | Shared DTO (used by both): the `ModManifest` shape, the canonical-string format used as input to HMAC, and the HMAC-SHA256 helpers. |
 
 ---
 
-**Version:** 1.5.0
+**Version:** 1.4.0
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

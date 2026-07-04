@@ -9,20 +9,26 @@
 bin/
 obj/
 
-# Unity
+# Unity (leftover template rules — *.csproj removed because project files are tracked)
 Library/
 Temp/
-*.csproj
 *.unityproj
 *.sln
 *.sln.docstates
 *.pidb.meta
 *.pdb
 *.mdb
+
+# Claude Code worktrees (auto-created by Claude Code, not source)
+.claude/worktrees/
 # BepInEx configs & logs (optional to ignore)
 BepInEx/config/
 BepInEx/patchers/
 BepInEx/LogOutput.log
+
+# Thunderstore build output (the manifest/DLL/changelog/readme/icon are tracked;
+# only the packaged zips are build artifacts that don't belong in git)
+Thunderstore files/**/*.zip
 
 # OS
 .DS_Store
