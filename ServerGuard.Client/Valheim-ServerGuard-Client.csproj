@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard-Client</AssemblyName>
     <RootNamespace>ValheimServerGuardClient</RootNamespace>
-    <Version>1.6.0</Version>
+    <Version>1.6.1</Version>
     <Description>Valheim ServerGuard Client - companion plugin that attests the client's mod list to a ServerGuard-protected server</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
@@ -81,7 +81,7 @@
   <Target Name="CopyToTestClient" AfterTargets="Build">
     <PropertyGroup>
       <_ServerGuardTestClientDir Condition="'$(SERVERGUARD_TEST_CLIENT_DIR)' != ''">$(SERVERGUARD_TEST_CLIENT_DIR)</_ServerGuardTestClientDir>
-      <_ServerGuardTestClientDir Condition="'$(_ServerGuardTestClientDir)' == ''">C:\Users\yesu0725\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\Mod Test Profile\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client</_ServerGuardTestClientDir>
+      <_ServerGuardTestClientDir Condition="'$(_ServerGuardTestClientDir)' == ''">C:\Users\yesu0725\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\Hearthbound Valheim - Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client</_ServerGuardTestClientDir>
     </PropertyGroup>
     <Copy
       SourceFiles="$(OutputPath)$(AssemblyName).dll"

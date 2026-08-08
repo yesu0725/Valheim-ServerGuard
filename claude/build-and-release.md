@@ -25,7 +25,7 @@ Both `.csproj` files have a post-build `<Target Name="CopyTo...">` that silently
 
 **Server** → `C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins`
 
-**Client** → `C:\Users\yesu0725\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\Mod Test Profile\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client`
+**Client** → `C:\Users\yesu0725\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\Hearthbound Valheim - Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client`
 
 Override at build time with env vars `SERVERGUARD_TEST_SERVER_DIR` or `SERVERGUARD_TEST_CLIENT_DIR`. Safe to commit — the `Condition="Exists(...)"` makes it a no-op on machines without those paths.
 

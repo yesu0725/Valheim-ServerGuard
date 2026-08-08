@@ -48,7 +48,8 @@ The password (if set) is applied automatically, so the in-game password dialog n
 ## Notes & troubleshooting
 
 - If the logo doesn't appear, check the BepInEx log for `Logo file not found` or `unsupported image` warnings, and confirm the file is a PNG/JPG in `BepInEx/config/ServerGuard/`.
-- The live player count uses a standard server query on the game port; if your host blocks query traffic it will show `Players: ?`.
+- The live player count uses a standard Steam server query (A2S_INFO) sent to the **query port**, which is your game port **+ 1** — so `2457` for a default `2456` server. If your host or firewall blocks UDP on that port, the panel shows `Players: ?`. Check the BepInEx log for `Player-count query to <host>:<port> got no answer.` to confirm which port was tried.
+  - *Fixed in 1.6.1:* before that version the count always showed `?`, because the query didn't answer the challenge packet Valve's query protocol requires. If you're on 1.6.0 or earlier, update the companion plugin.
 - The panel only shows on the title screen; it disappears once you're in-game.
 - Disabling is as simple as setting `quickLoginEnabled: false` (or leaving the address blank).
 

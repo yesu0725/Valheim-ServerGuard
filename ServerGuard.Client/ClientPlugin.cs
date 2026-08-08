@@ -26,7 +26,7 @@ namespace ValheimServerGuardClient
     {
         public const string GUID    = "com.taeguk.valheim.serverguard.client";
         public const string NAME    = "Valheim ServerGuard Client";
-        public const string VERSION = "1.6.0";
+        public const string VERSION = "1.6.1";
 
         internal static ClientPlugin Instance;
         internal static ManualLogSource LogS;
@@ -2039,64 +2039,133 @@ namespace ValheimServerGuardClient
         internal void DisarmQuickJoin() => _quickJoinArmed = false;
 
         // ---- Live player count (A2S_INFO query) ----
-        // Sends a minimal Source Engine server-info query (UDP) to port+1 and
-        // parses the response player count. Updates _playerCountText on success.
+        // Queries the server's Steam query port and updates _playerCountText.
+        // The UDP exchange blocks, so it runs on a background thread; the coroutine
+        // just polls for the answer and writes it on the main thread.
         private IEnumerator RefreshPlayerCount(string host, int gamePort)
         {
-            // Give the UI a frame to render before blocking.
+            // Give the UI a frame to render before starting the query.
             yield return null;
 
-            var result = "Players: ?";
-            try
+            // Single-element box instead of a captured local — no ValueTuple, and the
+            // worker's completion (IsAlive == false) is what publishes the write.
+            var box = new string[1];
+            var worker = new System.Threading.Thread(() =>
             {
-                // A2S_INFO query: 4-byte FF header + 0x54 + "Source Engine Query\0"
-                byte[] request = new byte[25];
-                request[0] = request[1] = request[2] = request[3] = 0xFF;
-                request[4] = 0x54;
-                Encoding.ASCII.GetBytes("Source Engine Query\0").CopyTo(request, 5);
-
-                // Valheim's query port is the game port (some sources say +1; try both).
-                int[] ports = { gamePort, gamePort + 1 };
-                byte[] response = null;
-
+                // Valheim's query port is the game port + 1 (2457 for the default
+                // 2456). Fall back to the game port for hosts that map it differently.
+                int[] ports = { gamePort + 1, gamePort };
                 foreach (var port in ports)
                 {
-                    try
-                    {
-                        using var udp = new UdpClient();
-                        udp.Client.ReceiveTimeout = 2000;
-                        udp.Connect(host, port);
-                        udp.Send(request, request.Length);
-                        var ep = new System.Net.IPEndPoint(System.Net.IPAddress.Any, 0);
-                        response = udp.Receive(ref ep);
-                        if (response != null && response.Length > 14) break;
-                        response = null;
-                    }
-                    catch { response = null; }
+                    int players, maxPlayers;
+                    if (!QueryA2SInfo(host, port, out players, out maxPlayers)) continue;
+                    box[0] = maxPlayers > 0
+                        ? $"Players: {players} / {maxPlayers}"
+                        : $"Players: {players}";
+                    return;
                 }
+            });
+            worker.IsBackground = true;
+            worker.Start();
 
-                if (response != null && response.Length > 14 && response[4] == 0x49)
+            float deadline = Time.realtimeSinceStartup + 10f;
+            while (worker.IsAlive && Time.realtimeSinceStartup < deadline)
+                yield return null;
+
+            var result = box[0];
+            if (result == null)
+                LogS?.LogInfo($"[ServerGuard.Client] Player-count query to {host}:{gamePort + 1} got no answer.");
+
+            if (_playerCountText != null)
+                SetAnyText(_playerCountText, result ?? "Players: ?");
+        }
+
+        // Sends A2S_INFO to host:port and reads back the player counts.
+        //
+        // Since the December 2020 Valve update — which Valheim's server inherits via
+        // the Steam game-server API — the first A2S_INFO gets an S2C_CHALLENGE reply
+        // ('A', 0x41) instead of the info packet. The query has to be resent with the
+        // 4-byte challenge appended before the server answers with 'I' (0x49).
+        // Not doing that is why the panel only ever showed "Players: ?".
+        private static bool QueryA2SInfo(string host, int port, out int players, out int maxPlayers)
+        {
+            players    = 0;
+            maxPlayers = 0;
+            try
+            {
+                using (var udp = new UdpClient())
                 {
-                    // Skip header (5), protocol (1), then scan past null-terminated strings:
-                    // Name, Map, Folder, Game (4 strings), then 2-byte ID, then player count.
-                    int idx = 6;
-                    for (int skip = 0; skip < 4 && idx < response.Length; skip++)
-                        while (idx < response.Length && response[idx++] != 0) { }
-                    idx += 2; // skip AppID (short)
-                    if (idx < response.Length)
+                    udp.Client.ReceiveTimeout = 2000;
+                    udp.Client.SendTimeout    = 2000;
+                    udp.Connect(host, port);
+
+                    byte[] challenge = null;
+                    // One initial query plus up to two challenge round-trips.
+                    for (int attempt = 0; attempt < 3; attempt++)
                     {
-                        int players    = response[idx];
-                        int maxPlayers = idx + 1 < response.Length ? response[idx + 1] : 0;
-                        result = maxPlayers > 0
-                            ? $"Players: {players} / {maxPlayers}"
-                            : $"Players: {players}";
+                        var request = BuildA2SInfoRequest(challenge);
+                        udp.Send(request, request.Length);
+
+                        var ep = new System.Net.IPEndPoint(System.Net.IPAddress.Any, 0);
+                        var response = udp.Receive(ref ep);
+
+                        // Only single-packet replies (0xFFFFFFFF) are handled; A2S_INFO
+                        // never splits in practice.
+                        if (response == null || response.Length < 5) return false;
+                        if (response[0] != 0xFF || response[1] != 0xFF ||
+                            response[2] != 0xFF || response[3] != 0xFF) return false;
+
+                        if (response[4] == 0x41 && response.Length >= 9)
+                        {
+                            challenge = new byte[4];
+                            Array.Copy(response, 5, challenge, 0, 4);
+                            continue;
+                        }
+
+                        if (response[4] == 0x49)
+                            return ParseA2SInfo(response, out players, out maxPlayers);
+
+                        return false;
                     }
                 }
             }
-            catch { /* offline or unreachable — leave result as "?" */ }
+            catch { /* timeout, unreachable host, or bad address */ }
+            return false;
+        }
 
-            if (_playerCountText != null)
-                SetAnyText(_playerCountText, result);
+        // A2S_INFO request: 0xFFFFFFFF + 'T' + "Source Engine Query\0", with the
+        // 4-byte challenge appended once the server has issued one.
+        private static byte[] BuildA2SInfoRequest(byte[] challenge)
+        {
+            var payload = Encoding.ASCII.GetBytes("Source Engine Query\0");
+            var request = new byte[5 + payload.Length + (challenge != null ? 4 : 0)];
+            request[0] = request[1] = request[2] = request[3] = 0xFF;
+            request[4] = 0x54;
+            payload.CopyTo(request, 5);
+            if (challenge != null) challenge.CopyTo(request, 5 + payload.Length);
+            return request;
+        }
+
+        // Layout after the 0xFFFFFFFF header and 'I': protocol byte, the
+        // null-terminated Name/Map/Folder/Game strings, a 2-byte AppID, then the
+        // player, max-player and bot counts.
+        private static bool ParseA2SInfo(byte[] response, out int players, out int maxPlayers)
+        {
+            players    = 0;
+            maxPlayers = 0;
+
+            int idx = 6;
+            for (int skip = 0; skip < 4; skip++)
+            {
+                while (idx < response.Length && response[idx] != 0) idx++;
+                idx++; // step over the terminator
+            }
+            idx += 2; // AppID (short)
+
+            if (idx + 1 >= response.Length) return false;
+            players    = response[idx];
+            maxPlayers = response[idx + 1];
+            return true;
         }
     }
 }

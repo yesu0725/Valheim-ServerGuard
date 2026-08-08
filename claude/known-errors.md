@@ -260,3 +260,45 @@ foreach (var r in rows) {
     matches.Add(r);
 }
 ```
+
+---
+
+## ERROR 13 — Quick Login panel always shows "Players: ?"
+
+### Symptom
+The title-screen Quick Login panel's live player count never resolves. It sits at
+`Players: ?` even when the server is online, reachable, and has players on it.
+No exception is logged — the query just silently yields nothing.
+
+### Root cause
+Two independent problems in `RefreshPlayerCount` (`ServerGuard.Client/ClientPlugin.cs`):
+
+1. **The A2S challenge was never answered.** Since Valve's December 2020 anti-reflection
+   update — which Valheim inherits through the Steam game-server API — a bare `A2S_INFO`
+   no longer returns the info packet. The server replies with `S2C_CHALLENGE`: a 9-byte
+   packet whose 5th byte is `'A'` (`0x41`), carrying a 4-byte challenge. The query must be
+   **resent with that challenge appended** before the server answers with `'I'` (`0x49`).
+   The old code sent one query and validated the reply with `response.Length > 14`, so the
+   9-byte challenge failed the length check, was discarded as garbage, and the placeholder
+   `"Players: ?"` was never overwritten.
+2. **Wrong port tried first.** Valheim's Steam query port is the game port **+ 1**
+   (`2457` for the default `2456`). The old code tried `gamePort` first, burning a full
+   2-second timeout on a dead port before falling back.
+
+A third, non-fatal issue: `udp.Receive()` was called directly inside the coroutine, so the
+blocking wait ran on the Unity main thread and froze the title screen for up to 4 seconds.
+
+### Fix
+Split the query into `QueryA2SInfo` / `BuildA2SInfoRequest` / `ParseA2SInfo` and:
+- Loop up to 3 times, capturing the challenge from a `0x41` reply and resending with it appended.
+- Validate the `0xFFFFFFFF` single-packet header before trusting the payload.
+- Try `gamePort + 1` first, `gamePort` as fallback.
+- Run the exchange on a background `Thread`; the coroutine polls `worker.IsAlive` and writes
+  the label on the main thread. The result crosses threads in a one-element `string[]` box —
+  **not** a tuple, per CONSTRAINT 1.
+- Log the host and port on failure so a real firewall/offline case is distinguishable from a
+  protocol bug.
+
+### Prevention
+Any future Steam/Source query (`A2S_PLAYER`, `A2S_RULES`) needs the same challenge handshake.
+Never treat a short reply as a failed query without first checking for `0x41`.

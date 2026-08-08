@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard</AssemblyName>
     <RootNamespace>ValheimServerGuard</RootNamespace>
-    <Version>1.6.0</Version>
+    <Version>1.6.1</Version>
     <Description>Valheim Server Guard - Anti-cheat and security mod for Valheim servers</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>

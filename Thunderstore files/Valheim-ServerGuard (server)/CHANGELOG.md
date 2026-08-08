@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.1
+
+Version-match release. No server-side behaviour changes — all fixes in 1.6.1 are in the companion plugin.
+
+### Companion
+- Requires companion plugin **v1.6.1**, which fixes the Quick Login panel's live player count always showing `?`. See the client changelog.
+
 ## 1.6.0
 
 Social/QoL feature drop on top of the 1.4.0 anti-cheat + admin toolkit (everything from 1.4.0 is still here).

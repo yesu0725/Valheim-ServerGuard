@@ -18,7 +18,7 @@ using ValheimServerGuard.Shared;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
-[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.0")]
+[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.1")]
 public class Plugin : BaseUnityPlugin
 {
     internal static Plugin Instance;
@@ -470,7 +470,7 @@ public class Plugin : BaseUnityPlugin
         _harmony.PatchAll();
 
         LogS.LogInfo(
-            $"[ServerGuard] Loaded (v1.6.0). " +
+            $"[ServerGuard] Loaded (v1.6.1). " +
             $"Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}. " +
             $"RequireCompanion: {(_settings.RequireCompanion ? "ON" : "OFF")}. " +
             $"RequireHmac: {(_settings.RequireHmac ? "ON" : "OFF")}. " +
@@ -524,7 +524,7 @@ public class Plugin : BaseUnityPlugin
 		// One-line admin-channel announcement that the plugin is up. Lets moderators
 		// confirm the server came back online after a restart without scraping logs.
 		PostAdminEvent(
-			$":rocket: **ServerGuard online** v1.6.0  " +
+			$":rocket: **ServerGuard online** v1.6.1  " +
 			$"enforce={(_settings.Enforce ? "ON" : "off")}  " +
 			$"requireHmac={(_settings.RequireHmac ? "ON" : "off")}  " +
 			$"req/allow/ban={_requiredMods.Count}/{_allowedMods.Count}/{_bannedMods.Count}  " +
@@ -659,7 +659,7 @@ public class Plugin : BaseUnityPlugin
                 SharedSecret = GenerateSharedSecret()
             };
             var sb = new StringBuilder();
-            sb.AppendLine("# ServerGuard settings (v1.6.0)");
+            sb.AppendLine("# ServerGuard settings (v1.6.1)");
             sb.AppendLine("#");
             sb.AppendLine("# Client-attestation handshake:");
             sb.AppendLine("#   requireCompanion       - if true, peers without the ServerGuard.Client plugin are kicked.");
@@ -3294,7 +3294,7 @@ public class Plugin : BaseUnityPlugin
     private string CmdStatus()
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"[ServerGuard] v1.6.0  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
+        sb.AppendLine($"[ServerGuard] v1.6.1  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
         sb.AppendLine($"  Allowlist  required={_requiredMods.Count}  allowed={_allowedMods.Count}  banned={_bannedMods.Count}");
         sb.AppendLine($"  Modset     loose={ModsetFingerprint.Short(_modsetFingerprintLoose)}  strict={ModsetFingerprint.Short(_modsetFingerprintStrict)}");
         try

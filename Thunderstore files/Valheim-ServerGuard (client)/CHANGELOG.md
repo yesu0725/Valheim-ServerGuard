@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.1
+
+Bug-fix release. Install alongside the 1.6.1 server plugin.
+
+### Fixed
+- **Quick Login player count no longer shows `?`.** The panel's live player count always displayed `Players: ?` even when the server was up and reachable. The server-info query never answered the challenge packet that Valve's query protocol has required since December 2020, so every reply was discarded. The panel now shows the real count (and max players).
+- **Player count queries the right port.** It now tries the Steam query port (game port + 1, i.e. 2457 for a default 2456 server) first instead of last, so the count appears immediately instead of after a wasted timeout.
+- **No more title-screen stutter.** The query used to run on the main thread and could freeze the menu for several seconds while it waited for a reply. It now runs in the background.
+- If the query genuinely can't reach the server (firewall, wrong port, server offline), the panel still shows `Players: ?` — but the log now records which host and port were tried so it can be diagnosed.
+
 ## 1.6.0
 
 Companion update for ServerGuard 1.6.0 server. Required version match — install both at the same time.

@@ -6,6 +6,10 @@ It works because every player runs a small companion plugin that tells the serve
 
 Beyond the mod allowlist, it also includes anti-cheat gates, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
 
+### Fixed in 1.6.1
+
+- **Quick Login player count** — the panel's live player count always showed `Players: ?`. The server query now completes the challenge handshake Valve's protocol requires, targets the correct query port (game port + 1), and runs off the main thread so it no longer stutters the title screen. Client-side fix; update both plugins to keep versions matched.
+
 ### New in 1.6.0
 
 - **Raid alerts** — random-event raids are posted to Discord using their real in-game name (e.g. "The Horde Is Attacking") with coordinates and pause/resume/end updates.
@@ -276,5 +280,5 @@ See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL bu
 
 ---
 
-**Version:** 1.6.0
+**Version:** 1.6.1
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard
