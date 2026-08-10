@@ -1,4 +1,4 @@
-# Implementation Summary — Valheim ServerGuard v1.5
+# Implementation Summary — Valheim ServerGuard
 
 This is a technical summary of how ServerGuard works for someone who wants to read or modify the code. For installation/usage docs see [README.md](README.md) and [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md).
 
@@ -311,6 +311,12 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 
 ## Version
 
+**1.6.2** — feature + fix release.
+- **Forced map positions** (`enableForceMapPositions`, `forceMapPositionsExemptAdmins`). `Patch_ForceMapPositions` postfixes the private `ZNet.RPC_ServerSyncedPlayerData` — the point where the server ingests each client's position sync — and sets `peer.m_publicRefPos = true` via `ApplyForcedMapPosition()`. `ZNet.UpdatePlayerList` then copies that into `PlayerInfo.m_publicPosition` for the broadcast player list. Re-applied on every ~2s sync, so it's authoritative and hot-reloads both ways.
+- **Sheathe dropped from the AnimationCancel rule.** `Patch_Humanoid_HideHandItems_BlockDuringAttack` deleted from the client; `OnAnimationCancelReceived` also discards any source in `_animationCancelIgnoredSources` so companions from 1.6.1 and earlier stop generating strikes without every player having to update.
+- **Arrival shout toggle** (`enableArrivalShout`). New server→client `ServerGuard_ArrivalShout` RPC pushed on connect (before the admin early-return) and re-broadcast from `LoadSettings()` on hot-reload. The companion brackets `Game.UpdateRespawn` with a frame stamp and drops the Shout raised inside it — no text matching, so it works in every language and won't eat a manual "I have arrived!". `Patch_Chat_SendText_Report` became a `bool` prefix to host both the report and the block (a prefix returning `false` skips the remaining prefixes, so splitting them would have been order-dependent).
+- **Server lifecycle notifications restored and split.** They existed in the 1.4.0/1.5.0 lineages and were dropped by the `1850200` merge, which took main's `Awake`/`OnDestroy` wholesale. `Awake` now posts "Server is starting..."; `ServerReadyWatcher()` polls `IsServerReadyForPlayers()` (`ZNet.IsServer()` + `ZoneSystem.LocationsGenerated`) once a second for up to 15 min and posts "The server has started, you may now login."; `PostShutdownNoticeBlocking()` runs first in `OnDestroy` and posts synchronously, because a fire-and-forget `Task` gets killed by process exit.
+
 **1.6.1** — bug-fix release. The Quick Login panel's live player count always rendered as `Players: ?` because the A2S_INFO query never answered Valve's `S2C_CHALLENGE` (`0x41`) packet, which the Steam game-server API has required since December 2020. `RefreshPlayerCount` now performs the challenge handshake via `QueryA2SInfo`/`BuildA2SInfoRequest`/`ParseA2SInfo`, queries the correct port first (`gamePort + 1`), and runs the blocking UDP exchange on a background thread instead of stalling the title screen.
 
 **1.6.0** — merge of the two lineages into one codebase. Keeps the 1.4.0 anti-cheat gates, `sg` admin console, build/death forensics, two-channel Discord routing, and self-test; adds raid event logging with **in-game display names** (via `RaidDisplayNames` map on `Patch_SetRandomEvent`/`Patch_ResetRandomEvent`), player shout logging (`ServerGuard_Chat` ZRpc), cheat-item removal on login (`ServerGuard_RemoveItems` ZRpc; `enableCheatItemRemoval`/`cheatItems`), and the client-side **Quick Login** title-screen panel (direct connect via `m_queuedJoinServer` re-asserted in an `OnCharacterStart` prefix; static `FejdStartup.ServerPassword` skips the password prompt).
@@ -322,12 +328,12 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 **1.3.0** — first release of the client-attestation architecture.
 
 The version string is set independently in:
-- `Plugin.cs` — `[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.1")]` + hardcoded `v1.6.1` in log/config strings
-- `ClientPlugin.cs` — `public const string VERSION = "1.6.1";`
-- `Valheim-ServerGuard.csproj` — `<Version>1.6.1</Version>`
-- `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` — `<Version>1.6.1</Version>`
-- `Thunderstore files/Valheim-ServerGuard (server)/manifest.json` — `"version_number": "1.6.1"`
-- `Thunderstore files/Valheim-ServerGuard (client)/manifest.json` — `"version_number": "1.6.1"`
+- `Plugin.cs` — `[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.2")]` + hardcoded `v1.6.2` in log/config strings
+- `ClientPlugin.cs` — `public const string VERSION = "1.6.2";`
+- `Valheim-ServerGuard.csproj` — `<Version>1.6.2</Version>`
+- `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` — `<Version>1.6.2</Version>`
+- `Thunderstore files/Valheim-ServerGuard (server)/manifest.json` — `"version_number": "1.6.2"`
+- `Thunderstore files/Valheim-ServerGuard (client)/manifest.json` — `"version_number": "1.6.2"`
 - `README.md`, `claude/IMPLEMENTATION_SUMMARY.md`, `DEPLOYMENT_GUIDE.md`, `BUILD.md` — inline version references
 - Both Thunderstore `README.md` and `CHANGELOG.md` files
 

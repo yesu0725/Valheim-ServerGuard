@@ -50,6 +50,24 @@ public static bool Prefix(...)
 }
 ```
 
+**A prefix returning `false` also skips the remaining prefixes on that method**, not just the
+original. So don't split "block it" and "observe it" into two patch classes on the same target —
+whether the observer still runs then depends on patch order, which you don't control. Put both jobs
+in one prefix. `Patch_Chat_SendText_Report` does exactly this: it reports shouts *and* swallows the
+arrival shout, because a separate blocker could otherwise silently disable the reporting.
+
+### Don't bracket state with Prefix/Postfix pairs
+A postfix does **not** run when the original method throws, so a `Prefix { flag = true } /
+Postfix { flag = false }` pair leaves the flag latched on forever the first time the target throws.
+Stamp a frame instead and compare — the window expires on its own:
+
+```csharp
+public static void Prefix() { _respawnUpdateFrame = Time.frameCount; }   // no postfix needed
+private static bool _inRespawnUpdate => _respawnUpdateFrame == Time.frameCount;
+```
+
+(A Harmony *finalizer* would also work, but a self-expiring stamp is simpler and can't leak.)
+
 ---
 
 ## Parameter binding rules
@@ -92,6 +110,7 @@ public static void Postfix(ref bool __result) { __result = false; }
 | `Patch_OnNewConnection` | `ZNet.OnNewConnection` | Postfix | `ZNetPeer peer` | Registers all RPC handlers **before** admin check |
 | `Patch_Disconnect` | `ZNet.Disconnect` | Prefix | `ZNetPeer peer` | `_suppressLogoutFor` prevents double-posting |
 | `Patch_RPC_PeerInfo` | `ZNet.RPC_PeerInfo` | Postfix | `ZNet __instance, ZRpc rpc` | Resolves peer from rpc via reflection |
+| `Patch_ForceMapPositions` | `ZNet."RPC_ServerSyncedPlayerData"` | Postfix | `ZNet __instance, ZRpc rpc` | Private method — string literal target. Sets `peer.m_publicRefPos = true` |
 | `Patch_Inventory_AddItem` | `Inventory.AddItem` | Prefix | `Inventory __instance, ItemDrop.ItemData item` | Returns `false` only when `!logOnly` |
 | `Patch_WearNTear_Damage_Track` (server) | `WearNTear.Damage` | Prefix | `WearNTear __instance, HitData hit` | Fills `LastHitBox` in `ConditionalWeakTable` |
 | `Patch_WearNTear_Destroy_Log` (server) | `WearNTear.Destroy` | Prefix | `WearNTear __instance` | Reads `LastHitBox`, logs to CSV |
@@ -101,8 +120,9 @@ public static void Postfix(ref bool __result) { __result = false; }
 | `Patch_Player_OnDeath_Report` (client) | `Player."OnDeath"` | Prefix | `Player __instance` | String literal, not nameof |
 | `Patch_TryRunCommand` (client) | `Terminal.TryRunCommand` | Prefix | `Terminal __instance, string text` | Intercepts `sg`/`/sg` before devcommands gate |
 | `Patch_Player_StartEmote_BlockDuringAttack` (client) | `Player.StartEmote` | Prefix | `Player __instance` | Returns `false` to block emote during attack |
-| `Patch_Humanoid_HideHandItems_BlockDuringAttack` (client) | `Humanoid.HideHandItems` | Prefix | `Humanoid __instance` | Casts to Player, returns `false` during attack |
 | `Patch_RegisterClientHandler` (client) | `ZNet.OnNewConnection` | Postfix | `ZNetPeer peer` | Stashes `_serverRpc`, registers `ServerGuard_RequestManifest` handler |
+| `Patch_Chat_SendText_Report` (client) | `Chat."SendText"` | Prefix → `bool` | `Talker.Type __0, string __1` | Positional binding. Returns `false` to swallow the arrival shout |
+| `Patch_Game_UpdateRespawn_ArrivalShout` (client) | `Game."UpdateRespawn"` | Prefix | none | Stamps `_respawnUpdateFrame` so the `Chat.SendText` prefix can identify the arrival shout |
 
 ---
 

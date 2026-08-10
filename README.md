@@ -6,6 +6,13 @@ It works because every player runs a small companion plugin that tells the serve
 
 Beyond the mod allowlist, it also includes anti-cheat gates, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
 
+### New in 1.6.2
+
+- **Forced map positions** *(`enableForceMapPositions`, off by default)* — override every player's "public position" toggle so everyone is permanently visible on everyone's map. Enforced server-side, so a modified client can't opt out. `forceMapPositionsExemptAdmins` lets staff stay hidden.
+- **Arrival shout toggle** *(`enableArrivalShout`, on by default)* — set to `false` to suppress the vanilla "I have arrived!" shout on first spawn. Useful when your server already posts login notifications and the shout is just noise. Players can still shout manually.
+- **Sheathing no longer counts as an animation cancel** — holstering your weapon mid-attack is ordinary play (weapon swaps, looting, building all do it), so it was flagging honest players. Only the emote cancel is gated now. Servers also discard `sheathe` reports from older companions, so the rule stops applying as soon as the server updates.
+- **Server start / shutdown notifications restored**, and the boot message is now split in two: `Server is starting...` when the plugin loads, then `The server has started, you may now login.` only once the world is loaded and location generation has finished. On a fresh seed those can be minutes apart — previously a single message invited players onto a server that would still refuse them.
+
 ### Fixed in 1.6.1
 
 - **Quick Login player count** — the panel's live player count always showed `Players: ?`. The server query now completes the challenge handshake Valve's protocol requires, targets the correct query port (game port + 1), and runs off the main thread so it no longer stutters the title screen. Client-side fix; update both plugins to keep versions matched.
@@ -280,5 +287,5 @@ See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL bu
 
 ---
 
-**Version:** 1.6.1
+**Version:** 1.6.2
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

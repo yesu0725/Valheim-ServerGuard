@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.2
+
+Install alongside the 1.6.2 server plugin.
+
+### Changed
+- **Sheathing your weapon is no longer blocked mid-attack.** Holstering was treated as an attack-cancel exploit, but weapon swaps, picking up items, opening chests and building all holster the weapon — so honest play was being blocked and reported. Only the emote cancel is blocked now.
+- **The "I have arrived!" shout can be turned off by the server.** If your server sets `enableArrivalShout: false`, the companion swallows the automatic first-spawn shout. You can still shout manually. Servers that don't set it keep vanilla behaviour.
+
 ## 1.6.1
 
 Bug-fix release. Install alongside the 1.6.1 server plugin.

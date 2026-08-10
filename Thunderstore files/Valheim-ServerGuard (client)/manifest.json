@@ -1,7 +1,7 @@
 {
   "name": "Valheim_ServerGuard_Client",
   "description": "Companion plugin for Valheim ServerGuard. Required when joining a ServerGuard-protected server. Adds an optional one-click Quick Login panel to the title screen. Tells the server which mods you have loaded so it can let you in.",
-  "version_number": "1.6.1",
+  "version_number": "1.6.2",
   "website_url": "https://github.com/yesu0725/Valheim-ServerGuard",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2333",

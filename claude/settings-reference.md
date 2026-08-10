@@ -128,6 +128,27 @@ Attribute: `[YamlMember(Alias = "countAsViolation", ApplyNamingConventions = fal
 
 ---
 
+## Arrival shout
+
+| C# property | YAML key | Type | Default |
+|---|---|---|---|
+| `EnableArrivalShout` | `enableArrivalShout` | bool | `true` |
+
+Server setting, client enforcement. `SendArrivalShoutPolicy(peer)` pushes `"1"`/`"0"` over the `ServerGuard_ArrivalShout` RPC on connect (before the admin early-return, so admins get it too); `BroadcastArrivalShoutPolicy()` re-pushes to everyone online from `LoadSettings()` on hot-reload. The companion swallows the shout in its `Chat.SendText` prefix while `Game.UpdateRespawn` is on the stack.
+
+---
+
+## Forced map positions
+
+| C# property | YAML key | Type | Default |
+|---|---|---|---|
+| `EnableForceMapPositions` | `enableForceMapPositions` | bool | `false` |
+| `ForceMapPositionsExemptAdmins` | `forceMapPositionsExemptAdmins` | bool | `false` |
+
+Implemented by `ApplyForcedMapPosition(ZNetPeer)` + `Patch_ForceMapPositions` (postfix on the private `ZNet.RPC_ServerSyncedPlayerData`). Sets `peer.m_publicRefPos = true`, which `ZNet.UpdatePlayerList` copies into `PlayerInfo.m_publicPosition` for the broadcast player list. Re-applied on every client sync (~2s), so it hot-reloads in both directions without a restart.
+
+---
+
 ## Metrics
 
 | C# property | YAML key | Type | Default |

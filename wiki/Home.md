@@ -26,7 +26,7 @@ A toolkit for running a curated-modpack server: keep the wrong people out, catch
 
 ## Versioning
 
-Server and companion versions must match (1.6.1 ↔ 1.6.1). If you update one, update the other.
+Server and companion versions must match (1.6.2 ↔ 1.6.2). If you update one, update the other.
 
 ## Try it out
 

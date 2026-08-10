@@ -44,6 +44,14 @@ If an admin connects and `Register` hasn't run yet, their companion's RPCs arriv
 
 ---
 
+### `ServerGuard_ArrivalShout`
+- **Sender:** `SendArrivalShoutPolicy(peer)` — from `Patch_OnNewConnection` (before the admin early-return) and from `BroadcastArrivalShoutPolicy()` on every settings.yaml hot-reload
+- **Payload:** `string` — `"1"` = vanilla first-spawn shout allowed, `"0"` = swallow it
+- **Client handler:** `ClientPlugin.OnArrivalShoutPolicyReceived(payload)` — sets `_arrivalShoutAllowed`, which the `Chat.SendText` prefix consults
+- **Default when never sent:** allowed (older/unconfigured servers keep vanilla behaviour)
+
+---
+
 ## Client → Server RPCs (client invokes, server receives)
 
 All registered in `Patch_OnNewConnection` on the server side.
@@ -72,9 +80,9 @@ All registered in `Patch_OnNewConnection` on the server side.
 ---
 
 ### `ServerGuard_AnimationCancelAttempt`
-- **Sender:** `Patch_Player_StartEmote_BlockDuringAttack` or `Patch_Humanoid_HideHandItems_BlockDuringAttack`
-- **Payload:** `string source` — `"emote"` or `"sheathe"`
-- **Server handler:** `OnAnimationCancelReceived(peer, source)`
+- **Sender:** `Patch_Player_StartEmote_BlockDuringAttack`
+- **Payload:** `string source` — `"emote"`
+- **Server handler:** `OnAnimationCancelReceived(peer, source)` — drops any source in `_animationCancelIgnoredSources` (currently `"sheathe"`, still sent by companions from 1.6.1 and earlier)
 
 ---
 

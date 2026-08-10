@@ -26,7 +26,7 @@ namespace ValheimServerGuardClient
     {
         public const string GUID    = "com.taeguk.valheim.serverguard.client";
         public const string NAME    = "Valheim ServerGuard Client";
-        public const string VERSION = "1.6.1";
+        public const string VERSION = "1.6.2";
 
         internal static ClientPlugin Instance;
         internal static ManualLogSource LogS;
@@ -1121,6 +1121,15 @@ namespace ValheimServerGuardClient
                         catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] RemoveItems handler error: {ex.Message}"); }
                     });
 
+                    // Arrival-shout policy: "1" = shout normally, "0" = swallow the
+                    // vanilla first-spawn shout. Sent on connect and on every
+                    // server-side settings.yaml reload.
+                    peer.m_rpc.Register<string>("ServerGuard_ArrivalShout", (rpc, allowed) =>
+                    {
+                        try { ClientPlugin.OnArrivalShoutPolicyReceived(allowed); }
+                        catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] ArrivalShout handler error: {ex.Message}"); }
+                    });
+
                     ClientPlugin.LogS.LogInfo("[ServerGuard.Client] Registered manifest request handler on server peer.");
                 }
                 catch (Exception ex)
@@ -1182,9 +1191,9 @@ namespace ValheimServerGuardClient
             catch { /* never let the gate throw into Valheim */ }
         }
 
-        // Called by the animation-cancel patches when they swallow an emote / sheathe /
-        // other cancel input that arrived mid-attack. `source` is a short tag (e.g.
-        // "emote", "sheathe") so the server log + Discord can show what vector was used.
+        // Called by the animation-cancel patches when they swallow a cancel input that
+        // arrived mid-attack. `source` is a short tag (e.g. "emote") so the server log
+        // + Discord can show what vector was used.
         internal void ReportAnimationCancel(string source)
         {
             try
@@ -1257,10 +1266,10 @@ namespace ValheimServerGuardClient
 
         // -------------- Animation-cancel gate --------------
         //
-        // Classic Valheim attack-spam exploit: trigger an emote (or sheathe weapon)
-        // mid-attack to cancel the recovery animation. The next attack then fires faster
-        // than the weapon's animation should allow. The fix is to refuse those state
-        // transitions while Player.InAttack() returns true.
+        // Classic Valheim attack-spam exploit: trigger an emote mid-attack to cancel the
+        // recovery animation. The next attack then fires faster than the weapon's
+        // animation should allow. The fix is to refuse that state transition while
+        // Player.InAttack() returns true.
         //
         // Only blocks on multiplayer clients - single-player / host keeps full control.
         // Only blocks the LOCAL player's input - we never interfere with how other
@@ -1268,7 +1277,11 @@ namespace ValheimServerGuardClient
         //
         // Patches:
         //   * Player.StartEmote         - emote cancel (the most common exploit)
-        //   * Humanoid.HideHandItems    - sheathe cancel (weapon-swap / press-R)
+        //
+        // Sheathing (Humanoid.HideHandItems) is deliberately NOT gated: it is ordinary
+        // play - weapon swaps, picking up items, opening chests and building all holster
+        // the weapon - so blocking it mid-attack produced constant false positives for
+        // honest players.
 
         private static bool ShouldBlockAnimationCancel(Player p)
         {
@@ -1298,33 +1311,6 @@ namespace ValheimServerGuardClient
                 catch (Exception ex)
                 {
                     ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Emote gate error: {ex.Message}");
-                }
-                return true;
-            }
-        }
-
-        [HarmonyPatch(typeof(Humanoid), nameof(Humanoid.HideHandItems))]
-        public static class Patch_Humanoid_HideHandItems_BlockDuringAttack
-        {
-            // Humanoid.HideHandItems is called for any humanoid (player, draugr, NPC, ...)
-            // when their weapons get holstered. We only care about the LOCAL player's
-            // own input on a multiplayer client, so the ShouldBlockAnimationCancel check
-            // also filters out non-Player Humanoids and non-local Players.
-            public static bool Prefix(Humanoid __instance)
-            {
-                try
-                {
-                    var asPlayer = __instance as Player;
-                    if (asPlayer == null) return true;
-                    if (ShouldBlockAnimationCancel(asPlayer))
-                    {
-                        ClientPlugin.Instance?.ReportAnimationCancel("sheathe");
-                        return false; // skip - weapons stay drawn, animation finishes naturally
-                    }
-                }
-                catch (Exception ex)
-                {
-                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Sheathe gate error: {ex.Message}");
                 }
                 return true;
             }
@@ -1393,16 +1379,31 @@ namespace ValheimServerGuardClient
 
         // Bind parameters by index (__0/__1) so the patch attaches regardless of
         // parameter names in the running Valheim build.
+        //
+        // Returns false to swallow the vanilla first-spawn shout when the server has
+        // turned it off. Both jobs live in one prefix on purpose: Harmony skips the
+        // remaining prefixes once any of them returns false, so a separate blocker
+        // patch could suppress the reporting patch (or not) depending on patch order.
         [HarmonyPatch(typeof(Chat), "SendText")]
         public static class Patch_Chat_SendText_Report
         {
-            public static void Prefix(Talker.Type __0, string __1)
+            public static bool Prefix(Talker.Type __0, string __1)
             {
                 try
                 {
-                    if (ZNet.instance == null || ZNet.instance.IsServer()) return;
-                    if (__0 != Talker.Type.Shout) return;
-                    if (string.IsNullOrWhiteSpace(__1)) return;
+                    if (ZNet.instance == null || ZNet.instance.IsServer()) return true;
+                    if (__0 != Talker.Type.Shout) return true;
+
+                    // Game.UpdateRespawn is the only caller that shouts on its own, so a
+                    // Shout raised inside it is the arrival message - no text matching
+                    // needed, and it works in every language.
+                    if (_inRespawnUpdate && !_arrivalShoutAllowed)
+                    {
+                        LogS?.LogInfo("[ServerGuard.Client] Arrival shout suppressed (server policy).");
+                        return false;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(__1)) return true;
 
                     ClientPlugin.Instance?.SendChatReport((int)__0, __1);
                 }
@@ -1410,7 +1411,42 @@ namespace ValheimServerGuardClient
                 {
                     ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Chat hook error: {ex.Message}");
                 }
+                return true;
             }
+        }
+
+        // ====================== Arrival shout gate ======================
+        //
+        // Vanilla shouts the localised "I have arrived!" line from Game.UpdateRespawn
+        // the first time the local player spawns into a session. Servers that already
+        // announce logins can turn it off via enableArrivalShout in settings.yaml.
+        //
+        // Rather than string-matching the shout (which breaks in other languages and
+        // would also eat a manual "I have arrived!"), we flag the window while
+        // UpdateRespawn is on the stack and let the Chat.SendText prefix drop the
+        // shout raised inside it.
+
+        // Default true: a server that never sends the policy (older build, or the
+        // setting left at its default) keeps vanilla behaviour.
+        private static bool _arrivalShoutAllowed = true;
+
+        // Frame on which UpdateRespawn last ran, rather than a bool bracketed by a
+        // prefix/postfix pair: a postfix does NOT run if the original method throws, and
+        // a latched bool would then swallow every shout for the rest of the session.
+        // A frame stamp expires on its own.
+        private static int _respawnUpdateFrame = -1;
+        private static bool _inRespawnUpdate => _respawnUpdateFrame == Time.frameCount;
+
+        internal static void OnArrivalShoutPolicyReceived(string payload)
+        {
+            _arrivalShoutAllowed = !string.Equals((payload ?? "").Trim(), "0", StringComparison.Ordinal);
+            LogS?.LogInfo($"[ServerGuard.Client] Arrival shout {(_arrivalShoutAllowed ? "allowed" : "suppressed")} by server policy.");
+        }
+
+        [HarmonyPatch(typeof(Game), "UpdateRespawn")]
+        public static class Patch_Game_UpdateRespawn_ArrivalShout
+        {
+            public static void Prefix() { _respawnUpdateFrame = Time.frameCount; }
         }
 
         // Payload: "<type>|<text>". Server resolves name/SteamID from the peer.

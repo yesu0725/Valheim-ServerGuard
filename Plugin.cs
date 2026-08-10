@@ -18,7 +18,7 @@ using ValheimServerGuard.Shared;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
-[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.1")]
+[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.2")]
 public class Plugin : BaseUnityPlugin
 {
     internal static Plugin Instance;
@@ -290,11 +290,14 @@ public class Plugin : BaseUnityPlugin
         public double InventoryCheckStackTolerance { get; set; } = 1.0;
 
         // --- Animation-cancel gate (anti-cheat) ---
-        // The classic Valheim attack-spam exploit: trigger an emote (or sheathe weapon)
-        // during attack recovery to cancel the recovery animation, allowing the next
-        // attack to fire sooner than vanilla intended. The companion plugin blocks the
-        // cancel client-side; this server-side toggle controls whether reports of those
+        // The classic Valheim attack-spam exploit: trigger an emote during attack
+        // recovery to cancel the recovery animation, allowing the next attack to fire
+        // sooner than vanilla intended. The companion plugin blocks the cancel
+        // client-side; this server-side toggle controls whether reports of those
         // blocks are logged + posted + counted as violations.
+        //
+        // Sheathing is excluded from this rule - it is ordinary play (weapon swaps,
+        // looting, building), so gating it flagged honest players.
         public bool EnableAnimationCancelGate { get; set; } = true;
 
         // --- Skill-level cap enforcement (#10) ---
@@ -343,6 +346,31 @@ public class Plugin : BaseUnityPlugin
         // player's inventory on login (the companion performs the removal after spawn).
         public bool EnableCheatItemRemoval { get; set; } = true;
         public List<string> CheatItems     { get; set; } = new List<string> { "SwordCheat", "SledgeCheat" };
+
+        // --- Arrival shout ---
+        // Vanilla makes every player shout the localised "I have arrived!" line the first
+        // time they spawn into a session (Game.UpdateRespawn). On a server that already
+        // announces logins, that shout is pure noise. Set this to false and the companion
+        // swallows it; the player joins silently.
+        //
+        // Only affects the automatic first-spawn shout - players can still shout manually.
+        // Default true = vanilla behaviour.
+        public bool EnableArrivalShout { get; set; } = true;
+
+        // --- Forced map positions ---
+        // Vanilla lets every player decide whether their position is shared on the map
+        // (the "public position" toggle on the minimap, off by default). When this is on,
+        // the server overrides that choice for every peer, so all players are permanently
+        // visible on each other's maps.
+        //
+        // Enforced server-side: the flag is rewritten on the peer record as the server
+        // ingests each client's position sync, so a modified client can't opt out.
+        // Defaults to false - this changes gameplay, so it's opt-in.
+        public bool EnableForceMapPositions       { get; set; } = false;
+
+        // When true, SteamIDs listed in admins.yaml keep their own toggle and can stay
+        // hidden. Default false = the rule applies to everyone, admins included.
+        public bool ForceMapPositionsExemptAdmins { get; set; } = false;
 
         // Deprecated (kept so old YAML loads without errors). v1.4+ uses two webhooks instead.
         public bool DiscordPublicMode { get; set; } = true;
@@ -470,7 +498,7 @@ public class Plugin : BaseUnityPlugin
         _harmony.PatchAll();
 
         LogS.LogInfo(
-            $"[ServerGuard] Loaded (v1.6.1). " +
+            $"[ServerGuard] Loaded (v1.6.2). " +
             $"Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}. " +
             $"RequireCompanion: {(_settings.RequireCompanion ? "ON" : "OFF")}. " +
             $"RequireHmac: {(_settings.RequireHmac ? "ON" : "OFF")}. " +
@@ -524,11 +552,17 @@ public class Plugin : BaseUnityPlugin
 		// One-line admin-channel announcement that the plugin is up. Lets moderators
 		// confirm the server came back online after a restart without scraping logs.
 		PostAdminEvent(
-			$":rocket: **ServerGuard online** v1.6.1  " +
+			$":rocket: **ServerGuard online** v1.6.2  " +
 			$"enforce={(_settings.Enforce ? "ON" : "off")}  " +
 			$"requireHmac={(_settings.RequireHmac ? "ON" : "off")}  " +
 			$"req/allow/ban={_requiredMods.Count}/{_allowedMods.Count}/{_bannedMods.Count}  " +
 			$"modset=`{ModsetFingerprint.Short(_modsetFingerprintLoose)}`");
+
+		// Public "we're coming up" notice. Awake runs long before the world is loaded,
+		// so this is deliberately worded as in-progress - ServerReadyWatcher posts the
+		// "you may now login" line once players can actually connect.
+		_ = SendDiscordNow(":hourglass_flowing_sand: **Server is starting...**", DiscordChannel.Public);
+		StartCoroutine(ServerReadyWatcher());
 
 		// Boot done - hot-reload notices will now reach the admin channel.
 		_bootCompleted = true;
@@ -540,10 +574,88 @@ public class Plugin : BaseUnityPlugin
 				$"strikes={_settings.SpeedCheckConsecutiveStrikes}  " +
 				$"teleport-tol={_settings.SpeedCheckTeleportToleranceMeters:F1}m");
 		}
+		if (_settings.EnableForceMapPositions)
+		{
+			LogS.LogInfo(
+				$"[ServerGuard] Forced map positions enabled  " +
+				$"exemptAdmins={(_settings.ForceMapPositionsExemptAdmins ? "yes" : "no")}");
+		}
+    }
+
+    // ==================== Server lifecycle notifications ====================
+
+    // True once the dedicated server has finished loading the world AND generating
+    // locations. Until LocationsGenerated flips, the process is up but the server is
+    // still churning (minutes, on a brand-new seed) and nobody can join yet.
+    private static bool IsServerReadyForPlayers()
+    {
+        try
+        {
+            var znet = ZNet.instance;
+            if (znet == null || !znet.IsServer()) return false;
+
+            var zones = ZoneSystem.instance;
+            if (zones == null) return false;
+
+            return zones.LocationsGenerated;
+        }
+        catch { return false; }
+    }
+
+    // Waits for the server to become joinable, then posts the public "you may now
+    // login" line. Deliberately separate from the Awake-time "starting" post: BepInEx
+    // loads plugins very early, so announcing "started" there would invite players to
+    // connect to a server that will refuse them for another few minutes.
+    private IEnumerator ServerReadyWatcher()
+    {
+        // Generous ceiling: first boot of a fresh seed generates every location and can
+        // legitimately take several minutes on slow hardware.
+        var deadline = Time.realtimeSinceStartup + 900f;
+
+        while (Time.realtimeSinceStartup < deadline)
+        {
+            if (IsServerReadyForPlayers())
+            {
+                LogS.LogInfo("[ServerGuard] Server is ready for players.");
+                _ = SendDiscordNow(":white_check_mark: **The server has started, you may now login.**", DiscordChannel.Public);
+                yield break;
+            }
+            yield return new WaitForSeconds(1f);
+        }
+
+        // Never went ready. Say so in the admin channel rather than posting an invite
+        // that isn't true - a silent public channel is the safer failure here.
+        LogS.LogWarning("[ServerGuard] Server-ready watcher timed out after 15 minutes; skipping the public 'server started' post.");
+        PostAdminEvent(":warning: Server-ready watcher timed out - no public \"server started\" message was sent. Check whether world generation finished.");
+    }
+
+    // Fires from OnDestroy, which on a graceful shutdown runs while the process is
+    // tearing down. A fire-and-forget Task would be killed before the request left the
+    // machine, so this one posts synchronously and accepts the brief block.
+    private void PostShutdownNoticeBlocking()
+    {
+        try
+        {
+            var url = _settings?.discordWebhookUrl;
+            if (string.IsNullOrWhiteSpace(url)) return;
+
+            var json = JsonConvert.SerializeObject(new { content = ":octagonal_sign: **Server is shutting down.**" });
+            using var body = new System.Net.Http.StringContent(json, Encoding.UTF8, "application/json");
+            using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            http.PostAsync(url, body).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            LogS?.LogWarning($"[ServerGuard] Shutdown notice failed: {ex.Message}");
+        }
     }
 
     private void OnDestroy()
 	{
+		// First, before anything can throw: the operator wants to know the server went
+		// down even if the rest of teardown misbehaves.
+		PostShutdownNoticeBlocking();
+
 		try
 		{
 			_harmony?.UnpatchSelf();
@@ -659,7 +771,7 @@ public class Plugin : BaseUnityPlugin
                 SharedSecret = GenerateSharedSecret()
             };
             var sb = new StringBuilder();
-            sb.AppendLine("# ServerGuard settings (v1.6.1)");
+            sb.AppendLine("# ServerGuard settings (v1.6.2)");
             sb.AppendLine("#");
             sb.AppendLine("# Client-attestation handshake:");
             sb.AppendLine("#   requireCompanion       - if true, peers without the ServerGuard.Client plugin are kicked.");
@@ -708,10 +820,12 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("#");
             sb.AppendLine("# Animation-cancel gate (anti-cheat):");
             sb.AppendLine("#   enableAnimationCancelGate - if true, attempts to cancel attack-recovery");
-            sb.AppendLine("#                               animations (emote, sheathe) reported by the");
-            sb.AppendLine("#                               companion are logged + posted + counted.");
+            sb.AppendLine("#                               animations (emote) reported by the companion");
+            sb.AppendLine("#                               are logged + posted + counted.");
             sb.AppendLine("#                               The companion ALWAYS blocks the cancel client-side;");
             sb.AppendLine("#                               this toggle only controls server-side accounting.");
+            sb.AppendLine("#                               Sheathing is NOT part of this rule - weapon swaps,");
+            sb.AppendLine("#                               looting and building all holster the weapon.");
             sb.AppendLine("#");
             sb.AppendLine("# Skill-level cap (anti-cheat):");
             sb.AppendLine("#   enableSkillCap     - master toggle. Companion plugin sends a snapshot of");
@@ -755,6 +869,25 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("#   enableCheatItemRemoval - if true, the companion strips the items listed in");
             sb.AppendLine("#                            cheatItems from any non-admin player's inventory on login.");
             sb.AppendLine("#   cheatItems             - prefab names to remove (default: SwordCheat, SledgeCheat).");
+            sb.AppendLine("#");
+            sb.AppendLine("# Arrival shout:");
+            sb.AppendLine("#   enableArrivalShout - vanilla makes every player shout \"I have arrived!\" the");
+            sb.AppendLine("#                        first time they spawn in. Set to false and the companion");
+            sb.AppendLine("#                        swallows it - useful when the server already announces");
+            sb.AppendLine("#                        logins and the shout is just noise. Players can still");
+            sb.AppendLine("#                        shout manually. Default true (vanilla behaviour).");
+            sb.AppendLine("#                        Hot-reloads: online players pick up the change at once.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Forced map positions:");
+            sb.AppendLine("#   enableForceMapPositions       - if true, every player is permanently visible on");
+            sb.AppendLine("#                                   everyone's map, regardless of their own");
+            sb.AppendLine("#                                   'public position' minimap toggle. Enforced");
+            sb.AppendLine("#                                   server-side, so a modified client can't opt out.");
+            sb.AppendLine("#                                   Default false (vanilla behaviour: each player");
+            sb.AppendLine("#                                   chooses). Takes effect within ~2s of a reload -");
+            sb.AppendLine("#                                   no restart needed.");
+            sb.AppendLine("#   forceMapPositionsExemptAdmins - if true, SteamIDs in admins.yaml keep their own");
+            sb.AppendLine("#                                   toggle and can stay hidden. Default false.");
             sb.AppendLine("#");
             sb.AppendLine("# Discord (two independent channels - either, both, or neither):");
             sb.AppendLine("#   discordWebhookUrl       - PUBLIC channel. Receives only player-facing");
@@ -891,7 +1024,13 @@ public class Plugin : BaseUnityPlugin
             }
 
             LogS.LogInfo("[ServerGuard] settings.yaml loaded");
-            if (_bootCompleted) PostAdminEvent(":arrows_counterclockwise: settings.yaml reloaded");
+            if (_bootCompleted)
+            {
+                PostAdminEvent(":arrows_counterclockwise: settings.yaml reloaded");
+                // enableArrivalShout lives on the client; push the new value out so the
+                // change lands without waiting for everyone to reconnect.
+                BroadcastArrivalShoutPolicy();
+            }
         }
         catch (Exception ex)
         {
@@ -2316,6 +2455,11 @@ public class Plugin : BaseUnityPlugin
                     Plugin.Instance.OnAdminCommandReceived(peer, command);
                 });
 
+                // Arrival-shout policy. Pushed to EVERY peer (admins included, hence
+                // before the early-return below) so the companion knows whether to
+                // swallow the first-spawn "I have arrived!" shout.
+                Plugin.Instance.SendArrivalShoutPolicy(peer);
+
                 if (Plugin.Instance.IsAdmin(pid))
                 {
                     Plugin.LogS.LogInfo($"[ServerGuard] {Plugin.Instance.FormatPlayer(pid)} is admin - skipping attestation challenge.");
@@ -2466,6 +2610,57 @@ public class Plugin : BaseUnityPlugin
 			}
 		}
 	}
+
+    // -------------- Forced map positions --------------
+
+    // Overrides a peer's "public position" flag so the player shows up on everyone's
+    // map. Valheim keeps that choice on ZNetPeer.m_publicRefPos, which ZNet.UpdatePlayerList
+    // copies into the PlayerInfo list broadcast to every client - flipping it here is all
+    // it takes for the pin to appear. Returns true when the flag was actually forced.
+    //
+    // Admins can be exempted via forceMapPositionsExemptAdmins.
+    private bool ApplyForcedMapPosition(ZNetPeer peer)
+    {
+        if (peer == null) return false;
+        if (_settings == null || !_settings.EnableForceMapPositions) return false;
+        if (peer.m_publicRefPos) return false;   // already sharing - nothing to do
+
+        if (_settings.ForceMapPositionsExemptAdmins)
+        {
+            var platformId = GetPeerPlatformId(peer);
+            if (!string.IsNullOrEmpty(platformId) && IsAdmin(platformId)) return false;
+        }
+
+        peer.m_publicRefPos = true;
+        return true;
+    }
+
+    // Clients push their reference position + public-position flag to the server every
+    // ~2s via ZNet.SendServerSyncPlayerData. This postfix re-applies the override on
+    // every sync, so a client that flips its own toggle off is corrected within one tick.
+    // RPC_ServerSyncedPlayerData is private, hence the string-name patch target.
+    [HarmonyPatch(typeof(ZNet), "RPC_ServerSyncedPlayerData")]
+    public static class Patch_ForceMapPositions
+    {
+        public static void Postfix(ZNet __instance, ZRpc rpc)
+        {
+            try
+            {
+                var s = Plugin.Instance?._settings;
+                if (s == null || !s.EnableForceMapPositions) return;
+                if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+                var peer = ResolvePeerFromRpc(__instance, rpc);
+                if (peer == null) return;
+
+                Plugin.Instance.ApplyForcedMapPosition(peer);
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogS?.LogWarning($"[ServerGuard] Force-map-position patch error: {ex.Message}");
+            }
+        }
+    }
 
     private static ZNetPeer ResolvePeerFromRpc(ZNet znet, ZRpc rpc)
     {
@@ -3294,7 +3489,7 @@ public class Plugin : BaseUnityPlugin
     private string CmdStatus()
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"[ServerGuard] v1.6.1  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
+        sb.AppendLine($"[ServerGuard] v1.6.2  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
         sb.AppendLine($"  Allowlist  required={_requiredMods.Count}  allowed={_allowedMods.Count}  banned={_bannedMods.Count}");
         sb.AppendLine($"  Modset     loose={ModsetFingerprint.Short(_modsetFingerprintLoose)}  strict={ModsetFingerprint.Short(_modsetFingerprintStrict)}");
         try
@@ -3304,6 +3499,8 @@ public class Plugin : BaseUnityPlugin
         }
         catch { }
         sb.AppendLine($"  Violators  {_violations.Count} player(s) with strikes recorded");
+        sb.AppendLine($"  MapForce   {(_settings.EnableForceMapPositions ? "ON" : "off")}"
+                      + (_settings.EnableForceMapPositions && _settings.ForceMapPositionsExemptAdmins ? "  (admins exempt)" : ""));
         return sb.ToString().TrimEnd();
     }
 
@@ -3834,8 +4031,16 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    // Sources that are no longer part of the animation-cancel rule. Sheathing was
+    // dropped because it is ordinary play (weapon swaps, looting, building all holster
+    // the weapon), so it produced constant false positives. Companions from 1.6.1 and
+    // earlier still report it, so the server drops those reports on arrival rather than
+    // waiting for every player to update their client.
+    private static readonly HashSet<string> _animationCancelIgnoredSources =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "sheathe" };
+
     // Handles ServerGuard_AnimationCancelAttempt RPC. Called when the companion plugin
-    // intercepts an attempt to cancel an attack-recovery animation (emote, sheathe, ...).
+    // intercepts an attempt to cancel an attack-recovery animation (emote, ...).
     // The cancel is already prevented locally; we just track for admin visibility.
     public void OnAnimationCancelReceived(ZNetPeer peer, string source)
     {
@@ -3849,6 +4054,12 @@ public class Plugin : BaseUnityPlugin
             var src     = (source ?? "").Trim();
             if (src.Length > 32) src = src.Substring(0, 32);
             if (string.IsNullOrWhiteSpace(src)) src = "unknown";
+
+            if (_animationCancelIgnoredSources.Contains(src))
+            {
+                LogS.LogInfo($"[ServerGuard] {who} animation-cancel via {src} - excluded from the rule, ignoring.");
+                return;
+            }
 
             if (IsAdmin(steamId))
             {
@@ -4186,6 +4397,43 @@ public class Plugin : BaseUnityPlugin
         catch (Exception ex)
         {
             LogS.LogWarning($"[ServerGuard] SendCheatItemRemovalIfEnabled failed: {ex.Message}");
+        }
+    }
+
+    // ==================== Arrival shout policy ====================
+    //
+    // Tells one peer's companion whether the vanilla first-spawn shout is allowed.
+    // Payload is "1" (shout normally) or "0" (swallow it). Sent on connect and again
+    // to everyone online whenever settings.yaml is reloaded.
+    private void SendArrivalShoutPolicy(ZNetPeer peer)
+    {
+        try
+        {
+            if (peer?.m_rpc == null || _settings == null) return;
+            peer.m_rpc.Invoke("ServerGuard_ArrivalShout", _settings.EnableArrivalShout ? "1" : "0");
+        }
+        catch (Exception ex)
+        {
+            LogS?.LogWarning($"[ServerGuard] SendArrivalShoutPolicy failed: {ex.Message}");
+        }
+    }
+
+    // Re-pushes the policy to every connected peer. Without this, flipping
+    // enableArrivalShout would only take effect for players who reconnect afterwards.
+    private void BroadcastArrivalShoutPolicy()
+    {
+        try
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+            var peers = ZNet.instance.GetConnectedPeers();
+            if (peers == null) return;
+
+            foreach (var peer in peers) SendArrivalShoutPolicy(peer);
+        }
+        catch (Exception ex)
+        {
+            LogS?.LogWarning($"[ServerGuard] BroadcastArrivalShoutPolicy failed: {ex.Message}");
         }
     }
 

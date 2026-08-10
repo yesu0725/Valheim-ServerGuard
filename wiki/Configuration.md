@@ -80,7 +80,7 @@ See **[Discord Integration](Discord-Integration)** for details.
 | `enableInventoryCheck` | `true` | Server-side check that items added to any inventory are known + within stack limits. |
 | `inventoryCheckLogOnly` | `true` | Log violations without blocking the add. Flip to `false` to actively reject. |
 | `inventoryCheckStackTolerance` | `1.0` | Multiplier on each item's `m_maxStackSize`. Raise for modpacks that bump stacks. |
-| `enableAnimationCancelGate` | `true` | Companion blocks emote/sheathe-based attack-cancel exploit. |
+| `enableAnimationCancelGate` | `true` | Companion blocks the emote-based attack-cancel exploit. Sheathing is excluded — it's ordinary play. |
 | `enableSkillCap` | `true` | Companion reports skill levels; server flags any above the cap. |
 | `skillCapMaxLevel` | `100.0` | Vanilla cap. Raise for modded skill systems. |
 | `skillCapTolerance` | `5.0` | Added to max — absorbs float-rounding overshoot. |
@@ -120,6 +120,42 @@ cheatItems:
   - SwordCheat
   - SledgeCheat
 ```
+
+## Arrival shout
+
+Vanilla makes every player shout the localised **"I have arrived!"** line the first time they spawn into a session. If your server already posts a login notification, that shout is just noise.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enableArrivalShout` | `true` | `false` = the companion swallows the automatic first-spawn shout. Players can still shout manually. |
+
+```yaml
+enableArrivalShout: false
+```
+
+Hot-reloads to everyone already online — the server re-pushes the setting on save, so nobody has to reconnect.
+
+Requires the companion plugin, since the shout originates on the client. A vanilla client (one allowed in via `requireCompanion: false`) will still shout.
+
+## Forced map positions
+
+By default Valheim lets each player decide whether their position is shared on the map — the **public position** toggle on the minimap, which starts off. Turn this on and the server overrides that choice, so every player is permanently visible on everyone else's map.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enableForceMapPositions` | `false` | Forces every peer's public-position flag on. Off = vanilla behaviour (each player chooses). |
+| `forceMapPositionsExemptAdmins` | `false` | If true, SteamIDs in `admins.yaml` keep their own toggle and can stay hidden. |
+
+```yaml
+enableForceMapPositions: true
+forceMapPositionsExemptAdmins: false
+```
+
+Enforcement is **server-side**: clients push their position and public/private flag to the server roughly every 2 seconds, and the server rewrites the flag on arrival before broadcasting the player list. A player who flips the toggle off — or a modified client that lies about it — is corrected on the next sync, so there is no way to opt out from the client.
+
+Both settings hot-reload. After saving `settings.yaml`, the change takes effect within ~2 seconds; no restart is needed. Turning it back off also self-heals within one sync, restoring each player's own choice.
+
+Neither setting appears in the generated `settings.yaml` (defaults are omitted from the file) — add the keys yourself to enable it.
 
 ## Raid alerts
 

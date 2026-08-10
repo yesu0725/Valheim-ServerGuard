@@ -117,10 +117,11 @@ countAsViolation:
 
 ### AnimationCancel
 - **Setting:** `enableAnimationCancelGate` (default `true`)
-- **Trigger:** Client blocks emote or sheathe during `p.InAttack()`, reports via `ServerGuard_AnimationCancelAttempt`
+- **Trigger:** Client blocks emote during `p.InAttack()`, reports via `ServerGuard_AnimationCancelAttempt`
 - **Client side:** ALWAYS blocked client-side
 - **Server side:** This setting controls accounting only
 - **countAsViolation default:** `false`
+- **Excluded sources:** `sheathe` — dropped from the rule (weapon swaps, looting and building all holster the weapon, so it flagged honest players). The client patch is gone; the server also drops any `sheathe` report via `_animationCancelIgnoredSources`, so companions from 1.6.1 and earlier can't resurrect it.
 
 ### SkillOverflow
 - **Settings:** `enableSkillCap`, `skillCapMaxLevel` (100.0), `skillCapTolerance` (5.0)
@@ -154,6 +155,26 @@ countAsViolation:
 - **Trigger:** On boot + `sg selftest` command
 - **8 checks:** HMAC secret configured, HMAC roundtrip, policy validator, build-log dir writable, modset fingerprint computed, public webhook URL sane, admin webhook URL sane, admins configured
 - **Output:** BepInEx log always; admin Discord on failure (or on pass if `selfTestPostOnPass: true`)
+
+### Arrival shout suppression
+- **Setting:** `enableArrivalShout` (default `true` = vanilla)
+- **Trigger:** Client `Chat.SendText` prefix returns `false` for a Shout raised while `Game.UpdateRespawn` is on the stack
+- **Why bracket UpdateRespawn:** it's the only vanilla caller that shouts on its own, so no text matching is needed — works in every language and never eats a manual "I have arrived!"
+- **Policy delivery:** `ServerGuard_ArrivalShout` RPC on connect + on settings hot-reload
+- **Requires the companion** — a vanilla client still shouts
+
+### Server lifecycle notifications
+- **Settings:** none — they follow `discordWebhookUrl`, like raid alerts
+- **Public posts:** "Server is starting..." (`Awake`), "The server has started, you may now login." (`ServerReadyWatcher`), "Server is shutting down." (`OnDestroy`)
+- **Readiness test:** `IsServerReadyForPlayers()` = `ZNet.IsServer()` + `ZoneSystem.LocationsGenerated`, polled every 1s for up to 15 min
+- See `claude/discord-routing.md` for why the shutdown post is synchronous
+
+### Forced map positions
+- **Settings:** `enableForceMapPositions` (default `false`), `forceMapPositionsExemptAdmins` (default `false`)
+- **Trigger:** `Patch_ForceMapPositions` postfix on the private `ZNet.RPC_ServerSyncedPlayerData`, i.e. every client position sync (~2s per peer)
+- **Effect:** `ApplyForcedMapPosition()` sets `peer.m_publicRefPos = true`, so `ZNet.UpdatePlayerList` marks that player's `PlayerInfo.m_publicPosition` and broadcasts the position to every client's map
+- **Server-authoritative:** the client's own minimap toggle (and any client lying about it) is overwritten on the next sync
+- **No Discord, no violation rule** — a server policy, not a detection
 
 ### Daily summary
 - **Settings:** `dailySummaryEnabled` (default `true`), `dailySummaryHourUtc` (default 0), `dailySummaryChannel` (`"admin"`)

@@ -63,6 +63,31 @@ void PostPlayerEvent(emoji, platformId, action, reason) {
 
 ---
 
+## Server lifecycle posts (public channel, no toggle)
+
+Direct `SendDiscordNow(..., DiscordChannel.Public)` calls — like raid alerts, these follow
+`discordWebhookUrl` and have no enable flag of their own.
+
+| When | Message |
+|---|---|
+| `Awake` | `:hourglass_flowing_sand: **Server is starting...**` |
+| `ServerReadyWatcher` (world loaded + locations generated) | `:white_check_mark: **The server has started, you may now login.**` |
+| `OnDestroy` | `:octagonal_sign: **Server is shutting down.**` |
+
+Two things worth knowing:
+
+- The **starting** and **started** posts are deliberately separate. `Awake` runs when BepInEx loads the
+  plugin, minutes before a fresh seed finishes generating; announcing "started" there would invite
+  players onto a server that will refuse them. `ServerReadyWatcher()` polls `IsServerReadyForPlayers()`
+  (`ZNet.IsServer()` + `ZoneSystem.LocationsGenerated`) once a second, up to 15 minutes. On timeout it
+  posts a warning to the **admin** channel and stays silent publicly.
+- The **shutdown** post is synchronous (`PostShutdownNoticeBlocking`), not `SendDiscordNow`. `OnDestroy`
+  runs while the process is exiting, so a fire-and-forget `Task` would be killed before the HTTP request
+  left the machine. It also runs first in `OnDestroy`, ahead of the teardown that can throw. A hard kill
+  (`SIGKILL`, host crash) still produces no post — Unity never calls `OnDestroy` in that case.
+
+---
+
 ## What calls PostAdminEvent
 
 | Caller | Message |

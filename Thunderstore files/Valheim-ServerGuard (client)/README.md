@@ -8,10 +8,11 @@ This is the *client-side* half of the system. The *server-side* mod (`Valheim_Se
 
 When you connect to a ServerGuard server, this plugin tells the server which mods you have loaded so it can decide whether to let you in. While you play, it also:
 - Blocks cheat console commands (`devcommands`, `god`, `fly`, etc.) on multiplayer servers — single-player and host-and-play keep full cheats.
-- Blocks the emote / sheathe attack-cancel exploit.
+- Blocks the emote attack-cancel exploit. Sheathing your weapon is untouched — swapping, looting and building all work normally mid-swing.
 - Reports your deaths, shouts, and built / destroyed pieces to the server's logs.
 - Reports your skill levels for cap enforcement.
 - Removes server-configured cheat items from your inventory on login (non-admins).
+- Suppresses the automatic "I have arrived!" shout on first spawn, if the server asks for it. You can still shout manually.
 
 You don't need to do anything in-game — it runs silently in the background.
 
@@ -63,6 +64,6 @@ This mod is **free to use as is**. Voluntary support is appreciated.
 
 ---
 
-**Version:** 1.6.1
+**Version:** 1.6.2
 **Source / issues / wiki:** https://github.com/yesu0725/Valheim-ServerGuard
 **Server-side package:** `TaegukGaming-Valheim_ServerGuard`

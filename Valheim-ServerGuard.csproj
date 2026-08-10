@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard</AssemblyName>
     <RootNamespace>ValheimServerGuard</RootNamespace>
-    <Version>1.6.1</Version>
+    <Version>1.6.2</Version>
     <Description>Valheim Server Guard - Anti-cheat and security mod for Valheim servers</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
@@ -71,11 +71,15 @@
     BepInEx plugins folder for fast iteration. The Condition guards make it a silent
     no-op on any machine that doesn't have that exact path - safe to commit.
     Override the destination with the SERVERGUARD_TEST_SERVER_DIR env var if needed.
+
+    Destination is the Thunderstore-style mod folder, NOT the plugins root. BepInEx
+    scans plugins/ recursively, so a copy in both places is loaded twice and the
+    duplicate GUID makes one of them fail.
   -->
   <Target Name="CopyToTestServer" AfterTargets="Build">
     <PropertyGroup>
       <_ServerGuardTestServerDir Condition="'$(SERVERGUARD_TEST_SERVER_DIR)' != ''">$(SERVERGUARD_TEST_SERVER_DIR)</_ServerGuardTestServerDir>
-      <_ServerGuardTestServerDir Condition="'$(_ServerGuardTestServerDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins</_ServerGuardTestServerDir>
+      <_ServerGuardTestServerDir Condition="'$(_ServerGuardTestServerDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard</_ServerGuardTestServerDir>
     </PropertyGroup>
     <Copy
       SourceFiles="$(OutputPath)$(AssemblyName).dll"

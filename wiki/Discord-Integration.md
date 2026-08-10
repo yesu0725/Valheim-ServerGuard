@@ -19,6 +19,17 @@ Player-facing events only. Safe to share with your whole community.
 | Raid started | `⚔️ **The Horde Is Attacking** has started! Location: X:123, Z:-456` |
 | Raid paused / resumed | `⏸️ **The Horde Is Attacking** is paused — no players in the event area.` |
 | Raid ended | `✅ **The Horde Is Attacking** is over!` |
+| Server starting | `⏳ **Server is starting...**` |
+| Server ready | `✅ **The server has started, you may now login.**` |
+| Server stopping | `🛑 **Server is shutting down.**` |
+
+The three server-lifecycle messages have no on/off setting — like raid alerts, they follow `discordWebhookUrl`.
+
+**"Starting" and "started" are two separate messages on purpose.** The plugin loads long before the world does, so "starting" fires immediately on boot, and "you may now login" only once the world is loaded and location generation has finished — which on a brand-new seed can be several minutes later. Players who join on the first message would just be refused.
+
+If world generation somehow never completes, no public "started" message is sent; a timeout warning goes to the admin channel instead after 15 minutes.
+
+The shutdown message needs a **graceful** stop (console `stop`, service stop, window close). A `SIGKILL`, power loss, or host crash gives the plugin no chance to post.
 
 **Admins are hidden from this channel.** Their joins, leaves, deaths, and kicks all route to the admin channel instead. Players never see admins coming and going.
 
@@ -28,7 +39,7 @@ Curated moderation events. Use a private channel that only moderators can see.
 
 | Event | Example |
 |---|---|
-| Server boot | `🚀 ServerGuard online v1.6.1  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
+| Server boot | `🚀 ServerGuard online v1.6.2  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
 | Hot-reload | `🔄 allowed_mods.yaml reloaded — req=1 allow=29 ban=0` |
 | Counted violation | `⚠️ Erik (765…) violated DevcommandAttempt (1/3) — fly` |
 | Informational rule | `👁 Erik (765…) triggered HashMismatch (informational — not counted) — Jotunn` |

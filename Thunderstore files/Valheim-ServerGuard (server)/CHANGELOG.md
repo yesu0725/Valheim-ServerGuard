@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.6.2
+
+Feature release. Two new `settings.yaml` options, one anti-cheat rule relaxed, and the server start/stop Discord notifications are back.
+
+### New
+- **Forced map positions** (`enableForceMapPositions`, default `false`). Overrides every player's "public position" minimap toggle so all players are permanently visible on each other's maps. Enforced server-side — the flag is rewritten as each client's position sync arrives, so a modified client can't opt out. `forceMapPositionsExemptAdmins` (default `false`) lets staff keep their own toggle. Both hot-reload; turning the feature off restores each player's own choice within a couple of seconds.
+- **Arrival shout toggle** (`enableArrivalShout`, default `true`). Set to `false` and the companion swallows the vanilla "I have arrived!" shout on first spawn — handy when the server already posts login notifications and the shout is just noise. Players can still shout manually. Hot-reloads to everyone already online, so nobody has to reconnect.
+
+### Changed
+- **Sheathing is no longer part of the AnimationCancel rule.** Holstering your weapon mid-attack is ordinary play — weapon swaps, picking up items, opening chests and building all do it — so gating it flagged honest players. Only the emote cancel is checked now. The server also discards `sheathe` reports from companions on 1.6.1 and earlier, so the rule stops applying the moment you update the server, without waiting for every player to update their client.
+
+### Fixed
+- **Server start and shutdown Discord notifications are back.** They were dropped when the 1.4.0 and 1.5.0 code lines were merged for 1.6.0.
+- **The boot notification is now two messages.** `Server is starting...` fires when the plugin loads; `The server has started, you may now login.` only once the world is loaded and location generation has finished. On a brand-new seed those can be minutes apart — the old single message invited players onto a server that would still refuse them. If generation never completes, no public message is sent and a timeout warning goes to the admin channel instead.
+- The shutdown notice now posts synchronously, so it actually reaches Discord before the process exits. A graceful stop is still required — a hard kill or host crash gives the plugin no chance to post.
+
+### Companion
+- Requires companion plugin **v1.6.2**. `enableArrivalShout` needs it; the rest is server-side.
+
 ## 1.6.1
 
 Version-match release. No server-side behaviour changes — all fixes in 1.6.1 are in the companion plugin.

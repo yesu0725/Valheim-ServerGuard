@@ -90,11 +90,12 @@ Server-side check on `Inventory.AddItem`:
 
 ### AnimationCancel
 
-The player tried to cancel an attack-recovery animation via emote or sheathe — the classic Valheim attack-spam exploit.
+The player tried to cancel an attack-recovery animation with an emote — the classic Valheim attack-spam exploit.
 
 - **Default:** Not counted.
 - **Setting:** `enableAnimationCancelGate: true`.
-- **Notes:** The companion blocks the cancel client-side (the emote/sheathe silently fails). This toggle controls server-side accounting.
+- **Notes:** The companion blocks the cancel client-side (the emote silently fails). This toggle controls server-side accounting.
+- **Sheathing is not part of this rule.** Holstering your weapon mid-attack is ordinary play — weapon swaps, picking up items, opening chests and building all do it — so it is neither blocked nor reported. Servers still running an older companion on some clients are covered too: the server discards `sheathe` reports on arrival.
 
 ### SkillOverflow
 
