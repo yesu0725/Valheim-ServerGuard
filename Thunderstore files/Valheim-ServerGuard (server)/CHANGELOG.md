@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.3
+
+Version-match release. No server-side behaviour changes — the fix in 1.6.3 is in the companion plugin.
+
+### Companion
+- Requires companion plugin **v1.6.3**, which fixes `enableArrivalShout: false` blocking every shout, not just the first-spawn one. If you turned that setting on in 1.6.2, your players could not use `/s` at all. Update both plugins.
+
 ## 1.6.2
 
 Feature release. Two new `settings.yaml` options, one anti-cheat rule relaxed, and the server start/stop Discord notifications are back.

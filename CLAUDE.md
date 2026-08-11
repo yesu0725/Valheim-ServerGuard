@@ -9,7 +9,7 @@ Read this first, then follow links to sub-files for deep detail.
 
 | Item | Value |
 |---|---|
-| **Current version** | 1.6.2 |
+| **Current version** | 1.6.3 |
 | **Server GUID** | `com.taeguk.valheim.serverguard` |
 | **Client GUID** | `com.taeguk.valheim.serverguard.client` |
 | **Target framework** | net462 (Mono, .NET Framework 4.6.2) |

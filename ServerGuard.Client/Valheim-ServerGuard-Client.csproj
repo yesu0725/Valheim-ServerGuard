@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard-Client</AssemblyName>
     <RootNamespace>ValheimServerGuardClient</RootNamespace>
-    <Version>1.6.2</Version>
+    <Version>1.6.3</Version>
     <Description>Valheim ServerGuard Client - companion plugin that attests the client's mod list to a ServerGuard-protected server</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>

@@ -26,7 +26,7 @@ namespace ValheimServerGuardClient
     {
         public const string GUID    = "com.taeguk.valheim.serverguard.client";
         public const string NAME    = "Valheim ServerGuard Client";
-        public const string VERSION = "1.6.2";
+        public const string VERSION = "1.6.3";
 
         internal static ClientPlugin Instance;
         internal static ManualLogSource LogS;
@@ -1395,10 +1395,13 @@ namespace ValheimServerGuardClient
                     if (__0 != Talker.Type.Shout) return true;
 
                     // Game.UpdateRespawn is the only caller that shouts on its own, so a
-                    // Shout raised inside it is the arrival message - no text matching
-                    // needed, and it works in every language.
-                    if (_inRespawnUpdate && !_arrivalShoutAllowed)
+                    // Shout raised while it is on the stack is the arrival message - no
+                    // text matching needed, and it works in every language. Anything the
+                    // player types reaches SendText from the chat input instead, well
+                    // outside this bracket.
+                    if (_inRespawnUpdate && !_arrivalShoutAllowed && !_arrivalShoutConsumed)
                     {
+                        _arrivalShoutConsumed = true;
                         LogS?.LogInfo("[ServerGuard.Client] Arrival shout suppressed (server policy).");
                         return false;
                     }
@@ -1430,23 +1433,32 @@ namespace ValheimServerGuardClient
         // setting left at its default) keeps vanilla behaviour.
         private static bool _arrivalShoutAllowed = true;
 
-        // Frame on which UpdateRespawn last ran, rather than a bool bracketed by a
-        // prefix/postfix pair: a postfix does NOT run if the original method throws, and
-        // a latched bool would then swallow every shout for the rest of the session.
-        // A frame stamp expires on its own.
-        private static int _respawnUpdateFrame = -1;
-        private static bool _inRespawnUpdate => _respawnUpdateFrame == Time.frameCount;
+        // True only while UpdateRespawn is actually on the stack. It must be a
+        // prefix/postfix bracket around the call and NOT a frame stamp: Game calls
+        // UpdateRespawn every frame, so "UpdateRespawn ran this frame" is true on
+        // every frame and swallowed every shout the player made.
+        private static bool _inRespawnUpdate;
+
+        // The arrival shout happens once per session, so suppress at most once. This
+        // is the safety net for the one case a bracket can't cover: a postfix does
+        // NOT run if the original method throws, which would otherwise latch the flag
+        // on and mute the player for the rest of the session.
+        private static bool _arrivalShoutConsumed;
 
         internal static void OnArrivalShoutPolicyReceived(string payload)
         {
             _arrivalShoutAllowed = !string.Equals((payload ?? "").Trim(), "0", StringComparison.Ordinal);
+            // Fires on connect, so this also re-arms the one-shot for the new session.
+            _arrivalShoutConsumed = false;
+            _inRespawnUpdate = false;
             LogS?.LogInfo($"[ServerGuard.Client] Arrival shout {(_arrivalShoutAllowed ? "allowed" : "suppressed")} by server policy.");
         }
 
         [HarmonyPatch(typeof(Game), "UpdateRespawn")]
         public static class Patch_Game_UpdateRespawn_ArrivalShout
         {
-            public static void Prefix() { _respawnUpdateFrame = Time.frameCount; }
+            public static void Prefix() { _inRespawnUpdate = true; }
+            public static void Postfix() { _inRespawnUpdate = false; }
         }
 
         // Payload: "<type>|<text>". Server resolves name/SteamID from the peer.

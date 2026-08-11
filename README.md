@@ -6,6 +6,10 @@ It works because every player runs a small companion plugin that tells the serve
 
 Beyond the mod allowlist, it also includes anti-cheat gates, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
 
+### Fixed in 1.6.3
+
+- **`enableArrivalShout: false` blocked all shouts** — with the arrival shout turned off, players couldn't use `/s` at all. The 1.6.2 filter keyed off "did the respawn update run this frame", but the game runs that update *every* frame, so it matched every shout instead of just the first-spawn one. The filter now brackets the actual call, and suppresses at most one shout per session. Client-side fix; update both plugins to keep versions matched.
+
 ### New in 1.6.2
 
 - **Forced map positions** *(`enableForceMapPositions`, off by default)* — override every player's "public position" toggle so everyone is permanently visible on everyone's map. Enforced server-side, so a modified client can't opt out. `forceMapPositionsExemptAdmins` lets staff stay hidden.
@@ -287,5 +291,5 @@ See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL bu
 
 ---
 
-**Version:** 1.6.2
+**Version:** 1.6.3
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

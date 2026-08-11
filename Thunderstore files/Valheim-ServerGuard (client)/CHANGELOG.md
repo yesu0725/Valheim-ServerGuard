@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.3
+
+Bug-fix release. Install alongside the 1.6.3 server plugin.
+
+### Fixed
+- **Shouting works again on servers that set `enableArrivalShout: false`.** The 1.6.2 filter was meant to swallow only the automatic "I have arrived!" line on first spawn, but it swallowed every shout — players on those servers couldn't use `/s` at all. It decided by asking "did the respawn update run this frame", and the game runs that update on every frame, so the answer was always yes. It now brackets the actual call instead, and gives up after suppressing one shout per session. Servers that leave `enableArrivalShout` at its default were unaffected either way.
+
 ## 1.6.2
 
 Install alongside the 1.6.2 server plugin.
