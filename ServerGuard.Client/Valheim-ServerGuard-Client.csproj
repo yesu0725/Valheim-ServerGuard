@@ -73,15 +73,20 @@
   </ItemGroup>
 
   <!--
-    Post-build: copy the freshly-built client DLL into the r2modman test profile so
+    Post-build: copy the freshly-built client DLL into the Gale "HB Test" profile so
     the next Valheim launch picks it up automatically. Condition guards make it a
     silent no-op on machines without that folder - safe to commit.
     Override the destination with the SERVERGUARD_TEST_CLIENT_DIR env var if needed.
+
+    Must be the TaegukGaming-Valheim_ServerGuard_Client mod subfolder, NEVER the
+    BepInEx\plugins root: Gale installs the mod into that subfolder, BepInEx scans
+    recursively, and a second copy at the root loads the plugin twice - the duplicate
+    GUID then makes one instance fail.
   -->
   <Target Name="CopyToTestClient" AfterTargets="Build">
     <PropertyGroup>
       <_ServerGuardTestClientDir Condition="'$(SERVERGUARD_TEST_CLIENT_DIR)' != ''">$(SERVERGUARD_TEST_CLIENT_DIR)</_ServerGuardTestClientDir>
-      <_ServerGuardTestClientDir Condition="'$(_ServerGuardTestClientDir)' == ''">C:\Users\yesu0725\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\Hearthbound Valheim - Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client</_ServerGuardTestClientDir>
+      <_ServerGuardTestClientDir Condition="'$(_ServerGuardTestClientDir)' == ''">C:\Users\yesu0725\AppData\Roaming\com.kesomannen.gale\valheim\profiles\HB Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client</_ServerGuardTestClientDir>
     </PropertyGroup>
     <Copy
       SourceFiles="$(OutputPath)$(AssemblyName).dll"

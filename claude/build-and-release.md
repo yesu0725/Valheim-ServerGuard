@@ -23,11 +23,15 @@ ServerGuard.Client/bin/Release/Valheim-ServerGuard-Client.dll
 
 Both `.csproj` files have a post-build `<Target Name="CopyTo...">` that silently copies the DLL if the destination folder exists.
 
-**Server** → `C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins`
+**Server** → `C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard`
 
-**Client** → `C:\Users\yesu0725\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\Hearthbound Valheim - Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client`
+**Client** → `C:\Users\yesu0725\AppData\Roaming\com.kesomannen.gale\valheim\profiles\HB Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client`
 
-Override at build time with env vars `SERVERGUARD_TEST_SERVER_DIR` or `SERVERGUARD_TEST_CLIENT_DIR`. Safe to commit — the `Condition="Exists(...)"` makes it a no-op on machines without those paths.
+The client test profile is managed by **[Gale](https://thunderstore.io/c/valheim/p/Kesomannen/GaleModManager/)**, not r2modman — hence the `com.kesomannen.gale` app-data root and the `HB Test` profile name. The old r2modman profile (`r2modmanPlus-local\...\Hearthbound Valheim - Test`) is no longer the test target; if it still exists on disk it is stale and gets no new builds.
+
+> **Both paths must end in the `TaegukGaming-*` mod subfolder, never the `BepInEx\plugins` root.** Both mod managers install the mod into that subfolder, BepInEx scans `plugins` recursively, and a second copy sitting at the root loads the plugin twice — the duplicate GUID then makes one instance fail to load. This bit the server target before 1.6.2.
+
+Override at build time with env vars `SERVERGUARD_TEST_SERVER_DIR` or `SERVERGUARD_TEST_CLIENT_DIR`. Safe to commit — the `Condition="Exists(...)"` makes it a no-op on machines without those paths, and prints `Skipped client-DLL copy (path missing): <path>` so a renamed profile is visible in the build log rather than silently stale.
 
 ---
 
