@@ -144,7 +144,7 @@ By default Valheim lets each player decide whether their position is shared on t
 | Setting | Default | What it does |
 |---|---|---|
 | `enableForceMapPositions` | `false` | Forces every peer's public-position flag on. Off = vanilla behaviour (each player chooses). |
-| `forceMapPositionsExemptAdmins` | `false` | If true, SteamIDs in `admins.yaml` keep their own toggle and can stay hidden. |
+| `forceMapPositionsExemptAdmins` | `false` | If true, moderators keep their own toggle and can stay hidden. Owners are always exempt. |
 
 ```yaml
 enableForceMapPositions: true
@@ -155,7 +155,42 @@ Enforcement is **server-side**: clients push their position and public/private f
 
 Both settings hot-reload. After saving `settings.yaml`, the change takes effect within ~2 seconds; no restart is needed. Turning it back off also self-heals within one sync, restoring each player's own choice.
 
-Neither setting appears in the generated `settings.yaml` (defaults are omitted from the file) — add the keys yourself to enable it.
+> **Before 1.7.0 these two keys were missing from the generated `settings.yaml`** — the
+> file was written by a serializer that omits anything still at its default, so every
+> option defaulting to `false`/`0`/empty was invisible. Fixed in 1.7.0: fresh installs
+> list every option, and existing servers get the missing ones appended on next boot
+> with their current values (your edits and comments are left alone).
+
+## Ban layer
+
+An independent SteamID denylist checked inside the connection handshake, so a banned
+player is refused before they can spawn — unlike Valheim's own ban list, which is only
+swept every 5 seconds.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enableBanLayer` | `true` | Master switch. |
+| `banLayerKickMessage` | `"You are banned from this server."` | Shown to a refused player, followed by the ban reason. |
+| `banLayerMirrorToVanilla` | `true` | Also write bans into Valheim's `banlist.txt`. |
+
+The list lives in `conf/bans.yaml` and hot-reloads. Manage it with `sg ban`, `sg unban`
+and `sg bans`. Full detail: **[Bans and Console Guard](Bans-and-Console-Guard)**.
+
+## Console guard
+
+Controls what players can run in the F5 console, and what happens to their key binds.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `consoleGuardMode` | `restricted` | `open` / `restricted` / `whitelist` / `disabled`. |
+| `consoleGuardExemptModerators` | `true` | Moderators keep full console access. Owners always do. |
+| `consoleGuardBindPolicy` | `purge` | `allow` / `block` / `purge` / `wipe`. Key binds can run commands without the console being open. |
+| `consoleBlockedCommands` | `[]` | Extra command names to block. |
+| `consoleAllowedCommands` | `[]` | The permitted set when `consoleGuardMode: whitelist`. |
+| `consoleGuardReportAttempts` | `true` | Log/post/count blocked attempts. |
+
+Enforced by the companion plugin, so every player needs the 1.7.0 client. Full detail
+and the per-command reasoning: **[Bans and Console Guard](Bans-and-Console-Guard)**.
 
 ## Raid alerts
 
@@ -170,7 +205,9 @@ The title-screen one-click login panel is configured on each **client** in `clie
 | Path | Purpose |
 |---|---|
 | `conf/settings.yaml` | This file. |
-| `conf/admins.yaml` | List of admin SteamIDs (one per line). |
+| `conf/owners.yaml` | Owner SteamIDs — exempt from every rule. See [Privilege Tiers](Privilege-Tiers). |
+| `conf/moderators.yaml` | Moderator (staff) SteamIDs. Renamed from `admins.yaml` in 1.7.0, migrated automatically. |
+| `conf/bans.yaml` | ServerGuard ban list. See [Bans and Console Guard](Bans-and-Console-Guard). |
 | `conf/allowed_mods.yaml` | Mod allowlist. |
 | `modset_fingerprint.txt` | Current modset hash (publish this to your community). |
 | `registrations.yaml` | SteamID → character names mapping. |

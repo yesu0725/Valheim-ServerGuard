@@ -1,13 +1,13 @@
 # Admin Commands
 
-ServerGuard exposes a `sg` command family in the **in-game console (F5)**. Anyone can type the command, but the server only executes for SteamIDs listed in `admins.yaml`.
+ServerGuard exposes a `sg` command family in the **in-game console (F5)**. Anyone can type the command, but the server only executes for SteamIDs listed in `moderators.yaml`.
 
 ## Setup
 
-Add your SteamID to `BepInEx/config/ServerGuard/conf/admins.yaml`:
+Add your SteamID to `BepInEx/config/ServerGuard/conf/moderators.yaml`:
 
 ```yaml
-admins:
+moderators:
   - 76561198064360681
 ```
 
@@ -32,7 +32,7 @@ You'll get back a list of every available command.
 | `sg help` | Print this command list. |
 | `sg status` | Quick health check — enforcement state, allowlist counts, modset fingerprint, peer count, violators on file. |
 | `sg selftest` | Re-run the boot smoke tests. |
-| `sg reload` | Reload `settings.yaml`, `admins.yaml`, `allowed_mods.yaml` immediately. |
+| `sg reload` | Reload `settings.yaml`, `moderators.yaml`, `allowed_mods.yaml` immediately. |
 | `sg modset` | Print the full + short modset fingerprints for sharing. |
 
 ### Players
@@ -43,6 +43,39 @@ You'll get back a list of every available command.
 | `sg violations [<n>]` | Top N players by violation count (default 10). |
 | `sg pardon <steamid>` | Clear a player's recorded violation strikes. |
 | `sg kick <steamid> [reason]` | Kick a connected player. The reason is shown to them on the disconnect screen. |
+
+### Bans
+
+| Command | What it does |
+|---|---|
+| `sg ban <steamid> [for <N>d\|h\|m] [reason]` | Ban a SteamID. Blocked during the connection handshake, so they never reach the world. |
+| `sg unban <steamid>` | Lift a ServerGuard ban. |
+| `sg bans [<n>]` | List active bans (default 20). |
+
+Notes:
+
+- The target does **not** have to be online, or ever to have connected. Pass a full
+  17-digit SteamID to ban someone pre-emptively. Character-name lookup only works for
+  players the server has already registered.
+- Duration forms: `7d`, `12h`, `30m`, `45s`. A bare number means days. Leave it off for
+  a permanent ban. Expired bans stop applying automatically and are cleaned out of the
+  file on the next write.
+- Banning yourself, an owner, or a moderator is refused. Owners cannot be banned at
+  all; to ban a moderator, remove them from `moderators.yaml` first. See
+  [Privilege Tiers](Privilege-Tiers).
+- A ban applies immediately to anyone already in the world — they are disconnected as
+  soon as the command runs.
+- `sg unban` clears **ServerGuard's** list. If `banLayerMirrorToVanilla` is on (the
+  default) the entry in Valheim's own `banlist.txt` remains; clear that with the
+  vanilla `unban` command if you want it gone. Conversely, the in-game `unban` command
+  cannot lift a ServerGuard ban.
+
+```
+sg ban 76561198000000000 for 7d griefing spawn area
+sg ban 76561198000000000 duping
+sg unban 76561198000000000
+sg bans 50
+```
 
 ### Build / destroy heatmap queries
 
@@ -97,6 +130,6 @@ The chat intercept also accepts `/sg ...` (with leading slash). Either form work
 
 ## See also
 
-- **[Configuration](Configuration)** — `admins.yaml` and related settings.
+- **[Configuration](Configuration)** — `moderators.yaml` and related settings.
 - **[Forensic Logs](Forensic-Logs)** — the underlying CSV the `sg build`/`destroyed`/`placed` commands query.
 - **[Anti-Cheat Features](Anti-Cheat-Features)** — the rules `sg whois` and `sg violations` show.

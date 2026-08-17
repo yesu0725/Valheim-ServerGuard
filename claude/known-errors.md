@@ -1,4 +1,58 @@
-# Known Errors and Fixes
+# Known Errors
+
+## `key: []` in a generated YAML template is a trap
+
+**Symptom:** operator adds their SteamID to `owners.yaml`, server still logs
+`owners.yaml loaded (0 owner(s))`. No error anywhere.
+
+**Cause:** the template ended with `owners: []` and put the commented example
+*underneath* it. Adding `  - "id"` below a flow-empty list is a `SemanticErrorException`
+(verified), so the only edit that appears to work is uncommenting — which leaves the
+empty list in charge and the ID inert as a comment.
+
+**Fix:** emit a bare key with the commented example directly beneath:
+
+```yaml
+owners:
+#  - "76561198000000000"
+```
+
+A bare key deserializes to `null`, which every loader already handles via
+`?? new List<T>()`. Uncommenting then works, at any indentation.
+
+`WarnIfIdsOnlyInComments()` also fires when a staff file loads zero entries but a
+commented line contains a 17-digit ID.
+
+---
+
+## `DefaultValuesHandling.OmitDefaults` hides settings
+
+**Symptom:** a feature works but its setting is nowhere in `settings.yaml`, so nobody
+can find it to turn it on (`enableForceMapPositions` was invisible this way).
+`metrics.yaml` on a quiet server contained only a timestamp.
+
+**Cause:** `_yamlOut` omits any property still at its default — every `false`, `0` and
+empty list.
+
+**Fix:** `_yamlOutFull` (no `OmitDefaults`) for anything a human reads or edits:
+settings templates, the missing-key top-up, and `metrics.yaml`.
+
+---
+
+## YamlDotNet drops a Dictionary's comparer
+
+**Symptom:** `countAsViolation` entries had no effect; no rule counted toward the
+auto-ban threshold, silently.
+
+**Cause:** the field initializer specifies `StringComparer.OrdinalIgnoreCase`, but the
+deserializer **assigns a new Dictionary** over it. Lookups became case-sensitive, and
+older files wrote camelCase rule names while `RuleCountsAsViolation` looks up the
+PascalCase `RULE_*` constants.
+
+**Fix:** rebuild the dictionary with `OrdinalIgnoreCase` after deserializing. Applies
+to any `Dictionary` field populated by YamlDotNet that relies on a custom comparer.
+
+--- and Fixes
 
 Historical record of every error encountered during development of this mod, plus the exact fix applied. Consult this before debugging.
 

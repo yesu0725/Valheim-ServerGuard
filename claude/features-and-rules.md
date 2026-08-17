@@ -14,6 +14,7 @@ RULE_BANNED_MOD              = "BannedMod"
 RULE_HASH_MISMATCH           = "HashMismatch"
 RULE_CHAR_NAME_LIMIT         = "CharacterNameLimitExceeded"
 RULE_DEVCOMMAND_ATTEMPT      = "DevcommandAttempt"
+RULE_CONSOLE_COMMAND         = "ConsoleCommandBlocked"
 RULE_SPEED_HACK              = "SpeedHack"
 RULE_ILLEGAL_ITEM            = "IllegalItem"
 RULE_STACK_OVERFLOW          = "StackOverflow"
@@ -38,6 +39,7 @@ countAsViolation:
   HashMismatch:               false   # already kicked
   CharacterNameLimitExceeded: true    # in-game behavioural — escalate
   DevcommandAttempt:          true    # in-game behavioural — escalate
+  ConsoleCommandBlocked:      false   # non-cheat console blocks — informational
   SpeedHack:                  true    # in-game behavioural — escalate
   IllegalItem:                false   # audit first, opt-in when confident
   StackOverflow:              false   # audit first, opt-in when confident
@@ -91,12 +93,20 @@ countAsViolation:
 
 ### DevcommandAttempt
 - **Setting:** `enableDevcommandGate` (default `true`)
-- **Trigger:** Client's `Patch_TryRunCommand` intercepts a command from `BlockedCommands` set
+- **Trigger:** Client's `Patch_TryRunCommand` blocks a command classified `cheat` — the `CheatCommands` set, or anything registered in `Terminal.commands` with `IsCheat = true` (so other mods' cheat commands are caught dynamically)
 - **Client side:** ALWAYS blocked client-side regardless of this setting
-- **Server side:** This setting only controls whether it's counted as a violation
+- **Server side:** This setting only controls whether it's logged/posted/counted
 - **FriendlyReason:** `"tried to use cheats ('god')"`
 - **countAsViolation default:** `true`
-- **Blocked commands list:** `devcommands, debugmode, imacheater, god, ghost, fly, nocost, noplacementcost, spawn, pos, goto, tame, killall, event, stopevent, tod, skiptime, sleep, raiseskill, resetcharacter, heal, puke, damage, setkey, resetkeys, removedrops, freefly`
+- **Command list:** see `claude/console-guard.md` — the tiers moved out of this file in 1.7.0 because they now run to ~90 entries with a per-command rationale
+
+### ConsoleCommandBlocked
+- **Setting:** `consoleGuardMode` / `consoleGuardBindPolicy` / `consoleBlockedCommands` (+ `enableDevcommandGate` and `consoleGuardReportAttempts` gate the reporting)
+- **Trigger:** Client's `Patch_TryRunCommand` blocks a command classified `risky`, `bind`, or `notallowed` — i.e. a non-cheat command that still mutates shared server state, leaks information, or is a key bind
+- **Discord:** admin channel only (never public — a curious player typing `bind` isn't a cheater)
+- **FriendlyReason:** `"used a restricted console command ('bind (bind)')"`
+- **countAsViolation default:** `false`
+- **See:** `claude/console-guard.md` for the full per-command risk assessment
 
 ### SpeedHack
 - **Settings:** `enableSpeedCheck`, `speedCheckMaxMetersPerSecond` (15.0), `speedCheckSampleSeconds` (1.0), `speedCheckConsecutiveStrikes` (3), `speedCheckTeleportToleranceMeters` (60.0)

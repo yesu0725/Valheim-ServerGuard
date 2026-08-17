@@ -6,6 +6,15 @@ It works because every player runs a small companion plugin that tells the serve
 
 Beyond the mod allowlist, it also includes anti-cheat gates, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
 
+### New in 1.7.0
+
+- **Owner and moderator tiers** — `conf/owners.yaml` is a new list, normally just you. An owner is exempt from every rule in the mod, unconditionally: never kicked, never banned, never given a strike, never checked by anything. `admins.yaml` becomes `conf/moderators.yaml` (migrated automatically on first boot) — moderators keep all the old admin bypasses and skip the console guard, but stay bannable.
+- **Fixed: settings that default to off were missing from `settings.yaml`.** They were being written by a serializer that skips anything still at its default, so `enableForceMapPositions`, `enablePingLog`, `allowUnlisted` and several others had no visible switch at all. Fresh installs now list everything, and existing servers get the missing options appended on next boot with their current values — your edits and comments are left alone.
+- **Fixed: `discordAdminWebhookUrl` was silently ignored** (the key is `discordWebhookUrlAdmin`). Servers using the other spelling had no admin Discord channel at all and no error to explain it. Both spellings now work.
+- **Instant SteamID bans** *(`enableBanLayer`, on by default)* — Valheim's own ban list is only swept every five seconds, so a banned player still gets into the world and can play for a moment before being removed. ServerGuard keeps its own list in `conf/bans.yaml` and checks it inside the connection handshake, so the connection is refused before the player spawns at all. Manage it with `sg ban`, `sg unban` and `sg bans`; bans can carry a reason and an expiry (`sg ban <steamid> for 7d griefing`). Editing the file works too — it hot-reloads, and anyone already online who matches gets removed straight away.
+- **Console guard** *(`consoleGuardMode`, `restricted` by default)* — controls what players can run in the F5 console. `restricted` blocks cheat commands plus a list of non-cheat commands that still change your world (`nomap`, `noportals`, `setworldmodifier`, `optterrain`, `resetsharedmap` and more); `whitelist` permits only what you list; `disabled` stops the console opening at all. Admins are exempt by default.
+- **Key binds are removed on join** *(`consoleGuardBindPolicy`, `purge` by default)* — a player could bind a command to a key offline and arrive with it armed. Valheim runs binds without the console being open and skips its own "is this allowed here?" check when it does, so this was a real hole. Binds are now cleared while the player is on your server, and the `bind` command is blocked so they can't add more. Their saved binds come back in single-player; use `wipe` if you'd rather delete them permanently.
+
 ### Fixed in 1.6.3
 
 - **`enableArrivalShout: false` blocked all shouts** — with the arrival shout turned off, players couldn't use `/s` at all. The 1.6.2 filter keyed off "did the respawn update run this frame", but the game runs that update *every* frame, so it matched every shout instead of just the first-spawn one. The filter now brackets the actual call, and suppresses at most one shout per session. Client-side fix; update both plugins to keep versions matched.
@@ -116,12 +125,12 @@ Stop reading here unless something doesn't work or you want to change defaults.
 
 ## All configuration files
 
-All on the server, under `BepInEx/config/ServerGuard/conf/`. Edits are picked up live (no restart needed) for `settings.yaml`, `admins.yaml`, and `allowed_mods.yaml`.
+All on the server, under `BepInEx/config/ServerGuard/conf/`. Edits are picked up live (no restart needed) for `settings.yaml`, `moderators.yaml`, and `allowed_mods.yaml`.
 
 | File | What it does |
 |---|---|
 | `settings.yaml` | Main switches and the shared password. |
-| `admins.yaml` | Steam IDs that bypass the mod check entirely. |
+| `moderators.yaml` | Steam IDs that bypass the mod check entirely. |
 | `allowed_mods.yaml` | The required / allowed / banned mod lists. |
 | `registrations.yaml` | Auto-managed: which character names each Steam ID has used. |
 | `violations.yaml` | Auto-managed: how many times each Steam ID has been rejected. |
@@ -171,14 +180,25 @@ banned_mods:
 
 **Hash pinning** (the `|hash` part) locks the mod to a specific DLL. Useful if you want to forbid newer or older versions. Dropping the hash means any version with that GUID is accepted.
 
-## admins.yaml
+## owners.yaml and moderators.yaml
 
 ```yaml
-admins:
-  - "76561198012345678"   # this Steam ID skips the entire mod check
+# conf/owners.yaml — you. Exempt from every rule in the mod, unconditionally.
+owners:
+  - "76561198012345678"
 ```
 
-Use sparingly. Admins are not asked for a manifest, so they can run any mods.
+```yaml
+# conf/moderators.yaml — your staff. (Called admins.yaml before 1.7.0; upgrading
+# migrates it automatically and renames the old file to admins.yaml.legacy.)
+moderators:
+  - "76561198087654321"   # skips the mod check, the console guard and the sg gate
+```
+
+Use both sparingly. Neither tier is asked for a manifest, so they can run any mods.
+Owners additionally cannot be kicked or banned by ServerGuard — see the
+[Privilege Tiers](https://github.com/yesu0725/Valheim-ServerGuard/wiki/Privilege-Tiers)
+wiki page.
 
 To find your Steam ID, paste your profile URL into https://steamid.io and copy the **steamID64** number.
 
@@ -291,5 +311,5 @@ See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL bu
 
 ---
 
-**Version:** 1.6.3
+**Version:** 1.7.0
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

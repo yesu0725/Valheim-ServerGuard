@@ -18,7 +18,7 @@ using ValheimServerGuard.Shared;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
-[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.6.3")]
+[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.7.0")]
 public class Plugin : BaseUnityPlugin
 {
     internal static Plugin Instance;
@@ -35,7 +35,12 @@ public class Plugin : BaseUnityPlugin
     private static readonly string ReadmeMD  = Path.Combine(RootDir, "README.md");
 
     private static readonly string SettingsYaml      = Path.Combine(ConfDir, "settings.yaml");
-    private static readonly string AdminsYaml        = Path.Combine(ConfDir, "admins.yaml");
+    private static readonly string ModeratorsYaml    = Path.Combine(ConfDir, "moderators.yaml");
+    private static readonly string OwnersYaml        = Path.Combine(ConfDir, "owners.yaml");
+    // Pre-1.7 name for the moderator list. Migrated to moderators.yaml on first boot
+    // under 1.7+, then renamed to .legacy so it can't drift back into use.
+    private static readonly string LegacyAdminsYaml  = Path.Combine(ConfDir, "admins.yaml");
+    private static readonly string BansYaml          = Path.Combine(ConfDir, "bans.yaml");
     private static readonly string AllowedModsYaml   = Path.Combine(ConfDir, "allowed_mods.yaml");
     private static readonly string RegistrationsYaml = Path.Combine(ConfDir, "registrations.yaml");
     private static readonly string ViolationsYaml    = Path.Combine(ConfDir, "violations.yaml");
@@ -48,11 +53,35 @@ public class Plugin : BaseUnityPlugin
     // -------- YAML Serializer --------
     private static IDeserializer _yamlIn;
     private static ISerializer _yamlOut;
+    private static ISerializer _yamlOutFull;   // emits defaults too - see Awake
 
     // -------- In-memory state --------
     private Settings _settings;
+
+    // ---- Privilege tiers ----
+    //
+    //   OWNER      (owners.yaml)  - the server operator. Exempt from EVERY rule in the
+    //                              mod, unconditionally, with no setting to turn that
+    //                              off. Never kicked, never banned, never given a
+    //                              violation strike, never gated.
+    //   MODERATOR  (moderators.yaml) - staff. Keeps every bypass the old "admin" tier had
+    //                              (attestation, devcommand gate, speed check, character
+    //                              limit, console guard) and can run `sg` commands, but
+    //                              is still subject to the ban layer and can be kicked.
+    //   PLAYER                    - everyone else.
+    //
+    // The moderator list lives in moderators.yaml. Servers upgrading from <=1.6.x are
+    // migrated from admins.yaml on first boot by MigrateAdminsToModerators(), which
+    // copies the IDs across and renames the old file to admins.yaml.legacy.
     private HashSet<string> _admins = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _owners = new(StringComparer.OrdinalIgnoreCase);
     private DetectionMetrics _metrics;
+
+    // SteamID -> ban record, loaded from conf/bans.yaml. Read on every incoming
+    // connection, so it is replaced wholesale on reload rather than mutated in place
+    // (the read path is lock-free; the write path swaps the reference).
+    private Dictionary<string, BanEntry> _bans = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _bansLock = new object();
 
     // allowed_mods.yaml decoded into lookup-friendly form.
     private List<AllowedModEntry> _requiredMods = new();
@@ -114,6 +143,7 @@ public class Plugin : BaseUnityPlugin
     private const string RULE_HASH_MISMATCH           = "HashMismatch";
     private const string RULE_CHAR_NAME_LIMIT         = "CharacterNameLimitExceeded";
     private const string RULE_DEVCOMMAND_ATTEMPT      = "DevcommandAttempt";
+    private const string RULE_CONSOLE_COMMAND         = "ConsoleCommandBlocked";
     private const string RULE_SPEED_HACK              = "SpeedHack";
     private const string RULE_ILLEGAL_ITEM            = "IllegalItem";
     private const string RULE_STACK_OVERFLOW          = "StackOverflow";
@@ -132,6 +162,7 @@ public class Plugin : BaseUnityPlugin
         RULE_HASH_MISMATCH,
         RULE_CHAR_NAME_LIMIT,
         RULE_DEVCOMMAND_ATTEMPT,
+        RULE_CONSOLE_COMMAND,
         RULE_SPEED_HACK,
         RULE_ILLEGAL_ITEM,
         RULE_STACK_OVERFLOW,
@@ -140,7 +171,7 @@ public class Plugin : BaseUnityPlugin
     };
 
     // File watchers (hot-reload)
-    private FileSystemWatcher _watchSettings, _watchAdmins, _watchAllowed;
+    private FileSystemWatcher _watchSettings, _watchAdmins, _watchOwners, _watchAllowed, _watchBans;
     private readonly Dictionary<string, DateTime> _lastSeenWrite = new();
 
     // -------- Raid event tracking --------
@@ -248,6 +279,11 @@ public class Plugin : BaseUnityPlugin
             ["CharacterNameLimitExceeded"]    = true,
             ["DevcommandAttempt"]             = true,
             ["SpeedHack"]                     = true,
+
+            // Blocked non-cheat console commands (bind, world-key commands, anything on
+            // the operator blocklist). Informational by default - a curious player
+            // typing `bind` shouldn't accrue strikes toward an auto-ban.
+            ["ConsoleCommandBlocked"]         = false,
 
             // Newer/experimental rules - defaulted off. Audit logs first, then opt in.
             ["IllegalItem"]                   = false,
@@ -368,9 +404,75 @@ public class Plugin : BaseUnityPlugin
         // Defaults to false - this changes gameplay, so it's opt-in.
         public bool EnableForceMapPositions       { get; set; } = false;
 
-        // When true, SteamIDs listed in admins.yaml keep their own toggle and can stay
-        // hidden. Default false = the rule applies to everyone, admins included.
+        // When true, moderators keep their own toggle and can stay hidden. Default
+        // false = the rule applies to everyone, moderators included. (Owners are always
+        // exempt regardless of this setting.)
         public bool ForceMapPositionsExemptAdmins { get; set; } = false;
+
+        // --- ServerGuard ban layer ---
+        // Independent SteamID denylist, held in conf/bans.yaml and enforced at the
+        // earliest point in the Valheim handshake where the ID is known. Vanilla's
+        // ban list is only swept by ZNet.UpdateBanList once every 5 seconds, which is
+        // why banned players get far enough in to spawn before being removed. This
+        // layer rejects them inside ZNet.IsAllowed - before RPC_PeerInfo accepts the
+        // peer - so the connection never completes.
+        //
+        // Independent of the vanilla list on purpose: an in-game `unban` (or a wiped
+        // banlist.txt) cannot undo a ServerGuard ban.
+        public bool   EnableBanLayer       { get; set; } = true;
+        public string BanLayerKickMessage  { get; set; } = "You are banned from this server.";
+        // Also write every ServerGuard ban into Valheim's own banlist.txt. Belt and
+        // braces: if ServerGuard is ever removed, the vanilla ban still stands.
+        public bool   BanLayerMirrorToVanilla { get; set; } = true;
+
+        // --- Console guard ---
+        // Controls what the companion plugin allows in the F5 console / chat command
+        // line while connected to this server. Pushed to every client on connect via
+        // the ServerGuard_ConsolePolicy RPC and re-pushed on settings hot-reload.
+        //
+        // mode:
+        //   "open"       - no gating at all (companion behaves like vanilla)
+        //   "restricted" - block the built-in risky list + anything Valheim flags as a
+        //                  cheat command, plus consoleBlockedCommands (DEFAULT)
+        //   "whitelist"  - block everything except consoleAllowedCommands
+        //   "disabled"   - the console cannot be opened at all (F5 and the gamepad
+        //                  chord are both dead). Chat still works.
+        public string ConsoleGuardMode { get; set; } = "restricted";
+
+        // Moderators (moderators.yaml) keep full console access regardless of the mode
+        // above. Leave true unless you want the policy to apply to staff too - note
+        // that `sg ...` commands are typed in the console, so a moderator locked out
+        // of the console in "disabled" mode also loses the sg command interface.
+        //
+        // Owners (owners.yaml) are ALWAYS exempt; this setting does not affect them.
+        public bool ConsoleGuardExemptModerators { get; set; } = true;
+
+        // bindPolicy - what to do about key binds (the `bind` command).
+        // Binds are the sharpest edge in the console: Valheim runs them from
+        // Chat.Update with skipAllowedCheck=true, so a bind fires even for commands
+        // that are "not valid in the current context", and the bind list is persisted
+        // in the client's ConsoleBindings pref - it survives a restart and follows the
+        // player onto the server.
+        //
+        //   "allow" - leave binds alone
+        //   "block" - block the bind/unbind commands but leave existing binds loaded
+        //   "purge" - clear all loaded binds for the duration of the session and block
+        //             the bind command (DEFAULT). The player's saved binds are left on
+        //             disk and come back in single-player.
+        //   "wipe"  - as purge, and also erase the persisted ConsoleBindings pref so
+        //             the binds are gone for good.
+        public string ConsoleGuardBindPolicy { get; set; } = "purge";
+
+        // Extra command names to block on top of the built-in list (mode=restricted).
+        public List<string> ConsoleBlockedCommands { get; set; } = new List<string>();
+
+        // The only commands permitted when mode=whitelist. A small safe core
+        // (help, clear, info, ping, sg, emotes, ...) is always permitted on top.
+        public List<string> ConsoleAllowedCommands { get; set; } = new List<string>();
+
+        // Log + Discord-post + count blocked console attempts. Off means the companion
+        // still blocks the command, it just doesn't report it.
+        public bool ConsoleGuardReportAttempts { get; set; } = true;
 
         // Deprecated (kept so old YAML loads without errors). v1.4+ uses two webhooks instead.
         public bool DiscordPublicMode { get; set; } = true;
@@ -382,9 +484,56 @@ public class Plugin : BaseUnityPlugin
         public bool RequireAttestation     { get; set; } = false;
     }
 
-    private class AdminsDoc
+    // moderators.yaml. `admins:` is still accepted as an input key so a hand-copied
+    // pre-1.7 file loads without edits; the migration writes `moderators:`.
+    private class ModeratorsDoc
     {
+        public List<string> moderators { get; set; } = new();
+
+        [YamlMember(Alias = "admins", ApplyNamingConventions = false)]
         public List<string> admins { get; set; } = new();
+
+        public IEnumerable<string> All() =>
+            (moderators ?? new List<string>()).Concat(admins ?? new List<string>());
+    }
+
+    private class OwnersDoc
+    {
+        public List<string> owners { get; set; } = new();
+    }
+
+    // bans.yaml schema. `bans:` is a list of records so a ban can carry a reason and
+    // an expiry. Only `id` is required - the rest can be omitted and default to empty.
+    private class BansDoc
+    {
+        public List<BanEntry> bans { get; set; } = new();
+    }
+
+    // internal (not private) because IsBannedId/AddBan hand it back to the Harmony
+    // patch classes, which are separate types even though they nest inside Plugin.
+    internal class BanEntry
+    {
+        // SteamID64 (17 digits). The only field that matters for enforcement.
+        public string id      { get; set; } = "";
+        public string reason  { get; set; } = "";
+        // ISO-8601 UTC. Empty/absent = permanent. A ban past its expiry is ignored
+        // at match time and dropped on the next save.
+        public string expires { get; set; } = "";
+        public string added   { get; set; } = "";
+        public string addedBy { get; set; } = "";
+
+        // Parses `expires`. Returns false for permanent bans or unparseable values
+        // (unparseable is treated as permanent - fail closed).
+        public bool TryGetExpiry(out DateTime utc)
+        {
+            utc = DateTime.MinValue;
+            if (string.IsNullOrWhiteSpace(expires)) return false;
+            return DateTime.TryParse(expires, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+                out utc);
+        }
+
+        public bool IsExpired(DateTime nowUtc) => TryGetExpiry(out var exp) && nowUtc >= exp;
     }
 
     // allowed_mods.yaml schema. Each list entry is a string of the form:
@@ -447,6 +596,8 @@ public class Plugin : BaseUnityPlugin
         public long admin_bypasses { get; set; } = 0;
         public long violations_issued { get; set; } = 0;
         public long players_banned { get; set; } = 0;
+        public long ban_layer_blocks { get; set; } = 0;
+        public long console_blocks { get; set; } = 0;
         public Dictionary<string, long> top_detected_mods { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public DateTime last_updated { get; set; } = DateTime.UtcNow;
     }
@@ -479,12 +630,30 @@ public class Plugin : BaseUnityPlugin
             .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitDefaults)
             .Build();
 
+        // Same, but WITHOUT OmitDefaults.
+        //
+        // OmitDefaults drops every property that still equals its default - which for
+        // Settings means every `false` bool, every 0 and every empty list. The
+        // generated settings.yaml therefore silently lacked enableForceMapPositions,
+        // enablePingLog, allowUnlisted, logPeerManifest, selfTestPostOnPass,
+        // discordVerboseMirror, dailySummaryHourUtc and more: features that worked but
+        // whose switch was invisible, so nobody could find them to turn them on.
+        // Settings templates and the missing-key top-up below use this one.
+        _yamlOutFull = new SerializerBuilder()
+            .WithNamingConvention(CamelCaseNamingConvention.Instance)
+            .Build();
+
         // Ensure folders + default files
         EnsureFoldersAndFiles();
 
         // Load YAML
         LoadSettings();
+        // Add any option missing from an older settings.yaml. Runs here, before
+        // StartWatchers, so the append can't bounce off the file watcher.
+        TopUpSettingsFile();
+        LoadOwners();
         LoadAdmins();
+        LoadBans();
         LoadAllowedMods();
         LoadRegistrations();
         LoadViolations();
@@ -498,13 +667,19 @@ public class Plugin : BaseUnityPlugin
         _harmony.PatchAll();
 
         LogS.LogInfo(
-            $"[ServerGuard] Loaded (v1.6.3). " +
+            $"[ServerGuard] Loaded (v1.7.0). " +
             $"Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}. " +
             $"RequireCompanion: {(_settings.RequireCompanion ? "ON" : "OFF")}. " +
             $"RequireHmac: {(_settings.RequireHmac ? "ON" : "OFF")}. " +
             $"AllowUnlisted: {(_settings.AllowUnlisted ? "ON" : "OFF")}. " +
             $"Required: {_requiredMods.Count}, Allowed: {_allowedMods.Count}, Banned: {_bannedMods.Count}. " +
+            $"Owners: {_owners.Count}, Moderators: {_admins.Count}. " +
             $"Metrics: {(_settings.EnableMetrics ? "ON" : "OFF")}");
+
+        if (_owners.Count == 0)
+        {
+            LogS.LogWarning("[ServerGuard] No owner configured. Add your SteamID64 to conf/owners.yaml to be exempt from every rule.");
+        }
 
         if (_settings.RequireHmac && !string.IsNullOrEmpty(_settings.SharedSecret))
         {
@@ -552,7 +727,7 @@ public class Plugin : BaseUnityPlugin
 		// One-line admin-channel announcement that the plugin is up. Lets moderators
 		// confirm the server came back online after a restart without scraping logs.
 		PostAdminEvent(
-			$":rocket: **ServerGuard online** v1.6.3  " +
+			$":rocket: **ServerGuard online** v1.7.0  " +
 			$"enforce={(_settings.Enforce ? "ON" : "off")}  " +
 			$"requireHmac={(_settings.RequireHmac ? "ON" : "off")}  " +
 			$"req/allow/ban={_requiredMods.Count}/{_allowedMods.Count}/{_bannedMods.Count}  " +
@@ -771,7 +946,7 @@ public class Plugin : BaseUnityPlugin
                 SharedSecret = GenerateSharedSecret()
             };
             var sb = new StringBuilder();
-            sb.AppendLine("# ServerGuard settings (v1.6.3)");
+            sb.AppendLine("# ServerGuard settings (v1.7.0)");
             sb.AppendLine("#");
             sb.AppendLine("# Client-attestation handshake:");
             sb.AppendLine("#   requireCompanion       - if true, peers without the ServerGuard.Client plugin are kicked.");
@@ -886,7 +1061,7 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("#                                   Default false (vanilla behaviour: each player");
             sb.AppendLine("#                                   chooses). Takes effect within ~2s of a reload -");
             sb.AppendLine("#                                   no restart needed.");
-            sb.AppendLine("#   forceMapPositionsExemptAdmins - if true, SteamIDs in admins.yaml keep their own");
+            sb.AppendLine("#   forceMapPositionsExemptAdmins - if true, moderators keep their own");
             sb.AppendLine("#                                   toggle and can stay hidden. Default false.");
             sb.AppendLine("#");
             sb.AppendLine("# Discord (two independent channels - either, both, or neither):");
@@ -911,17 +1086,101 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("#   player (when enforce: true) but doesn't add a strike. Tune to match how");
             sb.AppendLine("#   strict you want your server to be. Defaults shown below.");
             sb.AppendLine("#");
-            sb.AppendLine(_yamlOut.Serialize(defaults));
+            sb.AppendLine("# Privilege tiers (two separate files, no setting needed):");
+            sb.AppendLine("#   conf/owners.yaml  - OWNER. Exempt from every rule in this mod,");
+            sb.AppendLine("#                       unconditionally. Cannot be kicked or banned by");
+            sb.AppendLine("#                       ServerGuard. Keep this list to yourself.");
+            sb.AppendLine("#   conf/moderators.yaml");
+            sb.AppendLine("#                     - MODERATOR (staff). Runs `sg` commands and skips the");
+            sb.AppendLine("#                       attestation, devcommand, speed, character-limit and");
+            sb.AppendLine("#                       console checks. Still subject to the ban layer.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Ban layer:");
+            sb.AppendLine("#   enableBanLayer          - independent SteamID denylist held in conf/bans.yaml.");
+            sb.AppendLine("#                             Enforced inside the Valheim handshake (ZNet.IsAllowed)");
+            sb.AppendLine("#                             instead of on the 5-second sweep vanilla uses, so a");
+            sb.AppendLine("#                             banned player is refused before they can spawn.");
+            sb.AppendLine("#   banLayerKickMessage     - text shown to a refused player.");
+            sb.AppendLine("#   banLayerMirrorToVanilla - also write bans into Valheim's own banlist.txt.");
+            sb.AppendLine("#                             Manage with: sg ban / sg unban / sg bans");
+            sb.AppendLine("#");
+            sb.AppendLine("# Console guard:");
+            sb.AppendLine("#   consoleGuardMode        - 'open'       no gating");
+            sb.AppendLine("#                             'restricted' block risky + cheat-flagged commands (default)");
+            sb.AppendLine("#                             'whitelist'  block everything except consoleAllowedCommands");
+            sb.AppendLine("#                             'disabled'   the F5 console cannot be opened at all");
+            sb.AppendLine("#   consoleGuardExemptModerators");
+            sb.AppendLine("#                           - moderators (moderators.yaml) keep full console access.");
+            sb.AppendLine("#                             Note: `sg` commands are typed in the console, so");
+            sb.AppendLine("#                             setting this false under 'disabled' removes the sg");
+            sb.AppendLine("#                             interface for moderators too.");
+            sb.AppendLine("#                             Owners (owners.yaml) are ALWAYS exempt - this");
+            sb.AppendLine("#                             setting does not apply to them.");
+            sb.AppendLine("#   consoleGuardBindPolicy  - 'allow' | 'block' | 'purge' (default) | 'wipe'.");
+            sb.AppendLine("#                             Key binds are the sharpest edge in the console:");
+            sb.AppendLine("#                             Valheim runs them with the context check skipped and");
+            sb.AppendLine("#                             persists them client-side, so a bind made offline");
+            sb.AppendLine("#                             still fires on your server. 'purge' clears them for");
+            sb.AppendLine("#                             the session; 'wipe' also erases them from disk.");
+            sb.AppendLine("#   consoleBlockedCommands  - extra command names to block (mode: restricted).");
+            sb.AppendLine("#   consoleAllowedCommands  - the permitted set (mode: whitelist).");
+            sb.AppendLine("#   consoleGuardReportAttempts - log/post/count blocked attempts.");
+            sb.AppendLine("#");
+            sb.AppendLine(_yamlOutFull.Serialize(defaults));
             File.WriteAllText(SettingsYaml, sb.ToString());
         }
 
-        if (!File.Exists(AdminsYaml))
+        // 1.7.0 migration: admins.yaml -> moderators.yaml. Must run before the
+        // "create if missing" below, or we'd write an empty moderators.yaml and then
+        // decline to migrate into it.
+        MigrateAdminsToModerators();
+
+        if (!File.Exists(ModeratorsYaml))
         {
-            var doc = new AdminsDoc { admins = new List<string>() };
+            WriteModeratorsFile(new List<string>());
+        }
+
+        if (!File.Exists(OwnersYaml))
+        {
             var sb = new StringBuilder();
-            sb.AppendLine("# Admin whitelist: one SteamID per entry");
-            sb.AppendLine(_yamlOut.Serialize(doc));
-            File.WriteAllText(AdminsYaml, sb.ToString());
+            sb.AppendLine("# OWNER list: one SteamID64 per entry. Normally just you.");
+            sb.AppendLine("#");
+            sb.AppendLine("# An owner is exempt from EVERY rule in this mod, unconditionally. There is no");
+            sb.AppendLine("# setting to make a rule apply to an owner. Specifically, an owner:");
+            sb.AppendLine("#   - is never kicked or banned by ServerGuard, and an entry in bans.yaml");
+            sb.AppendLine("#     matching an owner is ignored");
+            sb.AppendLine("#   - never accrues violation strikes, so can never hit the auto-ban threshold");
+            sb.AppendLine("#   - skips the mod-manifest attestation entirely");
+            sb.AppendLine("#   - is never speed-checked, skill-capped or animation-cancel checked");
+            sb.AppendLine("#   - is never subject to the character limit or cheat-item removal");
+            sb.AppendLine("#   - has full console access regardless of consoleGuardMode, and keeps its");
+            sb.AppendLine("#     key binds regardless of consoleGuardBindPolicy");
+            sb.AppendLine("#   - is exempt from forced map positions");
+            sb.AppendLine("#   - has full `sg` command access");
+            sb.AppendLine("#");
+            sb.AppendLine("# Owners do NOT need to be listed in moderators.yaml as well - the owner tier");
+            sb.AppendLine("# already includes everything moderators can do.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Keep this list as short as it can possibly be. Anyone here is invisible to");
+            sb.AppendLine("# every check the mod performs.");
+            sb.AppendLine("#");
+            sb.AppendLine("# TO ADD YOURSELF: delete the '#' on the line below and put your SteamID64 in.");
+            sb.AppendLine();
+            // Deliberately NOT `owners: []`. An empty flow list followed by a commented
+            // example reads as "add your entry here", but a `- item` line underneath
+            // `owners: []` is invalid YAML - and commenting/uncommenting around it
+            // silently leaves the list empty. A bare `owners:` key deserializes to null
+            // (handled) and accepts an item being uncommented directly beneath it.
+            sb.AppendLine("owners:");
+            sb.AppendLine("#  - \"76561198000000000\"");
+            File.WriteAllText(OwnersYaml, sb.ToString());
+        }
+
+        if (!File.Exists(BansYaml))
+        {
+            // Written through SaveBans so the on-disk header and the runtime writer
+            // can never drift apart.
+            SaveBans();
         }
 
         // v1.3+ migration: rename pre-attestation files out of the way so they don't
@@ -1004,7 +1263,43 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            _settings = _yamlIn.Deserialize<Settings>(File.ReadAllText(SettingsYaml)) ?? new Settings();
+            var settingsText = File.ReadAllText(SettingsYaml);
+            _settings = _yamlIn.Deserialize<Settings>(settingsText) ?? new Settings();
+
+            // Backward-compat: accept `discordAdminWebhookUrl` for `discordWebhookUrlAdmin`.
+            //
+            // The deserializer runs with IgnoreUnmatchedProperties, so a file using the
+            // other word order does not error - the key is silently DROPPED and the admin
+            // channel ends up unconfigured. Every PostAdminEvent then early-returns and
+            // the operator gets no violation alerts, no reload notices, no admin audit
+            // trail and no daily summary, with nothing in the log to say why.
+            if (string.IsNullOrWhiteSpace(_settings.discordWebhookUrlAdmin))
+            {
+                var alias = ReadScalarKey(settingsText, "discordAdminWebhookUrl");
+                if (!string.IsNullOrWhiteSpace(alias))
+                {
+                    _settings.discordWebhookUrlAdmin = alias;
+                    LogS.LogWarning("[ServerGuard] settings.yaml uses the legacy key 'discordAdminWebhookUrl'. "
+                        + "Honouring it, but rename it to 'discordWebhookUrlAdmin' - the legacy spelling may go away.");
+                }
+            }
+
+            // Rebuild countAsViolation with a case-insensitive comparer.
+            //
+            // The field initializer specifies StringComparer.OrdinalIgnoreCase, but the
+            // deserializer ASSIGNS A NEW Dictionary over it, so the comparer is lost and
+            // lookups become case-sensitive. RuleCountsAsViolation looks up the exact
+            // RULE_* constants ("DevcommandAttempt"), while older settings.yaml files
+            // wrote the keys camelCase ("devcommandAttempt") - every lookup missed and
+            // silently returned false, so no rule counted toward the auto-ban threshold
+            // and nothing in the log said why.
+            if (_settings.CountAsViolation != null &&
+                !ReferenceEquals(_settings.CountAsViolation.Comparer, StringComparer.OrdinalIgnoreCase))
+            {
+                var ci = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in _settings.CountAsViolation) ci[kv.Key] = kv.Value;
+                _settings.CountAsViolation = ci;
+            }
 
             // Self-heal: if HMAC is required but no secret is configured, mint one and persist
             // it back so subsequent boots and the operator's eyes see the same value.
@@ -1030,6 +1325,10 @@ public class Plugin : BaseUnityPlugin
                 // enableArrivalShout lives on the client; push the new value out so the
                 // change lands without waiting for everyone to reconnect.
                 BroadcastArrivalShoutPolicy();
+                // Same for the console guard - mode/bindPolicy changes land immediately.
+                BroadcastConsolePolicy();
+                // A newly-enabled ban layer should act on anyone already online.
+                SweepBannedPeers();
             }
         }
         catch (Exception ex)
@@ -1044,6 +1343,138 @@ public class Plugin : BaseUnityPlugin
         // server boot has no effect until the next restart.
         try { ReconfigureDiscordAndSummary(); }
         catch (Exception ex) { LogS?.LogWarning($"[ServerGuard] Discord/summary reconfigure failed: {ex.Message}"); }
+    }
+
+    // Pulls a single top-level scalar out of raw YAML text by key name. Used for
+    // legacy-key fallbacks, where running a second full deserialize would be overkill.
+    // Handles optional single/double quotes; returns null when the key isn't present.
+    private static string ReadScalarKey(string yamlText, string key)
+    {
+        if (string.IsNullOrEmpty(yamlText) || string.IsNullOrEmpty(key)) return null;
+
+        foreach (var raw in yamlText.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.Length == 0 || char.IsWhiteSpace(line[0])) continue;   // nested, not top level
+            if (line.TrimStart().StartsWith("#")) continue;
+
+            var colon = line.IndexOf(':');
+            if (colon <= 0) continue;
+            if (!string.Equals(line.Substring(0, colon).Trim(), key, StringComparison.Ordinal)) continue;
+
+            var value = line.Substring(colon + 1).Trim();
+
+            // Strip a trailing inline comment only when the value isn't quoted.
+            if (value.Length > 0 && value[0] != '"' && value[0] != '\'')
+            {
+                var hash = value.IndexOf('#');
+                if (hash >= 0) value = value.Substring(0, hash).Trim();
+            }
+
+            if (value.Length >= 2 &&
+                ((value[0] == '"' && value[value.Length - 1] == '"') ||
+                 (value[0] == '\'' && value[value.Length - 1] == '\'')))
+            {
+                value = value.Substring(1, value.Length - 2);
+            }
+
+            return value;
+        }
+        return null;
+    }
+
+    // Appends any settings key that isn't in settings.yaml yet, with the value that is
+    // currently in effect for it.
+    //
+    // Why this exists: a server that was first started on an older build has a
+    // settings.yaml generated by the OmitDefaults serializer, so every option that
+    // defaults to false/0/empty was never written. Those features work - they just have
+    // no visible switch, which is indistinguishable from "the feature isn't there" for
+    // anyone reading the file. New settings added by an upgrade have the same problem.
+    //
+    // Deliberately additive: existing lines, values, ordering and comments are all left
+    // exactly as they are. We only append, under a dated header, and only keys that are
+    // genuinely absent. No-op when nothing is missing.
+    private void TopUpSettingsFile()
+    {
+        try
+        {
+            if (_settings == null || !File.Exists(SettingsYaml)) return;
+
+            var existing = File.ReadAllText(SettingsYaml);
+
+            // Top-level keys already present. A top-level key is a line that starts at
+            // column 0 with `name:` - indented lines belong to a parent (countAsViolation
+            // entries, list items), and `#` lines are comments.
+            var present = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var line in existing.Split('\n'))
+            {
+                var l = line.TrimEnd('\r');
+                if (l.Length == 0 || char.IsWhiteSpace(l[0])) continue;
+                var t = l.TrimStart();
+                // '#' = comment. '-' = a sequence item, which YamlDotNet writes at
+                // column 0 under its parent key; a URL inside one would otherwise be
+                // mistaken for a `key: value` line.
+                if (t.StartsWith("#") || t.StartsWith("-")) continue;
+                var colon = l.IndexOf(':');
+                if (colon > 0) present.Add(l.Substring(0, colon).Trim());
+            }
+
+            // Serialize the live settings with defaults included, then split it into
+            // top-level blocks so a missing key carries its nested lines with it.
+            var full = _yamlOutFull.Serialize(_settings);
+            var blocks = new List<KeyValuePair<string, List<string>>>();
+            List<string> current = null;
+            foreach (var line in full.Split('\n'))
+            {
+                var l = line.TrimEnd('\r');
+                if (l.Length == 0) { current?.Add(l); continue; }
+
+                if (!char.IsWhiteSpace(l[0]) && !l.TrimStart().StartsWith("-"))
+                {
+                    var colon = l.IndexOf(':');
+                    if (colon > 0)
+                    {
+                        current = new List<string>();
+                        blocks.Add(new KeyValuePair<string, List<string>>(l.Substring(0, colon).Trim(), current));
+                    }
+                }
+                current?.Add(l);
+            }
+
+            var missing = blocks.Where(b => !present.Contains(b.Key)).ToList();
+            if (missing.Count == 0) return;
+
+            var sb = new StringBuilder();
+            if (!existing.EndsWith("\n")) sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("# ---------------------------------------------------------------------------");
+            sb.AppendLine($"# Settings added automatically on {DateTime.UtcNow:yyyy-MM-dd} because they were missing");
+            sb.AppendLine("# from this file. The values below are the ones already in effect, so writing");
+            sb.AppendLine("# them changes nothing - they are here so you can see and edit them.");
+            sb.AppendLine("#");
+            sb.AppendLine("# (Older builds generated settings.yaml with defaults omitted, which hid every");
+            sb.AppendLine("#  option that defaults to false, 0 or an empty list.)");
+            sb.AppendLine("# ---------------------------------------------------------------------------");
+
+            foreach (var b in missing)
+            {
+                foreach (var l in b.Value)
+                {
+                    if (l.Length == 0) continue;
+                    sb.AppendLine(l);
+                }
+            }
+
+            File.AppendAllText(SettingsYaml, sb.ToString());
+            LogS.LogWarning($"[ServerGuard] settings.yaml was missing {missing.Count} option(s) - appended them with their current values: "
+                + string.Join(", ", missing.Select(b => b.Key)));
+        }
+        catch (Exception ex)
+        {
+            // Never fatal - the settings are already loaded and correct in memory.
+            LogS?.LogWarning($"[ServerGuard] Could not top up settings.yaml: {ex.Message}");
+        }
     }
 
     // Idempotent: ensures the Discord admin log mirror is attached to the current URL,
@@ -1128,17 +1559,491 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            var text = File.ReadAllText(AdminsYaml);
-            var doc = _yamlIn.Deserialize<AdminsDoc>(text) ?? new AdminsDoc();
-            _admins = new HashSet<string>((doc.admins ?? new List<string>()).Select(s => s.Trim()).Where(s => !string.IsNullOrWhiteSpace(s)), StringComparer.OrdinalIgnoreCase);
-            LogS.LogInfo($"[ServerGuard] admins.yaml loaded ({_admins.Count} admins)");
-            if (_bootCompleted) PostAdminEvent($":arrows_counterclockwise: admins.yaml reloaded ({_admins.Count} admins)");
+            if (!File.Exists(ModeratorsYaml))
+            {
+                _admins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                LogS.LogWarning("[ServerGuard] moderators.yaml not present - no moderators configured.");
+                return;
+            }
+
+            var text = File.ReadAllText(ModeratorsYaml);
+            var doc = _yamlIn.Deserialize<ModeratorsDoc>(text) ?? new ModeratorsDoc();
+
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int skipped = 0;
+            foreach (var raw in doc.All())
+            {
+                var id = (raw ?? "").Trim();
+                if (!IsValidSteamId(id))
+                {
+                    var extracted = ExtractSteamIdFromString(id);
+                    if (IsValidSteamId(extracted)) id = extracted;
+                }
+                if (!IsValidSteamId(id)) { skipped++; continue; }
+                set.Add(id);
+            }
+
+            _admins = set;
+            LogS.LogInfo($"[ServerGuard] moderators.yaml loaded ({_admins.Count} moderator(s)"
+                + (skipped > 0 ? $", {skipped} invalid" : "") + ")");
+
+            WarnIfIdsOnlyInComments(ModeratorsYaml, "moderators.yaml", _admins.Count);
+
+            if (_bootCompleted)
+            {
+                PostAdminEvent($":arrows_counterclockwise: moderators.yaml reloaded ({_admins.Count} moderator(s))");
+                // The console policy carries each peer's resolved exemption, so a change
+                // to the list has to be re-pushed or a promoted/demoted player keeps the
+                // console rights they had at connect time.
+                BroadcastConsolePolicy();
+            }
         }
         catch (Exception ex)
         {
-            LogS.LogError($"[ServerGuard] Failed to load admins.yaml: {ex.Message}");
+            LogS.LogError($"[ServerGuard] Failed to load moderators.yaml: {ex.Message}");
             _admins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
+    }
+
+    // "You left it commented out" detector.
+    //
+    // A file that parses cleanly to zero entries is indistinguishable, in the log, from
+    // a file nobody has filled in yet - so an operator who adds their SteamID but leaves
+    // the '#' on gets a silent no-op and a tier that never applies. If the file yielded
+    // no entries but a comment line in it contains a 17-digit number, say so plainly.
+    private void WarnIfIdsOnlyInComments(string path, string label, int loadedCount)
+    {
+        try
+        {
+            if (loadedCount > 0) return;
+            if (!File.Exists(path)) return;
+
+            foreach (var raw in File.ReadAllLines(path))
+            {
+                var line = raw.Trim();
+                if (!line.StartsWith("#")) continue;
+
+                var id = ExtractSteamIdFromString(line);
+                if (!IsValidSteamId(id)) continue;
+                // Skip the placeholder in our own generated header.
+                if (id == "76561198000000000") continue;
+
+                LogS.LogWarning($"[ServerGuard] {label} has no entries, but a COMMENTED line contains SteamID {id}. "
+                    + "Remove the leading '#' for it to take effect - as written it does nothing.");
+                return;
+            }
+        }
+        catch { /* advisory only */ }
+    }
+
+    // One-time migration: admins.yaml -> moderators.yaml.
+    //
+    // Runs before any load, from EnsureFoldersAndFiles. Carries the SteamIDs across
+    // verbatim, then renames the old file to admins.yaml.legacy so there is exactly one
+    // file in play and an operator editing the wrong one notices immediately.
+    //
+    // Idempotent: does nothing once moderators.yaml exists. If both files somehow
+    // exist, moderators.yaml wins and the old one is still moved aside.
+    private void MigrateAdminsToModerators()
+    {
+        try
+        {
+            if (!File.Exists(LegacyAdminsYaml)) return;
+
+            if (File.Exists(ModeratorsYaml))
+            {
+                TryRenameLegacy(LegacyAdminsYaml, LegacyAdminsYaml + ".legacy");
+                return;
+            }
+
+            var ids = new List<string>();
+            try
+            {
+                var doc = _yamlIn.Deserialize<ModeratorsDoc>(File.ReadAllText(LegacyAdminsYaml)) ?? new ModeratorsDoc();
+                foreach (var raw in doc.All())
+                {
+                    var id = (raw ?? "").Trim();
+                    if (!IsValidSteamId(id))
+                    {
+                        var extracted = ExtractSteamIdFromString(id);
+                        if (IsValidSteamId(extracted)) id = extracted;
+                    }
+                    if (IsValidSteamId(id) && !ids.Contains(id)) ids.Add(id);
+                }
+            }
+            catch (Exception parseEx)
+            {
+                // Leave admins.yaml exactly where it is so the operator can recover it by
+                // hand. Bailing out here means moderators.yaml is not created either, and
+                // the next boot retries the migration.
+                LogS.LogError($"[ServerGuard] Could not parse admins.yaml for migration ({parseEx.Message}). "
+                    + "Left it in place - copy your SteamIDs into moderators.yaml manually.");
+                return;
+            }
+
+            WriteModeratorsFile(ids);
+            TryRenameLegacy(LegacyAdminsYaml, LegacyAdminsYaml + ".legacy");
+
+            LogS.LogWarning($"[ServerGuard] Migrated admins.yaml -> moderators.yaml ({ids.Count} moderator(s)). "
+                + "The old file is now admins.yaml.legacy and is no longer read. "
+                + "The admin tier was renamed to MODERATOR in 1.7.0; the new owners.yaml is the tier above it.");
+        }
+        catch (Exception ex)
+        {
+            LogS.LogError($"[ServerGuard] admins.yaml migration failed: {ex.Message}");
+        }
+    }
+
+    private void WriteModeratorsFile(List<string> ids)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("# MODERATOR list: one SteamID64 per entry.");
+        sb.AppendLine("#");
+        sb.AppendLine("# Moderators are staff. They can run `sg` commands and are exempt from the");
+        sb.AppendLine("# attestation handshake, the devcommand gate, the console guard, the speed check");
+        sb.AppendLine("# and the character limit.");
+        sb.AppendLine("#");
+        sb.AppendLine("# They are NOT exempt from the ban layer and can still be kicked. The tier that");
+        sb.AppendLine("# bypasses everything is conf/owners.yaml.");
+        sb.AppendLine("#");
+        sb.AppendLine("# Renamed from admins.yaml in 1.7.0. An `admins:` key is still read here for");
+        sb.AppendLine("# convenience if you paste an old file in.");
+        sb.AppendLine();
+
+        if (ids == null || ids.Count == 0)
+        {
+            // See the note in the owners.yaml template: a bare key, not `moderators: []`,
+            // so uncommenting the example below actually works.
+            sb.AppendLine("# TO ADD SOMEONE: delete the '#' on the line below and put their SteamID64 in.");
+            sb.AppendLine();
+            sb.AppendLine("moderators:");
+            sb.AppendLine("#  - \"76561198000000000\"");
+        }
+        else
+        {
+            sb.AppendLine("moderators:");
+            foreach (var id in ids) sb.AppendLine($"  - \"{YamlEscape(id)}\"");
+        }
+
+        File.WriteAllText(ModeratorsYaml, sb.ToString());
+    }
+
+    // Loads the owner tier. Kept separate from LoadAdmins so a mistake in one file
+    // can't take the other down.
+    //
+    // Fails CLOSED to an empty set on a parse error: an unreadable owners.yaml must
+    // not be able to hand out blanket rule exemptions.
+    private void LoadOwners()
+    {
+        try
+        {
+            if (!File.Exists(OwnersYaml))
+            {
+                _owners = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                LogS.LogInfo("[ServerGuard] owners.yaml not present - no owner configured.");
+                return;
+            }
+
+            var doc = _yamlIn.Deserialize<OwnersDoc>(File.ReadAllText(OwnersYaml)) ?? new OwnersDoc();
+
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int skipped = 0;
+            foreach (var raw in doc.owners ?? new List<string>())
+            {
+                var id = (raw ?? "").Trim();
+                if (!IsValidSteamId(id))
+                {
+                    var extracted = ExtractSteamIdFromString(id);
+                    if (IsValidSteamId(extracted)) id = extracted;
+                }
+                if (!IsValidSteamId(id)) { skipped++; continue; }
+                set.Add(id);
+            }
+
+            _owners = set;
+            LogS.LogInfo($"[ServerGuard] owners.yaml loaded ({_owners.Count} owner(s)"
+                + (skipped > 0 ? $", {skipped} invalid" : "") + ")");
+
+            WarnIfIdsOnlyInComments(OwnersYaml, "owners.yaml", _owners.Count);
+
+            if (_bootCompleted)
+            {
+                PostAdminEvent($":crown: owners.yaml reloaded ({_owners.Count} owner(s))");
+                // The console policy carries the recipient's tier, so a change here has
+                // to be re-pushed or a newly-promoted owner keeps their old rights.
+                BroadcastConsolePolicy();
+            }
+        }
+        catch (Exception ex)
+        {
+            LogS.LogError($"[ServerGuard] Failed to load owners.yaml: {ex.Message}. No owner is configured until this is fixed.");
+            _owners = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    // ==================== ServerGuard ban layer ====================
+    //
+    // Why this exists: Valheim's own ban list is only applied by ZNet.UpdateBanList,
+    // which runs on a 5-second timer and calls InternalKick on anyone it finds. A
+    // banned player therefore completes the handshake, loads in, and plays for up to
+    // five seconds before being removed - long enough to drop items, read chat, or
+    // reconnect in a loop. ZNet.IsAllowed, by contrast, is consulted inside
+    // RPC_PeerInfo *before* the peer is accepted, and a false result makes vanilla
+    // send ConnectionStatus.ErrorBanned and return. That is where this layer hooks.
+
+    private void LoadBans()
+    {
+        try
+        {
+            if (!File.Exists(BansYaml))
+            {
+                lock (_bansLock) { _bans = new Dictionary<string, BanEntry>(StringComparer.OrdinalIgnoreCase); }
+                LogS.LogInfo("[ServerGuard] bans.yaml not present - ban layer has no entries.");
+                return;
+            }
+
+            var doc = _yamlIn.Deserialize<BansDoc>(File.ReadAllText(BansYaml)) ?? new BansDoc();
+            var map = new Dictionary<string, BanEntry>(StringComparer.OrdinalIgnoreCase);
+            var now = DateTime.UtcNow;
+            int skipped = 0, expired = 0;
+
+            foreach (var e in doc.bans ?? new List<BanEntry>())
+            {
+                if (e == null) continue;
+                var id = (e.id ?? "").Trim();
+                // Tolerate "Steam_76561198..." and other decorated forms.
+                if (!IsValidSteamId(id))
+                {
+                    var extracted = ExtractSteamIdFromString(id);
+                    if (IsValidSteamId(extracted)) id = extracted;
+                }
+                if (!IsValidSteamId(id)) { skipped++; continue; }
+
+                if (e.IsExpired(now)) { expired++; continue; }
+
+                e.id = id;
+                map[id] = e;
+            }
+
+            lock (_bansLock) { _bans = map; }
+
+            LogS.LogInfo($"[ServerGuard] bans.yaml loaded ({map.Count} active"
+                + (expired > 0 ? $", {expired} expired" : "")
+                + (skipped > 0 ? $", {skipped} invalid" : "") + ")");
+
+            if (_bootCompleted)
+            {
+                PostAdminEvent($":arrows_counterclockwise: bans.yaml reloaded ({map.Count} active ban(s))");
+                // A ban added by hand-editing the file should take effect immediately
+                // for anyone already online, not only on their next login.
+                SweepBannedPeers();
+            }
+        }
+        catch (Exception ex)
+        {
+            // Fail OPEN on a parse error rather than locking the whole server out:
+            // a malformed bans.yaml should not be able to deny every login. The error
+            // is loud on both the log and the admin channel.
+            LogS.LogError($"[ServerGuard] Failed to load bans.yaml: {ex.Message}");
+            if (_bootCompleted) PostAdminEvent($":x: bans.yaml failed to parse - ban layer is running on the last good list. {ex.Message}");
+        }
+    }
+
+    private void SaveBans()
+    {
+        try
+        {
+            List<BanEntry> list;
+            lock (_bansLock)
+            {
+                var now = DateTime.UtcNow;
+                // Drop expired entries as we write, so the file self-cleans.
+                list = _bans.Values.Where(e => e != null && !e.IsExpired(now))
+                                   .OrderBy(e => e.id, StringComparer.Ordinal)
+                                   .ToList();
+                _bans = list.ToDictionary(e => e.id, e => e, StringComparer.OrdinalIgnoreCase);
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("# ServerGuard ban list.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Enforced at the earliest point of the Valheim handshake at which the SteamID is");
+            sb.AppendLine("# known, so a banned player's connection is refused before they ever spawn. This is");
+            sb.AppendLine("# separate from Valheim's own banlist.txt - an in-game `unban` does NOT clear an");
+            sb.AppendLine("# entry here. Use `sg unban <steamid>` or delete the line below.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Hot-reloaded: edits take effect within a second, and anyone already online who");
+            sb.AppendLine("# matches a new entry is disconnected immediately.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Fields: id (required, SteamID64), reason, expires (ISO-8601 UTC, empty =");
+            sb.AppendLine("# permanent), added, addedBy. Expired entries are removed on the next write.");
+            sb.AppendLine("#");
+            sb.AppendLine("# bans:");
+            sb.AppendLine("#   - id: \"76561198000000000\"");
+            sb.AppendLine("#     reason: \"Item duping\"");
+            sb.AppendLine("#     expires: \"\"");
+            sb.AppendLine();
+
+            if (list.Count == 0)
+            {
+                // Bare key rather than `bans: []` - see the owners.yaml template note.
+                sb.AppendLine("bans:");
+            }
+            else
+            {
+                sb.AppendLine("bans:");
+                foreach (var e in list)
+                {
+                    sb.AppendLine($"  - id: \"{YamlEscape(e.id)}\"");
+                    sb.AppendLine($"    reason: \"{YamlEscape(e.reason)}\"");
+                    sb.AppendLine($"    expires: \"{YamlEscape(e.expires)}\"");
+                    sb.AppendLine($"    added: \"{YamlEscape(e.added)}\"");
+                    sb.AppendLine($"    addedBy: \"{YamlEscape(e.addedBy)}\"");
+                }
+            }
+
+            File.WriteAllText(BansYaml, sb.ToString());
+        }
+        catch (Exception ex)
+        {
+            LogS.LogError($"[ServerGuard] Failed to save bans.yaml: {ex.Message}");
+        }
+    }
+
+    private static string YamlEscape(string s) =>
+        (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
+
+    // Central ban predicate. `candidate` may be a raw SteamID64 or any string a
+    // SteamID can be pulled out of (socket host names arrive decorated on some
+    // platforms). Returns false when the layer is off or the entry has expired.
+    internal bool IsBannedId(string candidate, out BanEntry entry)
+    {
+        entry = null;
+        if (_settings == null || !_settings.EnableBanLayer) return false;
+        if (string.IsNullOrWhiteSpace(candidate)) return false;
+
+        var id = candidate.Trim();
+        if (!IsValidSteamId(id))
+        {
+            var extracted = ExtractSteamIdFromString(id);
+            if (!IsValidSteamId(extracted)) return false;
+            id = extracted;
+        }
+
+        // Owner bypass, checked before the list lookup: even a hand-edited bans.yaml
+        // (or a stale auto-ban written before the ID was promoted) cannot lock the
+        // owner out of their own server.
+        if (IsOwner(id)) return false;
+
+        BanEntry found;
+        lock (_bansLock)
+        {
+            if (!_bans.TryGetValue(id, out found) || found == null) return false;
+        }
+
+        if (found.IsExpired(DateTime.UtcNow)) return false;
+
+        entry = found;
+        return true;
+    }
+
+    // Adds (or overwrites) a ban and persists it. Returns the stored entry.
+    internal BanEntry AddBan(string steamId, string reason, string addedBy, string expiresIso = "")
+    {
+        // Belt and braces alongside the IsBannedId bypass: never write an owner into
+        // the file in the first place, so the list stays honest.
+        if (IsOwner(steamId))
+        {
+            LogS.LogWarning($"[ServerGuard] Refusing to ban {FormatPlayer(steamId)} - owner.");
+            return null;
+        }
+
+        var entry = new BanEntry
+        {
+            id      = steamId,
+            reason  = string.IsNullOrWhiteSpace(reason) ? "No reason given." : reason.Trim(),
+            expires = expiresIso ?? "",
+            added   = DateTime.UtcNow.ToString("o"),
+            addedBy = addedBy ?? "",
+        };
+
+        lock (_bansLock) { _bans[steamId] = entry; }
+        SaveBans();
+
+        // Mirror into Valheim's own list so the ban survives ServerGuard being removed.
+        if (_settings != null && _settings.BanLayerMirrorToVanilla)
+            TryVanillaBan(steamId);
+
+        return entry;
+    }
+
+    internal bool RemoveBan(string steamId)
+    {
+        bool removed;
+        lock (_bansLock) { removed = _bans.Remove(steamId); }
+        if (removed) SaveBans();
+        return removed;
+    }
+
+    // Disconnects every currently-connected peer that matches an active ban. Called
+    // after a hot-reload of bans.yaml and after `sg ban`, so a ban applies to someone
+    // already in the world without waiting for them to reconnect.
+    private void SweepBannedPeers()
+    {
+        try
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (_settings == null || !_settings.EnableBanLayer) return;
+
+            foreach (var p in ZNet.instance.GetPeers()?.ToList() ?? new List<ZNetPeer>())
+            {
+                if (p == null) continue;
+                var pid = GetPeerPlatformId(p);
+                if (!IsBannedId(pid, out var entry)) continue;
+
+                LogS.LogWarning($"[ServerGuard] Ban sweep: disconnecting {FormatPlayer(pid)} ({entry.reason})");
+                PostPlayerEvent(":no_entry:", pid, "was removed", "banned");
+                TryKick(p, $"{_settings.BanLayerKickMessage} ({entry.reason})");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] Ban sweep error: {ex.Message}");
+        }
+    }
+
+    // Pushes the ban into Valheim's banlist.txt via ZNet.Ban. Reflection because the
+    // overload set around Ban/InternalBan has shifted between builds.
+    private void TryVanillaBan(string platformId)
+    {
+        try
+        {
+            var znet = typeof(ZNet).GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null);
+            if (znet == null) return;
+
+            var banId = znet.GetType().GetMethod("Ban", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[] { typeof(string) }, null);
+            banId?.Invoke(znet, new object[] { platformId });
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] Vanilla ban mirror failed for {platformId}: {ex.Message}");
+        }
+    }
+
+    // Reads the SteamID off the peer's socket. Available from the moment the socket is
+    // accepted - earlier than m_platformUserID, which RPC_PeerInfo only populates after
+    // the client sends its peer-info package. Returns null when it can't be resolved.
+    private static string GetPeerSocketId(ZNetPeer peer)
+    {
+        try
+        {
+            var host = peer?.m_socket?.GetHostName();
+            if (string.IsNullOrWhiteSpace(host)) return null;
+            if (IsValidSteamId(host)) return host;
+            var extracted = ExtractSteamIdFromString(host);
+            return IsValidSteamId(extracted) ? extracted : null;
+        }
+        catch { return null; }
     }
 
     private void LoadAllowedMods()
@@ -1317,7 +2222,10 @@ public class Plugin : BaseUnityPlugin
             if (!_settings.EnableMetrics) return;
             _metrics.last_updated = DateTime.UtcNow;
             var doc = _metrics;
-            File.WriteAllText(MetricsYaml, _yamlOut.Serialize(doc));
+            // Full serializer: with OmitDefaults every counter still at 0 was dropped,
+            // so a quiet server wrote a metrics.yaml containing nothing but a timestamp
+            // and it looked like the counters didn't exist.
+            File.WriteAllText(MetricsYaml, _yamlOutFull.Serialize(doc));
         }
         catch (Exception ex)
         {
@@ -1521,7 +2429,22 @@ public class Plugin : BaseUnityPlugin
         return v?.ToString() ?? "CHAR_UNKNOWN";
     }
 
-    private bool IsAdmin(string platformId) => _admins.Contains(platformId);
+    // ---- Privilege predicates ----
+    //
+    // IsAdmin keeps its old meaning ("has staff bypasses") so every existing call site
+    // behaves as before, and owners inherit all of them by being a superset. Code that
+    // needs to distinguish the tiers calls IsOwner / IsModerator directly.
+    internal bool IsOwner(string platformId) =>
+        !string.IsNullOrWhiteSpace(platformId) && _owners.Contains(platformId);
+
+    private bool IsModerator(string platformId) =>
+        !string.IsNullOrWhiteSpace(platformId) && _admins.Contains(platformId);
+
+    private bool IsAdmin(string platformId) => IsModerator(platformId) || IsOwner(platformId);
+
+    // Human-readable tier, for `sg whois`, logs and the console-policy payload.
+    private string RoleOf(string platformId) =>
+        IsOwner(platformId) ? "owner" : IsModerator(platformId) ? "moderator" : "player";
 
     // Renders "<CharacterName> (<SteamID>)" for logs and Discord messages.
     //
@@ -1577,6 +2500,7 @@ public class Plugin : BaseUnityPlugin
             case RULE_HASH_MISMATCH:        return string.IsNullOrEmpty(detail) ? "mod file doesn't match the server's copy" : $"mod file doesn't match the server's copy ({detail})";
             case RULE_CHAR_NAME_LIMIT:      return "tried to use too many characters";
             case RULE_DEVCOMMAND_ATTEMPT:   return string.IsNullOrEmpty(detail) ? "tried to use cheats" : $"tried to use cheats (`{detail}`)";
+            case RULE_CONSOLE_COMMAND:      return string.IsNullOrEmpty(detail) ? "used a restricted console command" : $"used a restricted console command (`{detail}`)";
             case RULE_SPEED_HACK:           return string.IsNullOrEmpty(detail) ? "moved suspiciously fast" : $"moved suspiciously fast (~{detail})";
             case RULE_ILLEGAL_ITEM:         return string.IsNullOrEmpty(detail) ? "had an unknown item" : $"had an unknown item ({detail})";
             case RULE_STACK_OVERFLOW:       return string.IsNullOrEmpty(detail) ? "had an over-sized item stack" : $"had an over-sized item stack ({detail})";
@@ -1772,7 +2696,7 @@ public class Plugin : BaseUnityPlugin
 
         // 7. Admin list non-empty (warning if empty - sg commands won't be usable).
         Add("Admins configured", _admins.Count > 0,
-            _admins.Count > 0 ? $"{_admins.Count} admin SteamID(s) in admins.yaml" : "admins.yaml is empty - sg commands will be unusable");
+            _admins.Count > 0 ? $"{_admins.Count} moderator SteamID(s) in moderators.yaml" : "moderators.yaml is empty - sg commands will be unusable");
 
         return results;
     }
@@ -2245,6 +3169,17 @@ public class Plugin : BaseUnityPlugin
 
     private void AddViolation(string platformId, string rule, string detail = null)
     {
+        // Owner bypass. This is the single choke point every rule funnels through, so
+        // short-circuiting here means an owner can never accrue a strike, never reach
+        // the auto-ban threshold, and never generate a violation post - whatever the
+        // rule and whatever countAsViolation says.
+        if (IsOwner(platformId))
+        {
+            LogS.LogInfo($"[ServerGuard] {FormatPlayer(platformId)} is the owner - {rule} ignored"
+                + (string.IsNullOrEmpty(detail) ? "." : $" ({detail})."));
+            return;
+        }
+
         var counts = RuleCountsAsViolation(rule);
         var who = FormatPlayer(platformId);
 
@@ -2301,6 +3236,15 @@ public class Plugin : BaseUnityPlugin
             var pid = GetPeerPlatformId(peer);
             var who = FormatPlayer(pid);
 
+            // Owners are never removed by ServerGuard, from any code path - including
+            // `sg kick`, the attestation timeout, and the ban sweep. Locking yourself
+            // out of your own server should not be reachable through this mod.
+            if (IsOwner(pid))
+            {
+                LogS.LogInfo($"[ServerGuard] Refusing to disconnect {who} - owner. (Reason would have been: {reason})");
+                return;
+            }
+
             // Tell the client *why* it's being disconnected. Best-effort - even if this
             // fails (e.g. socket already torn down), the Disconnect call below still runs.
             try
@@ -2353,20 +3297,45 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    // Disconnects a peer with the "banned" status code so the client shows Valheim's
+    // own "You are banned" screen rather than a generic connection error. Used by the
+    // socket-accept ban gate, where the peer exists but nothing has been set up yet.
+    internal void DisconnectAsBanned(ZNetPeer peer)
+    {
+        if (peer == null) return;
+        try { peer.m_rpc?.Invoke("Error", (int)ZNet.ConnectionStatus.ErrorBanned); } catch { }
+        try { lock (_suppressLogoutFor) { _suppressLogoutFor.Add(peer.m_uid); } } catch { }
+        try { ZNet.instance?.Disconnect(peer); }
+        catch (Exception ex) { LogS.LogWarning($"[ServerGuard] DisconnectAsBanned failed: {ex.Message}"); }
+    }
+
+    // Auto-ban path (violation threshold reached). Routes through the ServerGuard ban
+    // layer so the ban is instant on the next connect attempt; AddBan mirrors it into
+    // Valheim's own list when banLayerMirrorToVanilla is on.
+    //
+    // When the layer is disabled the old behaviour (vanilla ban only) is preserved.
     private void TryBan(string platformId, string reason)
     {
         try
         {
-            var znet = typeof(ZNet).GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null);
-            if (znet == null) return;
-
-            var banId = znet.GetType().GetMethod("Ban", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[] { typeof(string) }, null);
-            if (banId != null)
+            if (!IsValidSteamId(platformId))
             {
-                banId.Invoke(znet, new object[] { platformId });
-                var who = FormatPlayer(platformId);
-                LogS.LogWarning($"[ServerGuard] Auto-banned {who}. Reason: {reason}");
+                LogS.LogWarning($"[ServerGuard] Refusing to ban non-SteamID value '{platformId}'.");
+                return;
             }
+
+            var who = FormatPlayer(platformId);
+
+            if (_settings != null && _settings.EnableBanLayer)
+            {
+                AddBan(platformId, reason, addedBy: "auto");
+                LogS.LogWarning($"[ServerGuard] Auto-banned {who}. Reason: {reason}");
+                SweepBannedPeers();
+                return;
+            }
+
+            TryVanillaBan(platformId);
+            LogS.LogWarning($"[ServerGuard] Auto-banned {who} (vanilla list only). Reason: {reason}");
         }
         catch (Exception ex)
         {
@@ -2375,6 +3344,57 @@ public class Plugin : BaseUnityPlugin
     }
 
     // -------------- Harmony Patches --------------
+
+    // PRIMARY ban gate.
+    //
+    // ZNet.IsAllowed(hostName, playerName) is called from inside RPC_PeerInfo, on the
+    // server, before the peer is accepted. Vanilla's own blacklist/whitelist check
+    // lives here; when it returns false the caller invokes "Error" with
+    // ConnectionStatus.ErrorBanned (8) on the peer's rpc and returns immediately - no
+    // character is spawned, no ZDOs are sent, nothing is registered.
+    //
+    // `hostName` is the socket's host name, which for a Steam socket is the SteamID64
+    // (ZSteamSocket.GetHostName returns m_peerID.GetSteamID().ToString()). That makes
+    // this the earliest point in the handshake where the ID is both known and
+    // actionable, which is exactly the guarantee we want: a banned SteamID never
+    // completes a connection.
+    //
+    // Postfix (not prefix) so vanilla's own decision runs first - we only ever turn an
+    // allow into a deny, never the reverse.
+    [HarmonyPatch(typeof(ZNet), "IsAllowed")]
+    public static class Patch_ZNet_IsAllowed
+    {
+        public static void Postfix(string hostName, string playerName, ref bool __result)
+        {
+            try
+            {
+                if (!__result) return;                       // already denied by vanilla
+                if (Plugin.Instance == null) return;
+                if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+                if (!Plugin.Instance.IsBannedId(hostName, out var entry)) return;
+
+                __result = false;
+
+                var who = Plugin.Instance.FormatPlayer(entry.id);
+                var name = string.IsNullOrWhiteSpace(playerName) ? "?" : playerName;
+                Plugin.LogS.LogWarning($"[ServerGuard] Refused banned SteamID at handshake: {who} (character '{name}') — {entry.reason}");
+                Plugin.Instance.PostAdminEvent($":no_entry_sign: Blocked banned **{who}** at connect — {entry.reason}");
+
+                if (Plugin.Instance._settings.EnableMetrics)
+                {
+                    Plugin.Instance._metrics.ban_layer_blocks++;
+                    Plugin.Instance.SaveMetrics();
+                }
+            }
+            catch (Exception ex)
+            {
+                // Never let this throw - an exception here would break every login.
+                Plugin.LogS?.LogError($"[ServerGuard] IsAllowed ban gate error: {ex}");
+            }
+        }
+    }
+
     [HarmonyPatch(typeof(ZNet), "OnNewConnection")]
     public static class Patch_OnNewConnection
     {
@@ -2384,6 +3404,27 @@ public class Plugin : BaseUnityPlugin
             {
                 if (peer == null || peer.m_rpc == null) return;
                 if (!ZNet.instance || !ZNet.instance.IsServer()) return;
+
+                // SECONDARY ban gate, one step earlier than Patch_ZNet_IsAllowed.
+                // The socket is already accepted here but the client has not sent its
+                // peer info yet, so this fires before RPC_PeerInfo runs at all. On
+                // Steam the socket host name is the SteamID64, which means a banned
+                // player is dropped without ever getting a PeerInfo round-trip. We
+                // return before registering any handler or issuing a challenge.
+                var socketId = Plugin.GetPeerSocketId(peer);
+                if (Plugin.Instance.IsBannedId(socketId, out var banEntry))
+                {
+                    var banned = Plugin.Instance.FormatPlayer(banEntry.id);
+                    Plugin.LogS.LogWarning($"[ServerGuard] Refused banned SteamID at socket accept: {banned} — {banEntry.reason}");
+                    Plugin.Instance.PostAdminEvent($":no_entry_sign: Blocked banned **{banned}** at socket accept — {banEntry.reason}");
+                    if (Plugin.Instance._settings.EnableMetrics)
+                    {
+                        Plugin.Instance._metrics.ban_layer_blocks++;
+                        Plugin.Instance.SaveMetrics();
+                    }
+                    Plugin.Instance.DisconnectAsBanned(peer);
+                    return;
+                }
 
                 var pid   = Plugin.GetPeerPlatformId(peer);
                 Plugin.LogS.LogInfo($"[ServerGuard] Incoming connection: {Plugin.Instance.FormatPlayer(pid)}");
@@ -2460,9 +3501,13 @@ public class Plugin : BaseUnityPlugin
                 // swallow the first-spawn "I have arrived!" shout.
                 Plugin.Instance.SendArrivalShoutPolicy(peer);
 
+                // Console policy. Also pushed to every peer including admins, since
+                // the payload carries the caller's own admin flag.
+                Plugin.Instance.SendConsolePolicy(peer);
+
                 if (Plugin.Instance.IsAdmin(pid))
                 {
-                    Plugin.LogS.LogInfo($"[ServerGuard] {Plugin.Instance.FormatPlayer(pid)} is admin - skipping attestation challenge.");
+                    Plugin.LogS.LogInfo($"[ServerGuard] {Plugin.Instance.FormatPlayer(pid)} is {Plugin.Instance.RoleOf(pid)} - skipping attestation challenge.");
                     if (Plugin.Instance._settings.EnableMetrics)
                     {
                         Plugin.Instance._metrics.admin_bypasses++;
@@ -2471,7 +3516,10 @@ public class Plugin : BaseUnityPlugin
                     // Admins skip attestation, so the "joined" event from OnManifestReceived
                     // never fires for them. Fire it here so admins still show up in the
                     // admin channel (PostPlayerEvent routes admin events away from public).
-                    Plugin.Instance.PostPlayerEvent(":shield:", pid, "joined as admin");
+                    Plugin.Instance.PostPlayerEvent(
+                        Plugin.Instance.IsOwner(pid) ? ":crown:" : ":shield:",
+                        pid,
+                        Plugin.Instance.IsOwner(pid) ? "joined as owner" : "joined as moderator");
                     return;
                 }
 
@@ -2625,10 +3673,15 @@ public class Plugin : BaseUnityPlugin
         if (_settings == null || !_settings.EnableForceMapPositions) return false;
         if (peer.m_publicRefPos) return false;   // already sharing - nothing to do
 
+        var platformId = GetPeerPlatformId(peer);
+
+        // Owners are exempt unconditionally - forceMapPositionsExemptAdmins only
+        // controls the moderator tier.
+        if (IsOwner(platformId)) return false;
+
         if (_settings.ForceMapPositionsExemptAdmins)
         {
-            var platformId = GetPeerPlatformId(peer);
-            if (!string.IsNullOrEmpty(platformId) && IsAdmin(platformId)) return false;
+            if (!string.IsNullOrEmpty(platformId) && IsModerator(platformId)) return false;
         }
 
         peer.m_publicRefPos = true;
@@ -3376,7 +4429,7 @@ public class Plugin : BaseUnityPlugin
     //
     // The companion plugin intercepts in-game chat lines starting with `/sg` and
     // sends the raw text via ServerGuard_AdminCommand. The server:
-    //   1. Verifies the sender is in admins.yaml (defense against forged RPCs).
+    //   1. Verifies the sender is in moderators.yaml or owners.yaml (defense against forged RPCs).
     //   2. Parses the command and dispatches to a handler.
     //   3. Builds a reply string (multi-line, \n-separated).
     //   4. Sends the reply via ServerGuard_AdminCommandReply back to the same peer.
@@ -3399,7 +4452,7 @@ public class Plugin : BaseUnityPlugin
             if (!IsAdmin(senderSteamId))
             {
                 LogS.LogWarning($"[ServerGuard] Non-admin {FormatPlayer(senderSteamId)} attempted sg command - ignored.");
-                ReplyToAdmin(peer, "You are not an admin. Add your SteamID to admins.yaml on the server.");
+                ReplyToAdmin(peer, "You are not a moderator. Add your SteamID to moderators.yaml (or owners.yaml) on the server.");
                 return;
             }
 
@@ -3409,7 +4462,8 @@ public class Plugin : BaseUnityPlugin
             // that have side effects (mutating commands) - skip read-only queries to
             // keep the channel readable.
             var firstToken = (command ?? "").TrimStart().Split(' ').FirstOrDefault()?.ToLowerInvariant() ?? "";
-            var mutating = firstToken == "reload" || firstToken == "pardon" || firstToken == "kick";
+            var mutating = firstToken == "reload" || firstToken == "pardon" || firstToken == "kick"
+                        || firstToken == "ban"    || firstToken == "unban";
             if (mutating)
             {
                 PostAdminEvent($":hammer_and_wrench: **{FormatPlayer(senderSteamId)}** ran `sg {command}`");
@@ -3457,6 +4511,9 @@ public class Plugin : BaseUnityPlugin
             case "violations": return CmdViolations(args);
             case "pardon":     return CmdPardon(args);
             case "kick":       return CmdKick(args, callerSteamId);
+            case "ban":        return CmdBan(args, callerSteamId);
+            case "unban":      return CmdUnban(args);
+            case "bans":       return CmdBans(args);
             case "build":      return CmdBuild(args, actionFilter: null,      label: "event");
             case "destroyed":  return CmdBuild(args, actionFilter: "destroy", label: "destroy");
             case "placed":     return CmdBuild(args, actionFilter: "place",   label: "placement");
@@ -3477,6 +4534,9 @@ public class Plugin : BaseUnityPlugin
         sb.AppendLine("  sg violations [<n>]                      - top N players by violation count");
         sb.AppendLine("  sg pardon <steamid>                      - clear a player's violations");
         sb.AppendLine("  sg kick <steamid> [reason]               - kick a player");
+        sb.AppendLine("  sg ban <steamid> [for <N>d|h] [reason]   - ban a SteamID (blocked at connect)");
+        sb.AppendLine("  sg unban <steamid>                       - lift a ServerGuard ban");
+        sb.AppendLine("  sg bans [<n>]                            - list active bans (default 20)");
         sb.AppendLine("  sg build at <x> <z> [radius] [days]      - all events near coords (radius 50, days 7)");
         sb.AppendLine("  sg build by <steamid|name> [days]        - all events by a player");
         sb.AppendLine("  sg build today [<n>]                     - last N events today (default 10)");
@@ -3489,7 +4549,7 @@ public class Plugin : BaseUnityPlugin
     private string CmdStatus()
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"[ServerGuard] v1.6.3  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
+        sb.AppendLine($"[ServerGuard] v1.7.0  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
         sb.AppendLine($"  Allowlist  required={_requiredMods.Count}  allowed={_allowedMods.Count}  banned={_bannedMods.Count}");
         sb.AppendLine($"  Modset     loose={ModsetFingerprint.Short(_modsetFingerprintLoose)}  strict={ModsetFingerprint.Short(_modsetFingerprintStrict)}");
         try
@@ -3501,6 +4561,14 @@ public class Plugin : BaseUnityPlugin
         sb.AppendLine($"  Violators  {_violations.Count} player(s) with strikes recorded");
         sb.AppendLine($"  MapForce   {(_settings.EnableForceMapPositions ? "ON" : "off")}"
                       + (_settings.EnableForceMapPositions && _settings.ForceMapPositionsExemptAdmins ? "  (admins exempt)" : ""));
+        int activeBans;
+        lock (_bansLock) { var now = DateTime.UtcNow; activeBans = _bans.Values.Count(e => e != null && !e.IsExpired(now)); }
+        sb.AppendLine($"  BanLayer   {(_settings.EnableBanLayer ? "ON" : "off")}  {activeBans} active ban(s)"
+                      + (_settings.EnableBanLayer && _settings.BanLayerMirrorToVanilla ? "  (mirrored to banlist.txt)" : ""));
+        sb.AppendLine($"  Console    mode={NormalizedConsoleMode()}  binds={NormalizedBindPolicy()}"
+                      + (_settings.ConsoleGuardExemptModerators ? "  (moderators exempt)" : "")
+                      + "  (owners always exempt)");
+        sb.AppendLine($"  Staff      {_owners.Count} owner(s)  {_admins.Count} moderator(s)");
         return sb.ToString().TrimEnd();
     }
 
@@ -3527,9 +4595,11 @@ public class Plugin : BaseUnityPlugin
         try
         {
             LoadSettings();
+            LoadOwners();
             LoadAdmins();
+            LoadBans();
             LoadAllowedMods();
-            return "[ServerGuard] reloaded settings.yaml, admins.yaml, allowed_mods.yaml.";
+            return "[ServerGuard] reloaded settings.yaml, owners.yaml, moderators.yaml, bans.yaml, allowed_mods.yaml.";
         }
         catch (Exception ex)
         {
@@ -3584,7 +4654,8 @@ public class Plugin : BaseUnityPlugin
                 }
             }
             catch { }
-            sb.AppendLine($"      online={(online ? "yes" : "no")}  admin={(IsAdmin(steamId) ? "yes" : "no")}");
+            sb.AppendLine($"      online={(online ? "yes" : "no")}  role={RoleOf(steamId)}"
+                          + (IsBannedId(steamId, out var whoisBan) ? $"  BANNED ({whoisBan.reason})" : ""));
         }
         return sb.ToString().TrimEnd();
     }
@@ -3703,6 +4774,137 @@ public class Plugin : BaseUnityPlugin
         var reason = args.Length > 1 ? string.Join(" ", args.Skip(1)) : "Kicked by admin.";
         TryKick(target, reason);
         return $"Kicked {FormatPlayer(targetSteamId)}. Reason: {reason}";
+    }
+
+    // -------- Ban layer commands --------
+
+    // sg ban <steamid|name> [for <N>d|h|m] [reason...]
+    //
+    // The target does not have to be online - a SteamID can be banned pre-emptively.
+    // Names only resolve for players ServerGuard has already seen (registrations).
+    private string CmdBan(string[] args, string callerSteamId)
+    {
+        if (args.Length == 0) return "Usage: sg ban <steamid> [for <N>d|h|m] [reason]";
+        if (_settings == null || !_settings.EnableBanLayer)
+            return "Ban layer is disabled (enableBanLayer: false in settings.yaml).";
+
+        // An unknown 17-digit ID is a legitimate pre-emptive ban, so accept it as-is
+        // rather than insisting the query resolve to a known player.
+        string targetSteamId;
+        var raw = args[0].Trim();
+        if (IsValidSteamId(raw))
+        {
+            targetSteamId = raw;
+        }
+        else
+        {
+            var resolved = ResolvePlayerQuery(raw);
+            if (resolved.Count == 0) return $"No SteamID matched `{raw}`. Pass a full 17-digit SteamID to ban an unseen player.";
+            if (resolved.Count > 1) return $"Ambiguous - {resolved.Count} players match. Pass an exact SteamID.";
+            targetSteamId = resolved[0];
+        }
+
+        if (string.Equals(targetSteamId, callerSteamId, StringComparison.Ordinal))
+            return "Refusing to ban yourself.";
+        if (IsOwner(targetSteamId))
+            return $"{FormatPlayer(targetSteamId)} is an owner and cannot be banned.";
+        if (IsModerator(targetSteamId))
+            return $"{FormatPlayer(targetSteamId)} is a moderator. Remove them from moderators.yaml first.";
+
+        // Optional "for <N><unit>" duration prefix on the reason.
+        var rest = args.Skip(1).ToArray();
+        var expiresIso = "";
+        var durationLabel = "permanent";
+        if (rest.Length >= 2 && string.Equals(rest[0], "for", StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryParseDuration(rest[1], out var span))
+            {
+                expiresIso    = DateTime.UtcNow.Add(span).ToString("o");
+                durationLabel = $"expires {DateTime.UtcNow.Add(span):yyyy-MM-dd HH:mm} UTC";
+                rest = rest.Skip(2).ToArray();
+            }
+            else
+            {
+                return $"Could not parse duration `{rest[1]}`. Use forms like 7d, 12h, 30m.";
+            }
+        }
+
+        var reason = rest.Length > 0 ? string.Join(" ", rest) : "Banned by admin.";
+        AddBan(targetSteamId, reason, addedBy: callerSteamId, expiresIso: expiresIso);
+
+        PostPlayerEvent(":no_entry:", targetSteamId, "was banned", reason);
+        PostAdminEvent($":no_entry: **{FormatPlayer(callerSteamId)}** banned **{FormatPlayer(targetSteamId)}** ({durationLabel}) — {reason}");
+
+        // Remove them right now if they're already in the world.
+        SweepBannedPeers();
+
+        return $"Banned {FormatPlayer(targetSteamId)} ({durationLabel}). Reason: {reason}";
+    }
+
+    private string CmdUnban(string[] args)
+    {
+        if (args.Length == 0) return "Usage: sg unban <steamid>";
+        var raw = args[0].Trim();
+        var targetSteamId = IsValidSteamId(raw) ? raw : ExtractSteamIdFromString(raw);
+        if (!IsValidSteamId(targetSteamId))
+        {
+            var resolved = ResolvePlayerQuery(raw);
+            if (resolved.Count == 0) return $"No SteamID matched `{raw}`.";
+            if (resolved.Count > 1) return $"Ambiguous - {resolved.Count} players match. Pass an exact SteamID.";
+            targetSteamId = resolved[0];
+        }
+
+        if (!RemoveBan(targetSteamId)) return $"{FormatPlayer(targetSteamId)} is not in the ServerGuard ban list.";
+
+        PostAdminEvent($":white_check_mark: Unbanned **{FormatPlayer(targetSteamId)}**");
+        return $"Unbanned {FormatPlayer(targetSteamId)}."
+             + (_settings.BanLayerMirrorToVanilla ? " Note: Valheim's own banlist.txt still holds an entry - clear it with the vanilla `unban` command if needed." : "");
+    }
+
+    private string CmdBans(string[] args)
+    {
+        int limit = 20;
+        if (args.Length > 0 && int.TryParse(args[0], out var n) && n > 0) limit = n;
+
+        List<BanEntry> list;
+        lock (_bansLock) { list = _bans.Values.Where(e => e != null).ToList(); }
+
+        var now = DateTime.UtcNow;
+        list = list.Where(e => !e.IsExpired(now)).OrderBy(e => e.added, StringComparer.Ordinal).ToList();
+
+        if (list.Count == 0) return "No active ServerGuard bans.";
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"[ServerGuard] {list.Count} active ban(s), showing up to {limit}:");
+        foreach (var e in list.Take(limit))
+        {
+            var when = e.TryGetExpiry(out var exp) ? $"until {exp:yyyy-MM-dd HH:mm}Z" : "permanent";
+            sb.AppendLine($"  {e.id}  [{when}]  {e.reason}");
+        }
+        if (list.Count > limit) sb.AppendLine($"  ... and {list.Count - limit} more (see conf/bans.yaml)");
+        return sb.ToString().TrimEnd();
+    }
+
+    // Parses "7d", "12h", "30m", "45s" (also bare digits = days) into a TimeSpan.
+    private static bool TryParseDuration(string text, out TimeSpan span)
+    {
+        span = TimeSpan.Zero;
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        text = text.Trim().ToLowerInvariant();
+
+        var unit = text[text.Length - 1];
+        var numberPart = char.IsDigit(unit) ? text : text.Substring(0, text.Length - 1);
+        if (!double.TryParse(numberPart, System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var value) || value <= 0) return false;
+
+        switch (char.IsDigit(unit) ? 'd' : unit)
+        {
+            case 'd': span = TimeSpan.FromDays(value);    return true;
+            case 'h': span = TimeSpan.FromHours(value);   return true;
+            case 'm': span = TimeSpan.FromMinutes(value); return true;
+            case 's': span = TimeSpan.FromSeconds(value); return true;
+            default:  return false;
+        }
     }
 
     // -------- Build-log query commands (#14 + #16 integration) --------
@@ -4063,7 +5265,7 @@ public class Plugin : BaseUnityPlugin
 
             if (IsAdmin(steamId))
             {
-                LogS.LogInfo($"[ServerGuard] {who} (admin) animation-cancel via {src} - ignoring.");
+                LogS.LogInfo($"[ServerGuard] {who} ({RoleOf(steamId)}) animation-cancel via {src} - ignoring.");
                 return;
             }
 
@@ -4080,29 +5282,60 @@ public class Plugin : BaseUnityPlugin
     // Handles ServerGuard_DevcommandAttempt RPC. Called when the companion plugin
     // intercepts a `devcommands` (or other blocked) command client-side. The cheat is
     // already prevented locally; this handler is purely for visibility + accounting.
+    // Payload is either a bare command name (companions up to 1.6.3) or
+    // "<command>|<category>" where category is one of:
+    //   "cheat"      - devcommands / debugmode / anything Valheim flags IsCheat
+    //   "risky"      - non-cheat command on the built-in or operator blocklist
+    //   "bind"       - a bind/unbind attempt under a restrictive bindPolicy
+    //   "notallowed" - anything at all, under whitelist mode
+    //
+    // Only the "cheat" category is treated as a cheat attempt (public post +
+    // DevcommandAttempt strike). The rest are console-policy violations: admin
+    // channel only, and they carry their own rule key so operators decide whether
+    // they count toward auto-ban.
     public void OnDevcommandAttemptReceived(ZNetPeer peer, string command)
     {
         try
         {
             if (peer == null) return;
             if (!_settings.EnableDevcommandGate) return;
+            if (!_settings.ConsoleGuardReportAttempts) return;
 
             var steamId = GetPeerPlatformId(peer);
             var who     = FormatPlayer(steamId);
-            var cmd     = (command ?? "").Trim();
+
+            var raw = (command ?? "").Trim();
+            var sep = raw.IndexOf('|');
+            var cmd      = sep >= 0 ? raw.Substring(0, sep).Trim()     : raw;
+            var category = sep >= 0 ? raw.Substring(sep + 1).Trim().ToLowerInvariant() : "cheat";
+
             if (cmd.Length > 64) cmd = cmd.Substring(0, 64); // bound any client-supplied string
             if (string.IsNullOrWhiteSpace(cmd)) cmd = "(unknown)";
 
             // Admin bypass - operators may legitimately use console for moderation.
             if (IsAdmin(steamId))
             {
-                LogS.LogInfo($"[ServerGuard] {who} (admin) used `{cmd}` - bypassing devcommand gate.");
+                LogS.LogInfo($"[ServerGuard] {who} ({RoleOf(steamId)}) used `{cmd}` - bypassing console gate.");
                 return;
             }
 
-            LogS.LogWarning($"[ServerGuard] {who} attempted blocked command `{cmd}` (companion gate blocked it client-side).");
-            PostPlayerEvent(":no_entry_sign:", steamId, "tried to use cheats", $"`{cmd}`");
-            AddViolation(steamId, RULE_DEVCOMMAND_ATTEMPT, cmd);
+            if (_settings.EnableMetrics)
+            {
+                _metrics.console_blocks++;
+                SaveMetrics();
+            }
+
+            if (category == "cheat")
+            {
+                LogS.LogWarning($"[ServerGuard] {who} attempted cheat command `{cmd}` (companion gate blocked it client-side).");
+                PostPlayerEvent(":no_entry_sign:", steamId, "tried to use cheats", $"`{cmd}`");
+                AddViolation(steamId, RULE_DEVCOMMAND_ATTEMPT, cmd);
+                return;
+            }
+
+            LogS.LogWarning($"[ServerGuard] {who} attempted restricted console command `{cmd}` ({category}) - blocked client-side.");
+            PostAdminEvent($":no_entry_sign: **{who}** tried restricted console command `{cmd}` ({category})");
+            AddViolation(steamId, RULE_CONSOLE_COMMAND, $"{cmd} ({category})");
         }
         catch (Exception ex)
         {
@@ -4289,15 +5522,19 @@ public class Plugin : BaseUnityPlugin
     private void StartWatchers()
     {
         _watchSettings = MakeWatcher(SettingsYaml,     () => LoadSettings());
-        _watchAdmins   = MakeWatcher(AdminsYaml,       () => LoadAdmins());
+        _watchAdmins   = MakeWatcher(ModeratorsYaml,   () => LoadAdmins());
+        _watchOwners   = MakeWatcher(OwnersYaml,       () => LoadOwners());
         _watchAllowed  = MakeWatcher(AllowedModsYaml,  () => LoadAllowedMods());
+        _watchBans     = MakeWatcher(BansYaml,         () => LoadBans());
     }
 
     private void StopWatchers()
     {
         try { _watchSettings?.Dispose(); } catch { }
         try { _watchAdmins?.Dispose(); } catch { }
+        try { _watchOwners?.Dispose(); } catch { }
         try { _watchAllowed?.Dispose(); } catch { }
+        try { _watchBans?.Dispose(); } catch { }
     }
 
     private FileSystemWatcher MakeWatcher(string filePath, Action reloadAction)
@@ -4387,6 +5624,8 @@ public class Plugin : BaseUnityPlugin
             var items = _settings.CheatItems;
             if (items == null || items.Count == 0) return;
             if (peer?.m_rpc == null) return;
+            // Owners keep whatever is in their inventory.
+            if (IsOwner(GetPeerPlatformId(peer))) return;
 
             var payload = string.Join(",", items.Where(s => !string.IsNullOrWhiteSpace(s)));
             if (string.IsNullOrEmpty(payload)) return;
@@ -4397,6 +5636,89 @@ public class Plugin : BaseUnityPlugin
         catch (Exception ex)
         {
             LogS.LogWarning($"[ServerGuard] SendCheatItemRemovalIfEnabled failed: {ex.Message}");
+        }
+    }
+
+    // ==================== Console guard policy ====================
+    //
+    // Tells one peer's companion how the console is allowed to behave on this server.
+    // Sent on connect (before the admin early-return, so admins get it too) and
+    // re-broadcast to everyone online whenever settings.yaml is reloaded.
+    //
+    // Payload is 6 pipe-separated fields:
+    //   mode | exempt | role | bindPolicy | blockedCsv | allowedCsv
+    //
+    // `exempt` is resolved server-side (owner always; moderator when
+    // consoleGuardExemptModerators is on) so the client never has to reason about
+    // tiers - it just honours a yes/no. `role` is carried for the client log only.
+    //
+    // The client cannot be trusted to enforce this - a player running an unmodified
+    // or hacked client simply won't. It is the companion-attestation handshake that
+    // makes the policy meaningful: a client that isn't running our companion doesn't
+    // get in at all (requireCompanion), and the manifest hash check catches a
+    // tampered companion DLL. This RPC is the configuration channel, not the
+    // security boundary.
+    private static readonly string[] VALID_CONSOLE_MODES  = { "open", "restricted", "whitelist", "disabled" };
+    private static readonly string[] VALID_BIND_POLICIES  = { "allow", "block", "purge", "wipe" };
+
+    private string NormalizedConsoleMode()
+    {
+        var m = (_settings?.ConsoleGuardMode ?? "restricted").Trim().ToLowerInvariant();
+        return VALID_CONSOLE_MODES.Contains(m) ? m : "restricted";
+    }
+
+    private string NormalizedBindPolicy()
+    {
+        var p = (_settings?.ConsoleGuardBindPolicy ?? "purge").Trim().ToLowerInvariant();
+        return VALID_BIND_POLICIES.Contains(p) ? p : "purge";
+    }
+
+    private void SendConsolePolicy(ZNetPeer peer)
+    {
+        try
+        {
+            if (peer?.m_rpc == null || _settings == null) return;
+
+            var pid  = GetPeerPlatformId(peer);
+            var role = RoleOf(pid);
+
+            // Owners are exempt unconditionally; moderators only when the setting says so.
+            var exempt = IsOwner(pid) || (IsModerator(pid) && _settings.ConsoleGuardExemptModerators);
+
+            var blocked = string.Join(",", (_settings.ConsoleBlockedCommands ?? new List<string>())
+                .Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim().ToLowerInvariant()));
+            var allowed = string.Join(",", (_settings.ConsoleAllowedCommands ?? new List<string>())
+                .Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim().ToLowerInvariant()));
+
+            var payload = string.Join("|", new[]
+            {
+                NormalizedConsoleMode(),
+                exempt ? "1" : "0",
+                role,
+                NormalizedBindPolicy(),
+                blocked,
+                allowed,
+            });
+
+            peer.m_rpc.Invoke("ServerGuard_ConsolePolicy", payload);
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] SendConsolePolicy failed: {ex.Message}");
+        }
+    }
+
+    private void BroadcastConsolePolicy()
+    {
+        try
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            foreach (var p in ZNet.instance.GetPeers()?.ToList() ?? new List<ZNetPeer>())
+                SendConsolePolicy(p);
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] BroadcastConsolePolicy failed: {ex.Message}");
         }
     }
 

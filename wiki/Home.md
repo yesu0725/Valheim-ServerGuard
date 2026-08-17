@@ -10,6 +10,8 @@ A dedicated-server mod for Valheim that locks the server to a specific modpack, 
 - **[Discord Integration](Discord-Integration)** — public + admin channels, raid alerts, shouts, and the daily summary.
 - **[Admin Commands](Admin-Commands)** — full `sg` console reference.
 - **[Anti-Cheat Features](Anti-Cheat-Features)** — every rule, how it works, how to tune it, and the violations system.
+- **[Bans and Console Guard](Bans-and-Console-Guard)** — instant SteamID bans, console command gating, and key-bind removal.
+- **[Privilege Tiers](Privilege-Tiers)** — owner vs moderator vs player, and what each one bypasses.
 - **[Forensic Logs](Forensic-Logs)** — death log + build/destroy heatmap CSVs.
 - **[Quick Login Panel](Quick-Login)** — optional one-click title-screen join for your community (client-side).
 - **[Troubleshooting](Troubleshooting)** — common issues and how to fix them.
@@ -26,7 +28,7 @@ A toolkit for running a curated-modpack server: keep the wrong people out, catch
 
 ## Versioning
 
-Server and companion versions must match (1.6.3 ↔ 1.6.3). If you update one, update the other.
+Server and companion versions must match (1.7.0 ↔ 1.7.0). If you update one, update the other.
 
 ## Try it out
 

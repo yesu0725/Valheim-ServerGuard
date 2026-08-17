@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.0
+
+Feature release. Install alongside the 1.7.0 server plugin — this version enforces the server's new console policy, and an older companion will ignore it.
+
+### New
+- **Console guard.** The server decides what the F5 console may run: everything (as before), a restricted set, a whitelist, or nothing at all — the console can be locked shut entirely. Blocked commands print a short explanation instead of silently doing nothing. Servers that don't set a policy behave exactly as they did in 1.6.3, and single-player is never affected.
+- **Wider command coverage.** The blocked set grew from 27 to roughly 90 commands, split into cheat commands and non-cheat commands that still change shared world state (`nomap`, `noportals`, `setworldmodifier`, `setworldpreset`, `optterrain`, `resetsharedmap`, `printseeds` and others). Chat, emotes, `/s`, `/w`, display settings and the crafting-list commands are untouched.
+- **Key binds are cleared while you're on a guarded server.** If your server sets a bind policy, your custom console key binds are removed for that session and the `bind` command is blocked. They come back on their own in single-player — the mod clears the live list, not your saved settings. (A server can choose `wipe`, which does delete them permanently; you'll get a message in the console when binds are removed either way.)
+- **Everything is restored when you disconnect.** Leaving a server that locked the console down gives you your console and binds back immediately — no restart needed.
+
+### Fixed
+- **Cheat commands added by other mods are now detected.** The check that asks Valheim "is this a cheat command?" was reading the wrong internal table and always came back no, so it only ever caught the hard-coded list. It now reads the real command registry, which means cheat commands registered by any mod are caught too.
+
 ## 1.6.3
 
 Bug-fix release. Install alongside the 1.6.3 server plugin.

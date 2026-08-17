@@ -4,7 +4,7 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard-Client</AssemblyName>
     <RootNamespace>ValheimServerGuardClient</RootNamespace>
-    <Version>1.6.3</Version>
+    <Version>1.7.0</Version>
     <Description>Valheim ServerGuard Client - companion plugin that attests the client's mod list to a ServerGuard-protected server</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
@@ -78,10 +78,10 @@
     silent no-op on machines without that folder - safe to commit.
     Override the destination with the SERVERGUARD_TEST_CLIENT_DIR env var if needed.
 
-    Must be the TaegukGaming-Valheim_ServerGuard_Client mod subfolder, NEVER the
+    Destination is the TaegukGaming-Valheim_ServerGuard_Client mod subfolder, NEVER the
     BepInEx\plugins root: Gale installs the mod into that subfolder, BepInEx scans
     recursively, and a second copy at the root loads the plugin twice - the duplicate
-    GUID then makes one instance fail.
+    GUID then makes one instance fail, non-deterministically.
   -->
   <Target Name="CopyToTestClient" AfterTargets="Build">
     <PropertyGroup>
@@ -95,6 +95,13 @@
       SkipUnchangedFiles="false" />
     <Message Importance="high" Text="[ServerGuard.Client] Client DLL copied to: $(_ServerGuardTestClientDir)" Condition="Exists('$(_ServerGuardTestClientDir)')" />
     <Message Importance="high" Text="[ServerGuard.Client] Skipped client-DLL copy (path missing): $(_ServerGuardTestClientDir)" Condition="!Exists('$(_ServerGuardTestClientDir)')" />
+    <!--
+      Guard against the loose-DLL mistake in the other direction: a stray copy sitting
+      at the plugins root alongside this mod folder also duplicates the GUID.
+    -->
+    <Warning
+      Text="[ServerGuard.Client] Stray copy found at the plugins root ($(_ServerGuardTestClientDir)\..\Valheim-ServerGuard-Client.dll). BepInEx scans recursively, so it loads twice and one instance fails on the duplicate GUID. Delete the loose file."
+      Condition="Exists('$(_ServerGuardTestClientDir)\..\Valheim-ServerGuard-Client.dll')" />
   </Target>
 
 </Project>

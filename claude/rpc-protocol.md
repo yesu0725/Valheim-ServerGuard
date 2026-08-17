@@ -52,6 +52,23 @@ If an admin connects and `Register` hasn't run yet, their companion's RPCs arriv
 
 ---
 
+### `ServerGuard_ConsolePolicy`
+- **Sender:** `SendConsolePolicy(peer)` — from `Patch_OnNewConnection` (before the admin early-return) and from `BroadcastConsolePolicy()` on every settings.yaml, admins.yaml *and* owners.yaml hot-reload
+- **Payload:** `string` — 6 pipe-separated fields
+  ```
+  mode|exempt|role|bindPolicy|blockedCsv|allowedCsv
+  ```
+  - `mode`: `open` / `restricted` / `whitelist` / `disabled`
+  - `exempt`: `"1"` / `"0"` — resolved **server-side** (owner always; moderator when `consoleGuardExemptModerators`), so the client never models the tiers
+  - `role`: `owner` / `moderator` / `player` — carried for the client log line only, never for a decision
+  - `bindPolicy`: `allow` / `block` / `purge` / `wipe`
+  - `blockedCsv`, `allowedCsv`: comma-separated lowercase command names, may be empty
+- **Client handler:** `ClientPlugin.OnConsolePolicyReceived(payload)` — sets the static policy fields, then calls `ApplyBindPolicy()`
+- **Default when never sent:** `restricted` mode, `allow` bind policy (pre-1.7 behaviour, so an older server is unaffected)
+- **Reset:** `Patch_ZNet_Shutdown_ResetPolicy` restores defaults on disconnect, so leaving a `disabled`-mode server doesn't leave the local console dead in single-player
+
+---
+
 ## Client → Server RPCs (client invokes, server receives)
 
 All registered in `Patch_OnNewConnection` on the server side.
@@ -73,9 +90,12 @@ All registered in `Patch_OnNewConnection` on the server side.
 ---
 
 ### `ServerGuard_DevcommandAttempt`
-- **Sender:** `Patch_TryRunCommand` on client when a blocked command is typed
-- **Payload:** `string command` — the command that was attempted (e.g. `"god"`)
+- **Sender:** `Patch_TryRunCommand` on client when a blocked command is typed (or fired by a key bind)
+- **Payload:** `string` — `"<command>|<category>"`, category ∈ `cheat` / `risky` / `bind` / `notallowed`
 - **Server handler:** `OnDevcommandAttemptReceived(peer, command)`
+  - `cheat` → public Discord post + `DevcommandAttempt` violation
+  - everything else → admin channel only + `ConsoleCommandBlocked` violation
+- **Back-compat:** companions ≤1.6.3 send a bare command name with no `|`; the server treats a missing category as `cheat`, preserving the old behaviour
 
 ---
 

@@ -10,7 +10,7 @@ ServerGuard has two pieces — the **server mod** and a **client companion**. Bo
    - Manager: install the Thunderstore package onto the server profile.
 3. Start the server. First boot creates:
    - `BepInEx/config/ServerGuard/conf/settings.yaml` — main config, with a freshly-generated `sharedSecret`.
-   - `BepInEx/config/ServerGuard/conf/admins.yaml` — empty list. Add your own SteamID to use admin commands.
+   - `BepInEx/config/ServerGuard/conf/moderators.yaml` and `owners.yaml` — both empty. Add your SteamID to `owners.yaml` (see [Privilege Tiers](Privilege-Tiers)).
    - `BepInEx/config/ServerGuard/conf/allowed_mods.yaml` — empty allowlist. You'll populate this in step 5.
 4. Note the `sharedSecret` value printed in the server log on the first start:
    ```

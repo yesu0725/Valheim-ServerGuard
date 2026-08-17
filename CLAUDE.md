@@ -9,7 +9,7 @@ Read this first, then follow links to sub-files for deep detail.
 
 | Item | Value |
 |---|---|
-| **Current version** | 1.6.3 |
+| **Current version** | 1.7.0 |
 | **Server GUID** | `com.taeguk.valheim.serverguard` |
 | **Client GUID** | `com.taeguk.valheim.serverguard.client` |
 | **Target framework** | net462 (Mono, .NET Framework 4.6.2) |
@@ -39,6 +39,9 @@ Valheim-ServerGuard/
 │   ├── harmony-patterns.md
 │   ├── rpc-protocol.md
 │   ├── features-and-rules.md
+│   ├── ban-layer.md
+│   ├── console-guard.md
+│   ├── privilege-tiers.md
 │   ├── discord-routing.md
 │   ├── settings-reference.md
 │   ├── build-and-release.md
@@ -73,6 +76,10 @@ Valheim-ServerGuard/
 
 5. **RPC handlers MUST be registered before the admin early-return** — otherwise admins can't use `sg` commands. See `Patch_OnNewConnection`.
 
+6. **Valheim's `Console` type needs `global::Console`** — `using System;` is in scope in both plugins, so a bare `Console` binds to `System.Console`. Valheim's `Console` sits in the global namespace.
+
+7. **Don't pick a Valheim collection field by "first one of the right interface"** — `Terminal` has three static dictionaries and `m_testList` is declared before `commands`. Match on the generic argument types instead. See `ResolveTerminalCommands` in `ClientPlugin.cs`.
+
 ---
 
 ## Sub-file index
@@ -84,6 +91,9 @@ Valheim-ServerGuard/
 | [`claude/harmony-patterns.md`](claude/harmony-patterns.md) | Before adding or modifying any Harmony patch |
 | [`claude/rpc-protocol.md`](claude/rpc-protocol.md) | Adding a new server↔client message, payload format |
 | [`claude/features-and-rules.md`](claude/features-and-rules.md) | All anti-cheat rules, their constants, defaults, and enable flags |
+| [`claude/ban-layer.md`](claude/ban-layer.md) | The SteamID denylist — where it hooks the handshake, `bans.yaml`, how it relates to `banlist.txt` |
+| [`claude/console-guard.md`](claude/console-guard.md) | Console command gating, key-bind purging, and the per-command risk assessment |
+| [`claude/privilege-tiers.md`](claude/privilege-tiers.md) | Owner / moderator / player tiers, and every site the owner bypass is enforced |
 | [`claude/discord-routing.md`](claude/discord-routing.md) | Adding a new Discord post or changing what channel something routes to |
 | [`claude/settings-reference.md`](claude/settings-reference.md) | Adding a new setting, understanding all current settings |
 | [`claude/build-and-release.md`](claude/build-and-release.md) | Building, bumping version, releasing to Thunderstore and GitHub |

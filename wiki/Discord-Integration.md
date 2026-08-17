@@ -39,7 +39,7 @@ Curated moderation events. Use a private channel that only moderators can see.
 
 | Event | Example |
 |---|---|
-| Server boot | `🚀 ServerGuard online v1.6.3  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
+| Server boot | `🚀 ServerGuard online v1.7.0  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
 | Hot-reload | `🔄 allowed_mods.yaml reloaded — req=1 allow=29 ban=0` |
 | Counted violation | `⚠️ Erik (765…) violated DevcommandAttempt (1/3) — fly` |
 | Informational rule | `👁 Erik (765…) triggered HashMismatch (informational — not counted) — Jotunn` |

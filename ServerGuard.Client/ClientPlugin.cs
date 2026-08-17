@@ -26,7 +26,7 @@ namespace ValheimServerGuardClient
     {
         public const string GUID    = "com.taeguk.valheim.serverguard.client";
         public const string NAME    = "Valheim ServerGuard Client";
-        public const string VERSION = "1.6.3";
+        public const string VERSION = "1.7.0";
 
         internal static ClientPlugin Instance;
         internal static ManualLogSource LogS;
@@ -51,20 +51,189 @@ namespace ValheimServerGuardClient
         // null when not connected (single-player, main menu, between connections).
         internal ZRpc _serverRpc;
 
-        // Command names that are always blocked on multiplayer clients regardless of
-        // whether Valheim has them flagged as "cheat: true". `devcommands` itself is the
-        // enable flag; the rest are common abuse vectors. Console.IsCheatsEnabled is
-        // also force-overridden to false, which blocks every cheat-flagged command at
-        // the Terminal level - this list is belt-and-suspenders.
-        private static readonly HashSet<string> BlockedCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        // ====================== Console command classification ======================
+        //
+        // Three tiers, because they carry different consequences and deserve different
+        // reporting on the server.
+        //
+        // CHEAT: `devcommands` and everything it unlocks. Valheim's own position is that
+        // these "do not work on a dedicated server", but that guarantee is enforced on
+        // the CLIENT (Terminal.m_cheat), so a patched client can flip it. Many of these
+        // commands then take effect for real, because the client owns the ZDOs for the
+        // objects around it - a client-side `spawn` produces a genuine server-side item.
+        private static readonly HashSet<string> CheatCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
+            // Master switches
             "devcommands", "debugmode", "imacheater",
-            "god", "ghost", "fly", "nocost", "noplacementcost",
-            "spawn", "pos", "goto", "tame", "killall",
-            "event", "stopevent", "tod", "skiptime", "sleep",
-            "raiseskill", "resetcharacter", "heal", "puke", "damage",
-            "setkey", "resetkeys", "removedrops", "freefly"
+            // Self state / invulnerability
+            "god", "ghost", "heal", "puke", "damage", "addstatus", "clearstatus",
+            "resetcharacter", "setpower", "model", "beard", "hair",
+            // Movement / position
+            "fly", "freefly", "goto", "findtp", "pos", "ffsmooth",
+            // Teleports OTHER players to the caller
+            "recall",
+            // Entity + item creation
+            "spawn", "itemset", "location", "nextseed", "genloc", "setfuel",
+            // Free building / crafting
+            "nocost", "noplacementcost",
+            // Mass destruction and object removal
+            "forcedelete", "killall", "killenemies", "killtame",
+            "removedrops", "removebirds", "removefish",
+            // Taming / aggro of creatures near other players
+            "tame", "aggravate",
+            // World-wide progression state (global keys)
+            "setkey", "removekey", "resetkeys", "listkeys",
+            // World-wide events
+            "event", "randomevent", "stopevent",
+            // World-wide time, weather and difficulty
+            "tod", "skiptime", "sleep", "timescale", "env", "resetenv",
+            "wind", "resetwind", "players",
+            // Skills
+            "raiseskill", "resetskill",
+            // Map / world intel
+            "exploremap", "resetmap", "find", "printcreatures", "printlocations",
+            // Diagnostics that are cheap to spam
+            "dpsdebug", "gc", "test",
         };
+
+        // RISKY: not flagged as cheats by Valheim and usable without `devcommands`, but
+        // each one either mutates shared server state, leaks information, or (in the
+        // case of bind) provides a way to run other commands outside the normal
+        // dispatch path. See claude/console-guard.md for the reasoning per command.
+        private static readonly HashSet<string> RiskyCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            // NOTE: the bind family (bind/unbind/resetbinds/printbinds) is deliberately
+            // NOT here. It is gated by consoleGuardBindPolicy instead, so a server that
+            // sets bindPolicy: allow keeps those commands usable rather than having
+            // them blocked by a tier the operator can't opt out of.
+
+            // Toggles a GLOBAL key when run on a server
+            "nomap", "noportals",
+            // World modifier / preset mutation (combat, resources, raids, portals)
+            "setworldmodifier", "setworldpreset", "resetworldkeys",
+            // Shared/served state
+            "resetsharedmap", "resetspawn",
+            // Mass terrain-modification rewrite in the loaded area
+            "optterrain",
+            // Reveals dungeon seeds and positions
+            "printseeds",
+            // Local data loss + wipes the persisted bind list out from under us
+            "resetknownitems", "resetplayerprefs",
+            // Cheap to spam, causes a hitch each time
+            "cr", "restartparty",
+        };
+
+        // The bind family. Gated by consoleGuardBindPolicy rather than by a tier, so
+        // `bindPolicy: allow` leaves all four usable even under restricted mode.
+        private static readonly HashSet<string> BindCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "bind", "unbind", "resetbinds", "printbinds",
+        };
+
+        // Commands Valheim already gates on the SERVER's admin list (ZNet checks the
+        // caller is an admin before acting). Deliberately NOT blocked client-side:
+        // doing so would add no security - a non-admin's attempt is refused server-side
+        // regardless - while breaking legitimate moderation for real admins.
+        // Listed here for documentation and for operators who want to add them to
+        // consoleBlockedCommands themselves.
+        private static readonly HashSet<string> VanillaAdminCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "ban", "unban", "banned", "kick", "save",
+        };
+
+        // Always permitted, even under whitelist mode: local-only cosmetics, chat,
+        // and the ServerGuard admin interface itself.
+        private static readonly HashSet<string> AlwaysAllowedCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "sg", "help", "clear", "info", "ping", "fov", "maxfps",
+            "exclusivefullscreen", "hidebetatext", "sortcraft", "filtercraft",
+            "tutorialtoggle", "tutorialreset", "xb:version",
+            "s", "say", "w", "die", "respawn",
+            // Emotes (Chat handles these, but keep them explicit so whitelist mode
+            // never eats one).
+            "wave", "sit", "challenge", "cheer", "nonono", "thumbsup", "point",
+            "blowkiss", "bow", "cower", "cry", "despair", "flex", "comehere",
+            "headbang", "kneel", "laugh", "roar", "shrug", "dance", "relax",
+            "toast", "rest", "vibe", "loveyou", "count",
+        };
+
+        // ====================== Console policy (server-driven) ======================
+        //
+        // Defaults apply until the server sends ServerGuard_ConsolePolicy. They match
+        // the pre-1.7 behaviour so an older server (or a single-player session) is
+        // unaffected: restricted mode, binds left alone.
+        private static string _consoleMode       = "restricted"; // open|restricted|whitelist|disabled
+        private static string _consoleBindPolicy = "allow";      // allow|block|purge|wipe
+        private static string _consoleRole       = "player";     // owner|moderator|player (log only)
+        private static HashSet<string> _consoleExtraBlocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static HashSet<string> _consoleAllowed      = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // True when the policy should be ignored for this player. The server decides
+        // this (owner always; moderator when the server's consoleGuardExemptModerators
+        // is on) and sends the answer, so the client never has to model the tiers.
+        private static bool _consoleExempt = false;
+        private static bool ConsoleGuardExempt => _consoleExempt;
+
+        // The owner tier is exempt from every rule, including the ones enforced purely
+        // client-side (the emote/animation-cancel gate), which the server has no
+        // opportunity to wave through. `role` from the console-policy push is the only
+        // channel carrying the tier, so it does double duty here.
+        internal static bool IsOwnerClient => _consoleRole == "owner";
+
+        // Payload: mode|exempt|role|bindPolicy|blockedCsv|allowedCsv
+        internal static void OnConsolePolicyReceived(string payload)
+        {
+            try
+            {
+                var parts = (payload ?? "").Split('|');
+                if (parts.Length < 4)
+                {
+                    LogS?.LogWarning($"[ServerGuard.Client] Malformed console policy payload ({parts.Length} fields) - keeping current policy.");
+                    return;
+                }
+
+                _consoleMode       = parts[0].Trim().ToLowerInvariant();
+                _consoleExempt     = parts[1].Trim() == "1";
+                _consoleRole       = parts[2].Trim().ToLowerInvariant();
+                _consoleBindPolicy = parts[3].Trim().ToLowerInvariant();
+
+                _consoleExtraBlocked = ToSet(parts.Length > 4 ? parts[4] : "");
+                _consoleAllowed      = ToSet(parts.Length > 5 ? parts[5] : "");
+
+                LogS?.LogInfo($"[ServerGuard.Client] Console policy: mode={_consoleMode} binds={_consoleBindPolicy} "
+                    + $"role={_consoleRole} exempt={_consoleExempt} "
+                    + $"extraBlocked={_consoleExtraBlocked.Count} allowed={_consoleAllowed.Count}");
+
+                ApplyBindPolicy();
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Console policy parse failed: {ex.Message}");
+            }
+        }
+
+        private static HashSet<string> ToSet(string csv)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var s in (csv ?? "").Split(','))
+            {
+                var v = s.Trim();
+                if (v.Length > 0) set.Add(v);
+            }
+            return set;
+        }
+
+        // Reset to defaults when the connection ends, so leaving a locked-down server
+        // doesn't leave the local console crippled in single-player.
+        internal static void ResetConsolePolicy()
+        {
+            _consoleMode         = "restricted";
+            _consoleBindPolicy   = "allow";
+            _consoleRole         = "player";
+            _consoleExempt       = false;
+            _consoleExtraBlocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _consoleAllowed      = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
 
         private static readonly string ConfDir    = Path.Combine(Paths.ConfigPath, "ServerGuard");
         private static readonly string ClientYaml = Path.Combine(ConfDir, "client.yaml");
@@ -1130,6 +1299,15 @@ namespace ValheimServerGuardClient
                         catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] ArrivalShout handler error: {ex.Message}"); }
                     });
 
+                    // Console guard policy: how the F5 console and key binds are allowed
+                    // to behave on this server. Sent on connect and on every server-side
+                    // settings.yaml / admins.yaml reload.
+                    peer.m_rpc.Register<string>("ServerGuard_ConsolePolicy", (rpc, payload) =>
+                    {
+                        try { ClientPlugin.OnConsolePolicyReceived(payload); }
+                        catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] ConsolePolicy handler error: {ex.Message}"); }
+                    });
+
                     ClientPlugin.LogS.LogInfo("[ServerGuard.Client] Registered manifest request handler on server peer.");
                 }
                 catch (Exception ex)
@@ -1177,18 +1355,39 @@ namespace ValheimServerGuardClient
 
         // Called by the gate patch when it blocks a command. Fires off the report RPC
         // if we have a live server connection; always logs locally.
-        internal void ReportDevcommand(string command)
+        //
+        // `category` is one of "cheat", "risky", "bind", "notallowed" and travels to the
+        // server as "<command>|<category>" so it can decide how loudly to react. The
+        // pipe-separated form is new in 1.7 - servers on 1.6.x parse the whole string as
+        // the command name, which degrades to a slightly noisier log line, not a break.
+        internal void ReportDevcommand(string command, string category = "cheat")
         {
             try
             {
-                LogS.LogWarning($"[ServerGuard.Client] Blocked cheat attempt: `{command}` (multiplayer client)");
+                LogS.LogWarning($"[ServerGuard.Client] Blocked console command `{command}` ({category}) — server policy: {_consoleMode}");
                 if (_serverRpc != null)
                 {
-                    try { _serverRpc.Invoke("ServerGuard_DevcommandAttempt", command ?? ""); }
-                    catch (Exception ex) { LogS.LogWarning($"[ServerGuard.Client] Could not report devcommand to server: {ex.Message}"); }
+                    try { _serverRpc.Invoke("ServerGuard_DevcommandAttempt", $"{command ?? ""}|{category}"); }
+                    catch (Exception ex) { LogS.LogWarning($"[ServerGuard.Client] Could not report console attempt to server: {ex.Message}"); }
                 }
             }
             catch { /* never let the gate throw into Valheim */ }
+        }
+
+        // Prints a short refusal into the local console so a blocked player understands
+        // what happened instead of seeing the command silently do nothing.
+        private static void NotifyBlocked(string cmd, string category)
+        {
+            try
+            {
+                var why = category == "bind"
+                    ? "key binds are disabled on this server"
+                    : category == "notallowed"
+                        ? "this server only permits a whitelist of console commands"
+                        : "this command is blocked by the server's security policy";
+                ClientPlugin.Instance?.DisplayAdminReply($"[ServerGuard] `{cmd}` refused — {why}.");
+            }
+            catch { }
         }
 
         // Called by the animation-cancel patches when they swallow a cancel input that
@@ -1208,59 +1407,144 @@ namespace ValheimServerGuardClient
             catch { /* never let the gate throw into Valheim */ }
         }
 
-        // Looks up `cmd` in Terminal's command registry via reflection and returns true
-        // if the registered command is flagged as a cheat. Robust across Valheim builds
-        // because we probe for several common field/property names.
-        private static bool IsRegisteredCheatCommand(string cmd)
+        // Resolves Terminal's command registry (Dictionary<string, Terminal.ConsoleCommand>)
+        // once and caches it. Naming has varied across builds (`commands`, `m_commands`,
+        // `s_commands`), so we search by SHAPE rather than by name: a static dictionary
+        // whose key type is string and whose value type is named ConsoleCommand.
+        //
+        // Matching on shape matters here. Terminal also holds `m_testList`
+        // (Dictionary<string,string>) and `m_binds` (Dictionary<KeyCode, List<string>>)
+        // as static fields, and m_testList is declared FIRST - a "take the first
+        // IDictionary" search silently binds to the wrong dictionary and every
+        // cheat-flag lookup comes back false.
+        private static System.Collections.IDictionary _terminalCommands;
+        private static bool _terminalCommandsResolved;
+
+        private static System.Collections.IDictionary ResolveTerminalCommands()
         {
-            if (string.IsNullOrEmpty(cmd)) return false;
+            if (_terminalCommandsResolved) return _terminalCommands;
+            _terminalCommandsResolved = true;
+
             try
             {
-                var terminalType = typeof(Terminal);
-
-                // Find the command dictionary on Terminal. Naming has varied across
-                // builds: `commands`, `m_commands`, `s_commands` etc. Pick the first
-                // static field whose type implements IDictionary.
-                System.Collections.IDictionary commands = null;
-                foreach (var f in terminalType.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+                foreach (var f in typeof(Terminal).GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
                 {
-                    if (typeof(System.Collections.IDictionary).IsAssignableFrom(f.FieldType))
+                    if (!typeof(System.Collections.IDictionary).IsAssignableFrom(f.FieldType)) continue;
+                    if (!f.FieldType.IsGenericType) continue;
+
+                    var argsT = f.FieldType.GetGenericArguments();
+                    if (argsT.Length != 2) continue;
+                    if (argsT[0] != typeof(string)) continue;
+                    if (argsT[1].Name.IndexOf("ConsoleCommand", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    _terminalCommands = f.GetValue(null) as System.Collections.IDictionary;
+                    if (_terminalCommands != null)
                     {
-                        var val = f.GetValue(null) as System.Collections.IDictionary;
-                        if (val != null) { commands = val; break; }
+                        LogS?.LogInfo($"[ServerGuard.Client] Terminal command registry bound: {f.Name} ({_terminalCommands.Count} commands).");
+                        return _terminalCommands;
                     }
                 }
-                if (commands == null) return false;
+                LogS?.LogWarning("[ServerGuard.Client] Could not locate Terminal's command registry - falling back to the static command lists only.");
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Terminal command registry lookup failed: {ex.Message}");
+            }
+            return _terminalCommands;
+        }
 
-                object cmdObj = null;
+        private static object LookupCommandObject(string cmd)
+        {
+            if (string.IsNullOrEmpty(cmd)) return null;
+            var commands = ResolveTerminalCommands();
+            if (commands == null) return null;
+            try
+            {
+                // Valheim lowercases the token before its own lookup, so match that.
+                var key = cmd.ToLowerInvariant();
+                if (commands.Contains(key)) return commands[key];
+
                 foreach (System.Collections.DictionaryEntry entry in commands)
                 {
                     if (entry.Key is string k && string.Equals(k, cmd, StringComparison.OrdinalIgnoreCase))
-                    {
-                        cmdObj = entry.Value;
-                        break;
-                    }
-                }
-                if (cmdObj == null) return false;
-
-                // Inspect the command object for a cheat flag. Try fields then properties,
-                // common names first.
-                var t = cmdObj.GetType();
-                foreach (var name in new[] { "IsCheat", "isCheat", "m_isCheat", "Cheat", "cheat" })
-                {
-                    var fi = t.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                    if (fi != null && fi.FieldType == typeof(bool))
-                    {
-                        return fi.GetValue(cmdObj) is bool fb && fb;
-                    }
-                    var pi = t.GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                    if (pi != null && pi.PropertyType == typeof(bool))
-                    {
-                        return pi.GetValue(cmdObj) is bool pb && pb;
-                    }
+                        return entry.Value;
                 }
             }
-            catch { /* fall through */ }
+            catch { }
+            return null;
+        }
+
+        // True when `cmd` is a command Valheim itself considers a cheat. Dynamic, so it
+        // also covers cheat commands added by other mods.
+        private static bool IsRegisteredCheatCommand(string cmd)
+        {
+            var cmdObj = LookupCommandObject(cmd);
+            if (cmdObj == null) return false;
+            return ReadBoolMember(cmdObj, new[] { "IsCheat", "isCheat", "m_isCheat", "Cheat", "cheat" });
+        }
+
+        // True when `cmd` is registered at all (vanilla or from another mod). Used by
+        // whitelist mode: an unregistered token isn't a command, so there is nothing to
+        // block - Valheim will just print "not a recognized command".
+        private static bool IsRegisteredCommand(string cmd) => LookupCommandObject(cmd) != null;
+
+        private static bool ReadBoolMember(object target, string[] names)
+        {
+            var t = target.GetType();
+            foreach (var name in names)
+            {
+                var fi = t.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (fi != null && fi.FieldType == typeof(bool))
+                    return fi.GetValue(target) is bool fb && fb;
+
+                var pi = t.GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (pi != null && pi.PropertyType == typeof(bool))
+                    return pi.GetValue(target) is bool pb && pb;
+            }
+            return false;
+        }
+
+        // ====================== Console guard decision ======================
+        //
+        // Returns true when `cmd` must not run, and sets `category` for reporting.
+        // `cmd` arrives without any leading slash and without arguments.
+        internal static bool ShouldBlockConsoleCommand(string cmd, out string category)
+        {
+            category = null;
+            if (string.IsNullOrEmpty(cmd)) return false;
+            if (ConsoleGuardExempt) return false;
+            if (_consoleMode == "open") return false;
+
+            // Bind policy is evaluated first: under block/purge/wipe the whole bind
+            // family is off limits regardless of the mode. `bind` because leaving it
+            // usable would let a player re-add what the purge just removed;
+            // `printbinds` because it reports exactly which binds survived the guard,
+            // which is a map of where the gaps are.
+            if (_consoleBindPolicy != "allow" && BindCommands.Contains(cmd))
+            {
+                category = "bind";
+                return true;
+            }
+
+            // Operator-supplied additions apply in every non-open mode.
+            if (_consoleExtraBlocked.Contains(cmd)) { category = "risky"; return true; }
+
+            if (_consoleMode == "whitelist")
+            {
+                if (AlwaysAllowedCommands.Contains(cmd)) return false;
+                if (_consoleAllowed.Contains(cmd)) return false;
+                // Not a real command - nothing to block, vanilla prints "not recognized".
+                if (!IsRegisteredCommand(cmd)) return false;
+                category = "notallowed";
+                return true;
+            }
+
+            // mode == "restricted" (and "disabled", which still gates chat-typed
+            // commands - the console being unopenable doesn't close the chat line).
+            if (CheatCommands.Contains(cmd))        { category = "cheat"; return true; }
+            if (IsRegisteredCheatCommand(cmd))      { category = "cheat"; return true; }
+            if (RiskyCommands.Contains(cmd))        { category = "risky"; return true; }
+
             return false;
         }
 
@@ -1288,6 +1572,11 @@ namespace ValheimServerGuardClient
             try
             {
                 if (!IsActiveMultiplayerClient()) return false;
+                // Owners are exempt from every rule, and this one is enforced entirely
+                // client-side - the server never gets a chance to wave it through. The
+                // role comes from the server's console-policy push, which is the only
+                // channel that carries it.
+                if (IsOwnerClient) return false;
                 if (p == null) return false;
                 if (p != Player.m_localPlayer) return false;
                 return p.InAttack();
@@ -1313,6 +1602,195 @@ namespace ValheimServerGuardClient
                     ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Emote gate error: {ex.Message}");
                 }
                 return true;
+            }
+        }
+
+        // ====================== Key-bind control ======================
+        //
+        // The threat, concretely: a player runs `bind f devcommands` offline. Valheim
+        // writes "F devcommands" into the persisted ConsoleBindings pref. Next launch,
+        // Chat.Awake reads that pref back and Terminal.updateBinds rebuilds the live
+        // bind table. The player then joins a server and presses F.
+        //
+        // Two details make this worse than a normal console command:
+        //
+        //   1. Binds are dispatched from Chat.Update, NOT from Console.Update. Blocking
+        //      the console (F5) does nothing to them - the console never has to be
+        //      opened, or even openable, for a bind to fire.
+        //   2. Chat.Update calls TryRunCommand(text, silentFail: true,
+        //      skipAllowedCheck: true). That third argument makes ConsoleCommand.IsValid
+        //      skip its context check, so a bind runs commands that would be refused as
+        //      "not valid in the current context" if typed.
+        //
+        // Our TryRunCommand prefix still sees bind-dispatched commands (it patches the
+        // method, not the caller), so the blocklist already covers their contents. The
+        // purge below is the second layer: remove the binds themselves so nothing is
+        // sitting on a hotkey waiting for a gap in the blocklist.
+        //
+        // Terminal.m_binds is only ever populated by Terminal.updateBinds - confirmed by
+        // scanning every writer in assembly_valheim - so clearing it there is complete.
+
+        private static System.Reflection.FieldInfo _bindsField;      // Dictionary<KeyCode, List<string>>
+        private static System.Reflection.FieldInfo _bindListField;   // List<string>
+        private static bool _bindFieldsResolved;
+
+        private static void ResolveBindFields()
+        {
+            if (_bindFieldsResolved) return;
+            _bindFieldsResolved = true;
+            try
+            {
+                foreach (var f in typeof(Terminal).GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (!f.FieldType.IsGenericType) continue;
+                    var argsT = f.FieldType.GetGenericArguments();
+
+                    // Dictionary<KeyCode, List<string>>
+                    if (_bindsField == null && argsT.Length == 2 && argsT[0] == typeof(KeyCode)
+                        && typeof(System.Collections.IDictionary).IsAssignableFrom(f.FieldType))
+                    {
+                        _bindsField = f;
+                        continue;
+                    }
+
+                    // List<string> - the raw "KEY command" lines backing the pref.
+                    if (_bindListField == null && argsT.Length == 1 && argsT[0] == typeof(string)
+                        && typeof(System.Collections.IList).IsAssignableFrom(f.FieldType))
+                    {
+                        _bindListField = f;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Bind field lookup failed: {ex.Message}");
+            }
+
+            if (_bindsField == null)
+                LogS?.LogWarning("[ServerGuard.Client] Could not locate Terminal's bind table - bind purge is inactive.");
+        }
+
+        // Applies the server's bind policy right now. Safe to call repeatedly.
+        internal static void ApplyBindPolicy()
+        {
+            try
+            {
+                if (ConsoleGuardExempt) return;
+                if (_consoleBindPolicy == "allow" || _consoleBindPolicy == "block") return;
+                if (!IsActiveMultiplayerClient()) return;
+
+                ResolveBindFields();
+
+                int cleared = 0;
+                var dict = _bindsField?.GetValue(null) as System.Collections.IDictionary;
+                if (dict != null && dict.Count > 0)
+                {
+                    cleared = dict.Count;
+                    dict.Clear();
+                }
+
+                if (_consoleBindPolicy == "wipe")
+                {
+                    // Also drop the backing list and rewrite the persisted pref, so the
+                    // binds are gone permanently rather than only for this session.
+                    var list = _bindListField?.GetValue(null) as System.Collections.IList;
+                    if (list != null && list.Count > 0)
+                    {
+                        list.Clear();
+                        try
+                        {
+                            var update = typeof(Terminal).GetMethod("updateBinds",
+                                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                            update?.Invoke(null, null);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogS?.LogWarning($"[ServerGuard.Client] Could not persist bind wipe: {ex.Message}");
+                        }
+                    }
+                }
+
+                if (cleared > 0)
+                {
+                    LogS?.LogWarning($"[ServerGuard.Client] Cleared {cleared} key bind(s) — server bind policy is '{_consoleBindPolicy}'.");
+                    ClientPlugin.Instance?.DisplayAdminReply(
+                        $"[ServerGuard] {cleared} custom key bind(s) removed — this server does not permit console key binds.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] ApplyBindPolicy error: {ex.Message}");
+            }
+        }
+
+        // Terminal.updateBinds is the only writer of the live bind table. Re-clearing
+        // here catches every path that could repopulate it: Chat.Awake reloading the
+        // persisted list on world load, and any successful bind/unbind command.
+        [HarmonyPatch(typeof(Terminal), "updateBinds")]
+        public static class Patch_Terminal_UpdateBinds
+        {
+            public static void Postfix()
+            {
+                try { ApplyBindPolicy(); }
+                catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] updateBinds postfix error: {ex.Message}"); }
+            }
+        }
+
+        // Leaving the server has to restore local control. Without this, disconnecting
+        // from a server that runs consoleGuardMode: disabled would leave the player's
+        // console dead in single-player until they restarted the game.
+        //
+        // The player's saved binds are untouched by "purge" (only the live table is
+        // cleared), and Chat.Awake reloads them from the pref on the next world load,
+        // so single-player binds come back on their own. "wipe" is permanent by design.
+        [HarmonyPatch(typeof(ZNet), "Shutdown")]
+        public static class Patch_ZNet_Shutdown_ResetPolicy
+        {
+            public static void Postfix()
+            {
+                try
+                {
+                    if (ClientPlugin.Instance != null) ClientPlugin.Instance._serverRpc = null;
+                    ResetConsolePolicy();
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Policy reset on shutdown failed: {ex.Message}");
+                }
+            }
+        }
+
+        // ====================== Console lockout ======================
+        //
+        // Console.Update early-returns when IsConsoleEnabled() is false, and that single
+        // check gates both the F5 key and the gamepad chord. Forcing it false is
+        // therefore a complete lockout of the console window with no input-handling
+        // patch of our own.
+        //
+        // It does NOT stop chat, and it does NOT stop key binds (those live in
+        // Chat.Update) - the bind policy above covers that half.
+        //
+        // Admins are exempt by default: `sg` commands are typed into this console, so
+        // locking an admin out of it removes their moderation interface.
+        // `global::` is required: `using System;` is in scope, so a bare `Console` binds
+        // to System.Console. Valheim's Console type sits in the global namespace.
+        [HarmonyPatch(typeof(global::Console), "IsConsoleEnabled")]
+        public static class Patch_Console_IsConsoleEnabled
+        {
+            public static void Postfix(ref bool __result)
+            {
+                try
+                {
+                    if (!__result) return;                        // already off
+                    if (_consoleMode != "disabled") return;
+                    if (ConsoleGuardExempt) return;
+                    if (!IsActiveMultiplayerClient()) return;      // single-player keeps its console
+                    __result = false;
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Console lockout error: {ex.Message}");
+                }
             }
         }
 
@@ -1348,21 +1826,20 @@ namespace ValheimServerGuardClient
                         return false;
                     }
 
-                    // Below this line: the devcommand gate. Only active on multiplayer clients.
+                    // Below this line: the console guard. Only active on multiplayer
+                    // clients - single-player and host-and-play keep full console access.
                     if (!IsActiveMultiplayerClient()) return true;
 
-                    bool isHardBlocked = BlockedCommands.Contains(cmdNoSlash);
-                    bool isCheatTagged = !isHardBlocked && IsRegisteredCheatCommand(cmdNoSlash);
-
-                    if (isHardBlocked || isCheatTagged)
+                    if (ShouldBlockConsoleCommand(cmdNoSlash, out var category))
                     {
-                        ClientPlugin.Instance?.ReportDevcommand(cmdNoSlash);
+                        ClientPlugin.Instance?.ReportDevcommand(cmdNoSlash, category);
+                        NotifyBlocked(cmdNoSlash, category);
                         return false; // skip original - command is swallowed
                     }
                 }
                 catch (Exception ex)
                 {
-                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Devcommand gate error: {ex.Message}");
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Console gate error: {ex.Message}");
                 }
                 return true; // let Valheim handle non-blocked commands
             }
