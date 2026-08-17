@@ -116,7 +116,7 @@ Thunderstore files/Valheim-ServerGuard (client)/
 
 ## GitHub Wiki
 
-The `wiki/` directory contains 9 markdown files in GitHub Wiki format:
+The `wiki/` directory contains 12 markdown files in GitHub Wiki format:
 ```
 wiki/Home.md
 wiki/Installation.md
@@ -125,11 +125,39 @@ wiki/Allowed-Mods-and-Modset.md
 wiki/Discord-Integration.md
 wiki/Admin-Commands.md
 wiki/Anti-Cheat-Features.md
+wiki/Bans-and-Console-Guard.md      ← added 1.7.0
+wiki/Privilege-Tiers.md             ← added 1.7.0
 wiki/Forensic-Logs.md
+wiki/Quick-Login.md
 wiki/Troubleshooting.md
 ```
 
-To publish: clone `<repo>.wiki.git`, copy files in, push. GitHub auto-renders them. `Home.md` becomes the wiki landing page.
+**The wiki is a SEPARATE repository** — pushing `origin main` does not publish it:
+
+```
+https://github.com/yesu0725/Valheim-ServerGuard.wiki.git   (default branch: master)
+```
+
+To publish: clone the `.wiki.git` repo, copy the changed pages in, commit, push
+`origin master`. `Home.md` becomes the landing page.
+
+**Copy only the pages that actually changed.** The two repos use different newline
+conventions in places, so a copy-all produces whole-file diffs on pages with no real
+edits and makes the wiki history unreadable. Find the real changes with:
+
+```bash
+diff -q --strip-trailing-cr "wiki/<page>.md" "<wikiclone>/<page>.md"
+```
+
+then write each changed page using the destination's convention (currently CRLF
+throughout):
+
+```bash
+sed 's/\r$//' "$SRC/$n" | sed 's/$/\r/' > "$DST/$n"
+```
+
+Verify with `git diff --cached --stat` before committing — the line counts should
+match the size of the real edit, not the size of the file.
 
 ---
 
