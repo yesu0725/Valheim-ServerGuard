@@ -6,7 +6,7 @@ Lives at `BepInEx/config/ServerGuard/conf/allowed_mods.yaml`. Three sections:
 
 ```yaml
 required_mods:
-  - com.taeguk.valheim.serverguard.client    # companion plugin - keep this entry
+  - com.taeguk.valheim.serverguard    # ServerGuard itself (2.0: one GUID for both sides) - keep this entry
 
 allowed_mods:
   - com.bepis.bepinex
@@ -37,12 +37,13 @@ Each entry is a string. Two forms:
 | `required_mods` | Every connecting client must report all of these. Missing → kick (`RequiredModMissing`). |
 | `allowed_mods` | Extra mods the client may run beyond the required set. |
 | `banned_mods` | Any presence is fatal (`BannedMod`). |
+| `moderator_allowed_mods` *(2.0)* | Extra mods that only moderators (`moderators.yaml`) may run, on top of `required_mods` + `allowed_mods`. Moderators go through the same check as players; owners skip it. Not part of the modset fingerprint. |
 
 If `allowUnlisted: false` (the default), every mod the client has must appear in `required_mods` or `allowed_mods`. If `true`, unlisted mods are tolerated.
 
 ## Building your allowlist
 
-The companion plugin writes a ready-to-paste snippet on its first run. On a client machine with your full modpack installed:
+ServerGuard's client half writes a ready-to-paste snippet on its first run. On a client machine with your full modpack installed:
 
 ```
 BepInEx/config/ServerGuard/mods_for_allowed_mods.yaml

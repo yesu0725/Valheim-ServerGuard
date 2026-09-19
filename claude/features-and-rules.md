@@ -2,7 +2,7 @@
 
 ## Rule constants
 
-Defined at the top of `Plugin.cs`:
+Defined at the top of `ServerPlugin.cs`:
 
 ```csharp
 RULE_COMPANION_MISSING       = "CompanionMissing"
@@ -20,6 +20,9 @@ RULE_ILLEGAL_ITEM            = "IllegalItem"
 RULE_STACK_OVERFLOW          = "StackOverflow"
 RULE_ANIMATION_CANCEL        = "AnimationCancel"
 RULE_SKILL_OVERFLOW          = "SkillOverflow"
+RULE_CHEATED_ITEM            = "CheatedItem"     # 2.0
+RULE_CHEATED_BUILD           = "CheatedBuild"    # 2.0
+RULE_DEBUG_FLY               = "DebugFly"        # 2.0
 ```
 
 `ALL_RULES` array mirrors these for default-seeding the `countAsViolation` map.
@@ -45,6 +48,9 @@ countAsViolation:
   StackOverflow:              false   # audit first, opt-in when confident
   AnimationCancel:            false   # audit first, opt-in when confident
   SkillOverflow:              false   # audit first, opt-in when confident
+  CheatedItem:                false   # 2.0 — see cheatTaintPolicy; audit first
+  CheatedBuild:               false   # 2.0 — audit first
+  DebugFly:                   false   # 2.0 — server-observed; safe to enable once staff never trip it
 ```
 
 `RuleCountsAsViolation(rule)` returns **false** for missing keys — every new rule is opt-in.
@@ -109,7 +115,7 @@ countAsViolation:
 - **See:** `claude/console-guard.md` for the full per-command risk assessment
 
 ### SpeedHack
-- **Settings:** `enableSpeedCheck`, `speedCheckMaxMetersPerSecond` (15.0), `speedCheckSampleSeconds` (1.0), `speedCheckConsecutiveStrikes` (3), `speedCheckTeleportToleranceMeters` (60.0)
+- **Settings:** `enableSpeedCheck`, `speedCheckMaxMetersPerSecond` (70.0 since 2.0; was 15.0), `speedCheckSampleSeconds` (1.0), `speedCheckConsecutiveStrikes` (3), `speedCheckTeleportToleranceMeters` (60.0)
 - **Trigger:** N consecutive poll samples above threshold (horizontal XZ only — vertical ignored)
 - **Teleport safety:** Single jump > 60m resets strike counter instead of incrementing
 - **countAsViolation default:** `true`
@@ -138,6 +144,56 @@ countAsViolation:
 - **Trigger:** Skill report from client contains any skill > `maxLevel + tolerance` (105.0 by default)
 - **Report interval:** Every 60s after 15s initial delay
 - **countAsViolation default:** `false`
+
+### Cheat taint family (2.0) — CheatedItem / CheatedBuild / DebugFly
+
+Reads Valheim 1.0's own "cheated" bookkeeping (built for achievement gating) as an
+anti-cheat signal. Verified against the 1.0.7 source; the map of where the game sets
+and propagates the mark:
+
+| Game site | What it marks |
+|---|---|
+| `Terminal` `spawn` / `location` | `ItemDrop.OnCreateNew(go, cheated: true)`, creature/location ZDO `cheated` |
+| `Player.PlacePiece(..., bool cheated)` | piece ZDO `cheated` when built with `nocost` or with cheated materials (`Inventory.ItemCheated(resources)`) |
+| `Character.Damage` | victim ZDO `cheated` when the attacker is a player in god/ghost/**fly** mode or wielding a cheated damaging item |
+| `Destructible` / `MineRock5` | ZDO `cheated` / drops cheated when hit with a cheated weapon |
+| `Inventory.AddItem(prefabHash, ...)` | **auto-flags any item whose total damage > 10000** — false-positive source for modded weapons |
+| `InventoryGui.DoCrafting` | product cheated if any ingredient is, **or the crafting station's ZDO is** |
+| `Piece` (destroy), `CharacterDrop`, `Ragdoll`, `Container.AddDefaultItems`, `CookingStation`, `Smelter`, `Fermenter`, `StoreGui` | taint carried through returns, drops, processing, trading |
+| `ConsoleCommand.RunAction` | `PlayerProfile.m_usedCheats = true` on **any** `IsCheat` command — permanent, in the character file |
+| `yesiuseddevcommandsbutiwantmyachievementsanyway` | sets unique key `bypasscheatchecks`; every flagging site then short-circuits |
+
+The item flag is the last byte of `ItemData.Save`, so it lives in the **character
+file** (survives single-player → server), in container ZDOs (`items`) and in dropped
+items (`itemData`). `PlayerProfile.s_bypassCheatChecks` / `m_usedCheats` are client-only.
+What the server can read directly: any ZDO's `cheated` (`ZDOVars.s_cheated`), piece
+`creator` (`s_creator`), and the player ZDO's `DebugFly` (`s_debugFly`, written by
+`Player.ToggleDebugFly`). God/ghost are private fields and are **not** synced.
+
+Not a security boundary on its own — a hacked client never sets the flag. It catches an
+honest game used dishonestly (single-player spawns brought over, staff hand-outs, listen
+server cheats) and sits behind attestation like every other client-reported rule.
+
+**CheatedItem**
+- **Settings:** `enableCheatTaintDetection` (true), `cheatTaintPolicy` (`log` | `strip` | `violation`, default `log`), `cheatTaintIgnoredItems` ([]), `cheatTaintFlagUsedCheats` (true), `cheatTaintExemptModerators` (false)
+- **Trigger:** `ServerGuard_CheatState` from the client: `usedCheats|bypass|count|prefab:stack,...`. Sent 15 s after spawn, then within 10 s of the flagged set changing and at least every 60 s.
+- **Server:** `OnCheatStateReceived`. Drops ignored prefabs, dedups per peer on the sorted item signature (`_cheatTaintState`). `log` → admin post on change; `strip` → admin post + `ServerGuard_StripCheated` (re-sent on every report while anything remains); `violation` → strip + `AddViolation`. The `bypasscheatchecks` key and `m_usedCheats` are each posted once per session. Owners exempt; moderators only via the setting.
+- **countAsViolation default:** `false`
+
+**CheatedBuild**
+- **Trigger:** 5th field of `ServerGuard_BuildPlace` (`cheated` from `Player.PlacePiece`, read via `__args`), then **server-side confirmation**: `QueueCheatedBuildCheck` → `CheatedBuildSweepLoop` (every 5 s) scans `ZDOMan.m_objectsByID` (reflection) once for all pending pieces ≥ 3 s old, matches prefab hash + position (≤ 1 m) and reads `cheated` / `creator`. Unfound after 30 s → falls back to the client flag. A client/ZDO disagreement is logged as a mismatch.
+- **Output:** build CSV gained a trailing `cheated` column (`1`/`0` on place rows); `AddViolation(RULE_CHEATED_BUILD, "<piece> @ x, z")`.
+- **countAsViolation default:** `false`
+
+**DebugFly**
+- **Setting:** `enableDebugFlyCheck` (true)
+- **Note:** moderators can never be granted `fly`/`debugmode` (`ModeratorReservedCommands`), so there is no "granted fly" exemption — owners only (plus moderators via `cheatTaintExemptModerators`).
+- **Trigger:** `TickDebugFly` inside `TickSpeedCheck` (so it runs on the speed-check cadence even when `enableSpeedCheck` is off): player ZDO `DebugFly == true`. Fires once per fly session (`SpeedState.DebugFlyFlagged`, reset when the flag drops).
+- **Exemptions:** owners; moderators only via `cheatTaintExemptModerators`. Evaluated *before* the speed check's `IsAdmin` skip on purpose.
+- **Output:** public `:dove:` player event + `AddViolation(RULE_DEBUG_FLY)`.
+- **countAsViolation default:** `false`
+
+Metrics: `cheat_taint_reports`, `cheat_taint_builds`, `debug_fly_detections`.
 
 ---
 

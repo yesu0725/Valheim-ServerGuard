@@ -1,6 +1,8 @@
 # Settings Reference
 
-All fields are in the `Settings` class in `Plugin.cs`. The YAML file is `BepInEx/config/ServerGuard/conf/settings.yaml`. Hot-reloaded via `FileSystemWatcher`.
+All fields are in the `Settings` class in `ServerPlugin.cs`. The YAML file is `BepInEx/config/ServerGuard/conf/settings.yaml`. Hot-reloaded via `FileSystemWatcher`.
+
+The **client** has its own, much smaller config (`ClientSettings` in `ClientPlugin.cs`, file `client.yaml`). It is documented at the bottom of this page — see **Client config (`client.yaml`)**.
 
 YAML key naming: `CamelCaseNamingConvention` is applied by YamlDotNet. Field `SharedSecret` → YAML key `sharedSecret`. Fields with `[YamlMember(Alias="...", ApplyNamingConventions=false)]` use the exact alias.
 
@@ -74,7 +76,7 @@ Attribute: `[YamlMember(Alias = "countAsViolation", ApplyNamingConventions = fal
 | C# property | YAML key | Type | Default |
 |---|---|---|---|
 | `EnableSpeedCheck` | `enableSpeedCheck` | bool | `true` |
-| `SpeedCheckMaxMetersPerSecond` | `speedCheckMaxMetersPerSecond` | double | `15.0` |
+| `SpeedCheckMaxMetersPerSecond` | `speedCheckMaxMetersPerSecond` | double | `70.0` (2.0; was 15.0) |
 | `SpeedCheckSampleSeconds` | `speedCheckSampleSeconds` | double | `1.0` |
 | `SpeedCheckConsecutiveStrikes` | `speedCheckConsecutiveStrikes` | int | `3` |
 | `SpeedCheckTeleportToleranceMeters` | `speedCheckTeleportToleranceMeters` | double | `60.0` |
@@ -193,6 +195,54 @@ Full detail — including the per-command risk assessment — in `claude/console
 
 ---
 
+## Cheat taint detection (2.0)
+
+| C# property | YAML key | Type | Default |
+|---|---|---|---|
+| `EnableCheatTaintDetection` | `enableCheatTaintDetection` | bool | `true` |
+| `CheatTaintPolicy` | `cheatTaintPolicy` | string | `"log"` (`log` / `strip` / `violation`) |
+| `CheatTaintExemptModerators` | `cheatTaintExemptModerators` | bool | `false` |
+| `CheatTaintFlagUsedCheats` | `cheatTaintFlagUsedCheats` | bool | `true` |
+| `CheatTaintIgnoredItems` | `cheatTaintIgnoredItems` | `List<string>` | `[]` |
+| `EnableDebugFlyCheck` | `enableDebugFlyCheck` | bool | `true` |
+
+Policy is normalised by `NormalizedCheatTaintPolicy` (unknown → `log`). The three
+rules it feeds (`CheatedItem`, `CheatedBuild`, `DebugFly`) all default to
+`countAsViolation: false`. Full mechanism in `claude/features-and-rules.md`, *Cheat
+taint family*. `cheatTaintIgnoredItems` exists because Valheim auto-flags any item with
+more than 10000 total damage — list modded weapons there instead of disabling the
+feature.
+
+---
+
+## Staff dev commands (2.0)
+
+| C# property | YAML key | Type | Default |
+|---|---|---|---|
+| `EnableOwnerDevcommands` | `enableOwnerDevcommands` | bool | `true` |
+| `EnableModeratorDevcommands` | `enableModeratorDevcommands` | bool | `true` |
+| `ModeratorDevcommands` | `moderatorDevcommands` | `List<string>` | `goto pos removedrops stopevent find` |
+
+`enableOwnerDevcommands`: owners can run **every** dev command on this server, client-side
+and server-side, and are treated as vanilla admins by `ZNet` (no `adminlist.txt` entry
+needed). `enableModeratorDevcommands` + `moderatorDevcommands`: moderators can run
+exactly the listed commands; `devcommands` itself is always allowed to them when the
+list is non-empty. Names are lower-cased and a leading `/` is stripped on read
+(`ModeratorDevcommandSet`). **`ModeratorReservedCommands`** — `fly debugmode spawn itemset
+nocost noplacementcost location` — are dropped from the list on read (with a log line)
+and refused by `IsDevcommandAllowed` regardless: moderators can never create items, build
+for free or fly. Moderators do **not** need an `adminlist.txt` entry: every command on
+their list is either local to their client or authorised by ServerGuard's own prefixes.
+
+Travels to the client as the two trailing `ServerGuard_ConsolePolicy` fields
+(`devMode|devCsv`), pushed and re-pushed exactly like the console guard, so a change
+to any of the three keys — or to `owners.yaml` / `moderators.yaml` — takes effect for
+online staff immediately. Listing `debugmode` for moderators also hands them the
+debug hotkeys (Z fly, B free build). Full mechanism in `claude/console-guard.md`,
+*Staff dev commands*.
+
+---
+
 ## Metrics
 
 | C# property | YAML key | Type | Default |
@@ -249,3 +299,59 @@ public List<string> required_mods { get; set; } = new();
 - `bans.yaml` → calls `LoadBans()` → `SweepBannedPeers()`
 
 Debounce: `_lastSeenWrite` dictionary keyed by file path, skips events within 500ms of last write. Prevents double-fire from editors that write twice.
+
+---
+
+## Client config (`client.yaml`)
+
+Class `ClientSettings` in `ClientPlugin.cs`. File:
+`BepInEx/config/ServerGuard/client.yaml` on each player's install. Read once in
+`EnsureConfig()` during `Awake` — **not** hot-reloaded; the player relaunches Valheim.
+Same `CamelCaseNamingConvention` + `IgnoreUnmatchedProperties()` as the server.
+
+| C# property | YAML key | Type | Default | Notes |
+|---|---|---|---|---|
+| `SharedSecret` | `sharedSecret` | string | `""` | Must match the server's `sharedSecret` verbatim. Empty = manifest sent unsigned (server rejects unless `requireHmac: false`). |
+| `QuickLoginEnabled` | `quickLoginEnabled` | bool | `false` | Master switch for the title-screen panel. Also requires a non-empty `serverAddress`. |
+| `ServerAddress` | `serverAddress` | string | `""` | Hostname or IP. |
+| `ServerPort` | `serverPort` | int | `2456` | Game port. The A2S player-count query goes to **port + 1**. |
+| `ServerPassword` | `serverPassword` | string | `""` | Plain text. Applied via the static `FejdStartup.ServerPassword` so the in-game prompt is skipped. |
+| `ServerName` | `serverName` | string | `""` | Panel heading. |
+| `ServerDescription` | `serverDescription` | string | `""` | Single label under the name, fixed 64 px tall. |
+| `ServerLogoPath` | `serverLogoPath` | string | `""` | PNG/JPG **filename** relative to `BepInEx/config/ServerGuard/`. Loaded via `ImageConversion.LoadImage` by reflection. |
+| `ServerAnnouncements` | `serverAnnouncements` | string | `""` | *(1.8.0)* Multi-line text for the scrollable **Announcements** box under the description. Empty = header and box omitted entirely. |
+
+### `serverAnnouncements` in detail
+
+Intended to be written as a YAML **literal block scalar** so line breaks survive as typed:
+
+```yaml
+serverAnnouncements: |
+  <b>Server events</b>
+  Bosses every Saturday, 20:00 UTC.
+
+  Join our [Discord](https://discord.gg/example) for the schedule.
+```
+
+- `[label](url)` is rewritten to TMP `<link="url">` markup by `FormatAnnouncementsRich`.
+  Everything else passes through, so `<b>`, `<i>`, `<color=#…>` work.
+- **Only `http://` and `https://` are opened** (`IsOpenableUrl`). A link that fails the
+  check is rendered as plain label text — not styled as a link at all — so nothing
+  *looks* clickable that won't be. Rationale: `client.yaml` usually ships inside a
+  modpack, so the text isn't necessarily written by the person at the keyboard, and a
+  click must not be able to launch `file://` or a custom scheme handler.
+- Clicks resolve through `AnnouncementLinkClicker` → `TMP_TextUtilities.FindIntersectingLink`
+  (by reflection — the project doesn't reference `Unity.TextMeshPro`) → `Application.OpenURL`.
+
+### Template + migration
+
+`EnsureConfig()` only *writes* `client.yaml` when it is missing. Because a new key
+would otherwise never appear for upgrading players, there is one migration branch:
+if the file exists but contains no `serverAnnouncements` (case-insensitive), the
+commented block from `AnnouncementsYamlBlock()` is **appended** once. Existing
+values and comments are untouched. The shipped default is `serverAnnouncements: ""`
+with the block-scalar example in comments — deliberately *not* a live example, so
+enabling Quick Login never surfaces a placeholder Discord link.
+
+Add a key → add it to `ClientSettings`, to the fresh-file template in `EnsureConfig`,
+and to the migration check if upgrading players must be able to discover it.

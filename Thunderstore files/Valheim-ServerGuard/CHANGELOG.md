@@ -1,5 +1,48 @@
 # Changelog
 
+## 2.0.0
+
+**One mod for both sides, and dev commands for your staff.** This is a breaking packaging change — read the upgrade note.
+
+### Changed
+- **The server plugin and the client companion are now one mod.** Install `Valheim_ServerGuard` on the dedicated server *and* on every player's game — the same package, the same DLL. It works out which side it is on when it loads: a headless dedicated server runs the server half, a player's game runs the client half.
+- **The `Valheim_ServerGuard_Client` package is retired.** Remove it from every profile and modpack before updating; it must not run next to 2.0. Config files are unchanged (`conf/*.yaml` on the server, `client.yaml` on each player).
+- **Existing `allowed_mods.yaml` files keep working.** The old client GUID `com.taeguk.valheim.serverguard.client` in `required_mods` is read as the new `com.taeguk.valheim.serverguard`; the server logs a reminder to update the line. If you had the old client DLL hash-pinned, re-pin against the 2.0 DLL — the old hash can never match.
+- The kick text for a client without the mod now reads *ServerGuard is not installed on your client* instead of naming the old companion.
+
+### New
+- **Dev commands for owners.** Valheim refuses every cheat command on a dedicated-server client, whoever types it. Owners (`conf/owners.yaml`) can now use all of them, exactly as in single-player: type `devcommands`, then `fly`, `god`, `ghost`, `spawn`, `goto`, `heal`, `skiptime`, `tod`, `setworldmodifier`, `randomevent`, and the rest. Owners are also treated as vanilla admins by the server, so nothing needs to be added to `adminlist.txt`. (`enableOwnerDevcommands`, default on.)
+- **Dev commands for moderators — the ones you choose.** Moderators (`conf/moderators.yaml`) get exactly the commands in `moderatorDevcommands` (default: `goto`, `pos`, `removedrops`, `stopevent`, `find`). Anything else is refused on their client with a short message, and the attempt is posted to the admin Discord channel — no strike, they're staff. (`enableModeratorDevcommands`, default on.) `fly`, `debugmode`, `spawn`, `itemset`, `nocost`, `noplacementcost` and `location` can never be given to a moderator, whatever the list says.
+- **Moderators go through the mod check.** Only owners skip attestation now. A new `moderator_allowed_mods:` section in `allowed_mods.yaml` lists mods only moderators may run (admin tooling), on top of the normal lists.
+- **Moderator welcome.** Every time a moderator logs in they get a chat message: a greeting, the dev commands they currently have, where the `sg` tools are, and a reminder to moderate responsibly.
+- **Cheat-detection notice.** When cheat-taint detection is on, every player sees a one-time notice panel on their first login after launching the game (not on a relog) explaining what is detected and what the consequence is under your current policy.
+- **Map coordinates for staff.** Owners and moderators see the world X/Z under the cursor on the large map, next to the biome name.
+- **Speed check default** raised from 15 to 70 m/s. The old default flagged modded mounts and skills; 70 only catches teleport-style movement. Existing servers keep whatever they have set.
+- **Cheat-taint detection.** Valheim 1.0 marks everything that came out of a cheat — `spawn`ed items, anything crafted from them, pieces built with `nocost`, creatures hit while in god/fly mode — and keeps the mark in the character file, so it survives a trip through single-player. ServerGuard now uses it: players carrying flagged items are reported to your admin channel (`cheatTaintPolicy: log`, the default), or have them removed (`strip`), or get a strike as well (`violation`). Cheat-flagged builds go into the build log with a new `cheated` column and are double-checked by the server against the piece itself. Debug fly is detected server-side. Owners are exempt; moderators are reported unless you say otherwise. Everything is informational by default — three new rules, `CheatedItem`, `CheatedBuild` and `DebugFly`, all start with `countAsViolation: false`. If your modpack has weapons over 10000 damage, add them to `cheatTaintIgnoredItems` (the game auto-flags those).
+- Every dev command that runs on the server (`skiptime`, `sleep`, `randomevent`, world modifiers, ...) is logged with who ran it and posted to the admin channel. Staff see a short `[ServerGuard]` acknowledgement in their console; on connecting they get one line telling them what they have been granted.
+- All three settings hot-reload, and so do `owners.yaml` / `moderators.yaml`, so promoting or demoting someone takes effect while they are online.
+- `sg status` shows a `DevCmds` line. The new settings are appended to an existing `settings.yaml` on first boot, with comments.
+- If you were running *Server Devcommands* only to give staff cheats, you no longer need it.
+
+### Upgrade note
+1. Server: replace the DLL (or update the package). Start it once and check the log for `starting as SERVER`.
+2. Players: remove `Valheim_ServerGuard_Client`, install `Valheim_ServerGuard`. Their `client.yaml` is untouched.
+3. Optionally edit `allowed_mods.yaml` to the new GUID.
+
+## 1.8.1
+
+**Compatibility release for Valheim 1.0.** No code changes — this version exists to state the compatibility and to keep the server and companion version numbers matched.
+
+ServerGuard was verified against **Valheim 1.0.7** (network version 39, Unity 6000.0.75) on BepInEx 5.4.23.5: the server plugin loads cleanly, its self-test passes, and every Valheim method it patches (`ZNet.IsAllowed`, `ZNet.OnNewConnection`, `ZNet.RPC_PeerInfo`, `ZNet.RPC_ServerSyncedPlayerData`, `WearNTear.Damage`/`Destroy`, `Inventory.AddItem`, the raid-event hooks) still exists with the same signature. Mod attestation, the ban layer, the console guard and the privilege tiers all behave as they did on the previous build.
+
+If you are already running 1.8.0, you do not need this update for anything to work — take it only to keep both plugins on the same version number.
+
+Note for modpack authors: Valheim 1.0 changed the `Terminal.ConsoleCommand` constructor, which breaks *other* mods that register console commands (Server Devcommands 1.109 throws `MissingMethodException` on startup). ServerGuard never constructs one and is unaffected.
+
+Version-match release. The server plugin is functionally unchanged from 1.7.0 — all of 1.8.0's work is in the companion plugin, which gains a scrollable **Announcements** box with clickable links on its Quick Login title-screen panel (configured per-client in `client.yaml`, not on the server).
+
+Update both plugins together so the versions stay matched.
+
 ## 1.7.0
 
 Feature release. Three new subsystems: owner/moderator privilege tiers, an instant SteamID ban layer, and a console guard. Also fixes several settings that were invisible in `settings.yaml`. Requires companion plugin **v1.7.0** — the console guard is enforced by the companion, so an older client will ignore it.

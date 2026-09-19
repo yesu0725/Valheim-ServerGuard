@@ -1,12 +1,13 @@
 # Privilege Tiers
 
-Three tiers as of 1.7.0. Two config files, no settings.
+Three tiers as of 1.7.0. Two config files; the only settings that mention tiers are
+the 2.0 dev-command grants.
 
-| Tier | File | Meaning |
-|---|---|---|
-| **Owner** | `conf/owners.yaml` | The server operator. Exempt from **every** rule, unconditionally. |
-| **Moderator** | `conf/moderators.yaml` | Staff. Everything the pre-1.7 "admin" tier had. |
-| **Player** | — | Everyone else. |
+| Tier | File | Meaning | Dev commands (2.0) |
+|---|---|---|---|
+| **Owner** | `conf/owners.yaml` | The server operator. Exempt from **every** rule, unconditionally. | **All**, plus vanilla admin rights (`enableOwnerDevcommands`). |
+| **Moderator** | `conf/moderators.yaml` | Staff. Everything the pre-1.7 "admin" tier had. | Only `moderatorDevcommands` (`enableModeratorDevcommands`). |
+| **Player** | — | Everyone else. | None — vanilla refusal plus the console guard. |
 
 ## Migration from `moderators.yaml`
 
@@ -69,10 +70,13 @@ short-circuits:
 | `ApplyForcedMapPosition` | Exempt regardless of `forceMapPositionsExemptAdmins` (that setting governs moderators only). |
 | `SendCheatItemRemovalIfEnabled` | Skipped. |
 | `SendConsolePolicy` | `exempt = 1` regardless of `consoleGuardExemptModerators`. |
+| `CheatTaintExempt` (CheatedItem / CheatedBuild / DebugFly, 2.0) | Exempt. Moderators are **not** unless `cheatTaintExemptModerators`. |
+| `Patch_OnNewConnection` attestation skip (2.0) | Owners only. **Moderators attest like players**, with `moderator_allowed_mods` added to their allowlist (`ValidateAgainstPolicy(manifest, pid)`). |
 
-Inherited via `IsAdmin` (unchanged call sites): attestation challenge, character
-limit, speed check, devcommand/console reporting, skill cap, animation-cancel
-*reporting*, death log routing, `sg` authorisation.
+Inherited via `IsAdmin` (unchanged call sites): character limit, speed check,
+devcommand/console reporting, skill cap, animation-cancel *reporting*, death log
+routing, `sg` authorisation. (The attestation skip was `IsAdmin` until 2.0; it is
+`IsOwner` now.)
 
 One rule is enforced entirely **client-side** and so cannot be waved through by the
 server: the emote/animation-cancel gate swallows the input locally before any RPC is
@@ -112,6 +116,23 @@ The server resolves this into a single `exempt` boolean in the
 Both `LoadOwners` and `LoadAdmins` call `BroadcastConsolePolicy()` on hot-reload —
 without it, a player promoted or demoted mid-session would keep the console rights
 they had at connect time.
+
+## Dev commands per tier (2.0)
+
+The same policy push carries `devMode` (`all` / `list` / `none`) and the moderator
+list. Where each tier is authorised:
+
+| Site | Owner | Moderator | Player |
+|---|---|---|---|
+| `DevcommandModeFor` → policy push | `all` | `list` (if enabled and non-empty) | `none` |
+| `IsDevcommandAllowed(pid, cmd)` — server-side gate for forwarded / routed commands | true | `cmd == devcommands` or in list | false |
+| `IsVanillaAdminByGrant` → `Patch_ZNet_ListContainsId` — reads as `adminlist.txt` member | true | **false** (kept out on purpose: vanilla admin RPCs are all-or-nothing) | false |
+| `ModeratorReservedCommands` (`fly debugmode spawn itemset nocost noplacementcost location`) | n/a | **never**, whatever the list says | n/a |
+| Client login messages (2.0) | one console line on grant | chat welcome every login: greeting, live command list, `sg help`, responsibility note | — |
+| Staff map coordinates (2.0, `Patch_Minimap_UpdateBiome_StaffCoords`) | yes | yes | no |
+| Client `ShouldBlockConsoleCommand` | exempt anyway | non-listed dev-only command → category `moderator` | unchanged |
+
+Full mechanism in `claude/console-guard.md`, *Staff dev commands*.
 
 ---
 

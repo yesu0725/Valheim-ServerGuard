@@ -18,10 +18,16 @@ using ValheimServerGuard.Shared;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
-[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.7.0")]
-public class Plugin : BaseUnityPlugin
+namespace ValheimServerGuard;
+
+// The SERVER half of ServerGuard. Attached by ServerGuardPlugin.Awake on a dedicated
+// server only (never on a player's client). Not a BepInEx plugin itself: it is a
+// plain MonoBehaviour living on the same GameObject as the entry plugin, so Awake /
+// StartCoroutine / OnDestroy behave exactly as they did when this was the
+// standalone server plugin.
+internal class ServerPlugin : MonoBehaviour
 {
-    internal static Plugin Instance;
+    internal static ServerPlugin Instance;
     internal static ManualLogSource LogS;
     private Harmony _harmony;
 	
@@ -87,6 +93,7 @@ public class Plugin : BaseUnityPlugin
     private List<AllowedModEntry> _requiredMods = new();
     private List<AllowedModEntry> _allowedMods  = new();
     private List<AllowedModEntry> _bannedMods   = new();
+    private List<AllowedModEntry> _moderatorAllowedMods = new();   // 2.0: allowed for moderators only
 
     // Modset fingerprint (#2) - canonical identifier of the server's curated mod set.
     // Recomputed on every LoadAllowedMods. Written to ConfDir\modset_fingerprint.txt
@@ -120,6 +127,7 @@ public class Plugin : BaseUnityPlugin
     // sample can compute a velocity. Reset on disconnect via Patch_Disconnect.
     private class SpeedState
     {
+        public bool DebugFlyFlagged;   // 2.0: rule DebugFly fired for the current fly session
         public Vector3 LastPos;
         public bool HasLastPos;
         public float LastSampleTime;
@@ -149,6 +157,11 @@ public class Plugin : BaseUnityPlugin
     private const string RULE_STACK_OVERFLOW          = "StackOverflow";
     private const string RULE_ANIMATION_CANCEL        = "AnimationCancel";
     private const string RULE_SKILL_OVERFLOW          = "SkillOverflow";
+    // 2.0 cheat-taint family. Driven by Valheim 1.0's own "cheated" bookkeeping - see
+    // the "Cheat taint detection" section and claude/features-and-rules.md.
+    private const string RULE_CHEATED_ITEM            = "CheatedItem";
+    private const string RULE_CHEATED_BUILD           = "CheatedBuild";
+    private const string RULE_DEBUG_FLY               = "DebugFly";
 
     // All rule keys, used to seed default countAsViolation map and validate user input.
     private static readonly string[] ALL_RULES = new[]
@@ -168,6 +181,9 @@ public class Plugin : BaseUnityPlugin
         RULE_STACK_OVERFLOW,
         RULE_ANIMATION_CANCEL,
         RULE_SKILL_OVERFLOW,
+        RULE_CHEATED_ITEM,
+        RULE_CHEATED_BUILD,
+        RULE_DEBUG_FLY,
     };
 
     // File watchers (hot-reload)
@@ -220,7 +236,7 @@ public class Plugin : BaseUnityPlugin
 
         // --- Client-attestation handshake (v1.3+) ---
         // The server requests a signed mod manifest from every connecting peer via the
-        // Valheim ServerGuard Client companion plugin. RequireCompanion=true means any
+        // ServerGuard running on the player's client. RequireCompanion=true means any
         // peer that fails to deliver a valid manifest is kicked (vanilla / wrong-modpack).
         public bool RequireCompanion         { get; set; } = true;
         public int  CompanionTimeoutSeconds  { get; set; } = 10;
@@ -290,13 +306,22 @@ public class Plugin : BaseUnityPlugin
             ["StackOverflow"]                 = false,
             ["AnimationCancel"]               = false,
             ["SkillOverflow"]                 = false,
+
+            // 2.0 cheat-taint rules. Off by default: audit the admin channel first
+            // (modded high-damage weapons trip Valheim's own >10000-damage auto-flag),
+            // then opt in. DebugFly is server-observed and unambiguous, but stays off
+            // for consistency - flip it on once you have seen it never fires for staff.
+            ["CheatedItem"]                   = false,
+            ["CheatedBuild"]                  = false,
+            ["DebugFly"]                      = false,
         };
 
         // --- Devcommands gate (#5) ---
-        // Server side of the gate: controls whether attempts reported by the companion
-        // plugin are logged, posted to Discord, and recorded as violations.
-        // The companion plugin ALWAYS blocks devcommands client-side regardless of this
-        // setting; the toggle only controls server-side accounting.
+        // Server side of the gate: controls whether attempts reported by the client
+        // half are logged, posted to Discord, and recorded as violations.
+        // The client half ALWAYS blocks devcommands for ordinary players regardless of
+        // this setting; the toggle only controls server-side accounting. Staff are the
+        // exception - see "Staff dev commands" below.
         public bool EnableDevcommandGate { get; set; } = true;
 
         // --- Movement-speed sanity check (#6) ---
@@ -309,7 +334,7 @@ public class Plugin : BaseUnityPlugin
         // Single-sample jumps larger than the teleport tolerance (e.g. portal travel)
         // are ignored to avoid false positives.
         public bool   EnableSpeedCheck                  { get; set; } = true;
-        public double SpeedCheckMaxMetersPerSecond      { get; set; } = 15.0;
+        public double SpeedCheckMaxMetersPerSecond      { get; set; } = 70.0;
         public double SpeedCheckSampleSeconds           { get; set; } = 1.0;
         public int    SpeedCheckConsecutiveStrikes      { get; set; } = 3;
         public double SpeedCheckTeleportToleranceMeters { get; set; } = 60.0;
@@ -382,6 +407,51 @@ public class Plugin : BaseUnityPlugin
         // player's inventory on login (the companion performs the removal after spawn).
         public bool EnableCheatItemRemoval { get; set; } = true;
         public List<string> CheatItems     { get; set; } = new List<string> { "SwordCheat", "SledgeCheat" };
+
+        // --- Cheat taint detection (2.0) ---
+        // Valheim 1.0 marks everything that came out of a cheat: `spawn`ed items and
+        // creatures (ItemData.m_cheated / ZDO "cheated"), pieces built with `nocost` or
+        // cheated materials, creatures hit while in god/ghost/fly mode, and it carries
+        // the mark through crafting, smelting, cooking, drops and trading. The mark is
+        // saved in the CHARACTER file, so gear spawned in single-player arrives on this
+        // server still flagged. The game only uses it to withhold achievements; this
+        // feature reads it as an anti-cheat signal.
+        //
+        // What it is NOT: proof. A hacked client simply never sets the flag. It catches
+        // an honest game being used dishonestly (single-player spawns, staff hand-outs,
+        // listen-server cheats) and complements attestation, it does not replace it.
+        //
+        // Three rules:
+        //   CheatedItem  - the client reports every flagged item in the player's
+        //                  inventory (ServerGuard_CheatState, on spawn, every 60 s and
+        //                  whenever the set changes). Policy below.
+        //   CheatedBuild - a placed piece was flagged. The client says so in its build
+        //                  report, and the server reads the piece's own ZDO a few
+        //                  seconds later to confirm ("cheated" + "creator"), so a
+        //                  client that lies is contradicted by the world state.
+        //   DebugFly     - the player's ZDO carries DebugFly=true. Read server-side
+        //                  in the speed-check loop; nothing to trust.
+        //
+        // cheatTaintPolicy (CheatedItem only):
+        //   "log"       - admin-channel post when the set of flagged items changes (DEFAULT)
+        //   "strip"     - as log, and the client removes the flagged items on the spot
+        //   "violation" - as strip, and a CheatedItem strike (subject to countAsViolation)
+        // CheatedBuild and DebugFly always go through AddViolation, so countAsViolation
+        // decides whether they are informational or strikes.
+        //
+        // Owners are exempt from all three. Moderators are NOT exempt by default - they
+        // can never be granted spawn/nocost/fly/debugmode (ModeratorReservedCommands),
+        // so a flagged moderator is always worth a look.
+        //
+        // cheatTaintIgnoredItems: prefab names to ignore for CheatedItem. Valheim also
+        // auto-flags any item whose total damage exceeds 10000 on pickup; if your
+        // modpack has such weapons, list them here rather than turning the feature off.
+        public bool   EnableCheatTaintDetection  { get; set; } = true;
+        public string CheatTaintPolicy           { get; set; } = "log";
+        public bool   CheatTaintExemptModerators { get; set; } = false;
+        public bool   CheatTaintFlagUsedCheats   { get; set; } = true;   // also report the character's permanent "used cheats" mark
+        public List<string> CheatTaintIgnoredItems { get; set; } = new List<string>();
+        public bool   EnableDebugFlyCheck        { get; set; } = true;
 
         // --- Arrival shout ---
         // Vanilla makes every player shout the localised "I have arrived!" line the first
@@ -474,6 +544,31 @@ public class Plugin : BaseUnityPlugin
         // still blocks the command, it just doesn't report it.
         public bool ConsoleGuardReportAttempts { get; set; } = true;
 
+        // --- Staff dev commands (2.0) ---
+        // Vanilla refuses every cheat command on a dedicated-server client, whoever
+        // types it: Terminal.IsCheatsEnabled() requires ZNet.IsServer(). ServerGuard
+        // lifts that for staff, on the client side (so `fly`, `god`, `spawn`, `goto`
+        // and friends run exactly as they do in single-player) and on the server side
+        // (so the commands Valheim forwards to the server - `skiptime`, `sleep`,
+        // `setworldmodifier`, `randomevent`, ... - are accepted from staff without an
+        // adminlist.txt entry).
+        //
+        // Owners get every command. Moderators get only the ones listed below; a
+        // moderator typing anything else is refused client-side and the attempt is
+        // posted to the admin channel (no strike). `devcommands` itself is always
+        // permitted to a moderator with a non-empty list - it only flips the local
+        // toggle, and nothing works without it.
+        //
+        // Note: `debugmode` also unlocks the debug HOTKEYS (Z fly, B free build,
+        // K killenemies, L removedrops, Ctrl+click map teleport). Listing it for
+        // moderators effectively grants fly and nocost too.
+        public bool EnableOwnerDevcommands     { get; set; } = true;
+        public bool EnableModeratorDevcommands { get; set; } = true;
+        public List<string> ModeratorDevcommands { get; set; } = new List<string>
+        {
+            "goto", "pos", "removedrops", "stopevent", "find",
+        };
+
         // Deprecated (kept so old YAML loads without errors). v1.4+ uses two webhooks instead.
         public bool DiscordPublicMode { get; set; } = true;
 
@@ -510,7 +605,7 @@ public class Plugin : BaseUnityPlugin
     }
 
     // internal (not private) because IsBannedId/AddBan hand it back to the Harmony
-    // patch classes, which are separate types even though they nest inside Plugin.
+    // patch classes, which are separate types even though they nest inside ServerPlugin.
     internal class BanEntry
     {
         // SteamID64 (17 digits). The only field that matters for enforcement.
@@ -553,6 +648,11 @@ public class Plugin : BaseUnityPlugin
 
         [YamlMember(Alias = "banned_mods", ApplyNamingConventions = false)]
         public List<string> banned_mods   { get; set; } = new();
+
+        // 2.0: extra mods only moderators may run (admin tooling etc.). Players are
+        // still held to required_mods + allowed_mods; owners skip attestation entirely.
+        [YamlMember(Alias = "moderator_allowed_mods", ApplyNamingConventions = false)]
+        public List<string> moderator_allowed_mods { get; set; } = new();
     }
 
     private class AllowedModEntry
@@ -587,6 +687,9 @@ public class Plugin : BaseUnityPlugin
 
     private class DetectionMetrics
     {
+        public long cheat_taint_reports   { get; set; } = 0;   // 2.0: CheatedItem reports with a changed item set
+        public long cheat_taint_builds    { get; set; } = 0;   // 2.0: CheatedBuild confirmations
+        public long debug_fly_detections  { get; set; } = 0;   // 2.0: DebugFly flags
         public long total_players_checked { get; set; } = 0;
         public long total_mods_detected { get; set; } = 0;
         public long phase1_rpc_detections { get; set; } = 0;
@@ -617,7 +720,7 @@ public class Plugin : BaseUnityPlugin
     private void Awake()
     {
         Instance = this;
-        LogS = Logger;
+        LogS = ServerGuardPlugin.Log;
 
         // YAML serializer
         _yamlIn = new DeserializerBuilder()
@@ -663,11 +766,14 @@ public class Plugin : BaseUnityPlugin
         StartWatchers();
 
         // Harmony patches
-        _harmony = new Harmony("com.taeguk.valheim.serverguard");
-        _harmony.PatchAll();
+        // Only the patch classes nested in THIS type - the client half's patches must
+        // never be applied on the server (see ServerGuardPlugin.PatchNested).
+        _harmony = new Harmony(ServerGuardPlugin.GUID + ".server");
+        var patched = ServerGuardPlugin.PatchNested(_harmony, typeof(ServerPlugin));
+        LogS.LogInfo($"[ServerGuard] Applied {patched} server-side Harmony patch class(es).");
 
         LogS.LogInfo(
-            $"[ServerGuard] Loaded (v1.7.0). " +
+            $"[ServerGuard] Loaded (v{ServerGuardPlugin.VERSION}). " +
             $"Enforcement: {(_settings.Enforce ? "ON" : "LOG-ONLY")}. " +
             $"RequireCompanion: {(_settings.RequireCompanion ? "ON" : "OFF")}. " +
             $"RequireHmac: {(_settings.RequireHmac ? "ON" : "OFF")}. " +
@@ -696,6 +802,7 @@ public class Plugin : BaseUnityPlugin
 		// Movement-speed sanity check (#6). Runs forever; the toggle is checked each tick
 		// so flipping it at runtime via hot-reload of settings.yaml takes effect immediately.
 		StartCoroutine(SpeedCheckLoop());
+		StartCoroutine(CheatedBuildSweepLoop());
 
 		// Build-log retention pruner (#14). Hourly sweep; toggle / retention re-read each
 		// pass so settings.yaml hot-reloads are honoured.
@@ -727,7 +834,7 @@ public class Plugin : BaseUnityPlugin
 		// One-line admin-channel announcement that the plugin is up. Lets moderators
 		// confirm the server came back online after a restart without scraping logs.
 		PostAdminEvent(
-			$":rocket: **ServerGuard online** v1.7.0  " +
+			$":rocket: **ServerGuard online** v{ServerGuardPlugin.VERSION}  " +
 			$"enforce={(_settings.Enforce ? "ON" : "off")}  " +
 			$"requireHmac={(_settings.RequireHmac ? "ON" : "off")}  " +
 			$"req/allow/ban={_requiredMods.Count}/{_allowedMods.Count}/{_bannedMods.Count}  " +
@@ -946,10 +1053,10 @@ public class Plugin : BaseUnityPlugin
                 SharedSecret = GenerateSharedSecret()
             };
             var sb = new StringBuilder();
-            sb.AppendLine("# ServerGuard settings (v1.7.0)");
+            sb.AppendLine($"# ServerGuard settings (v{ServerGuardPlugin.VERSION})");
             sb.AppendLine("#");
             sb.AppendLine("# Client-attestation handshake:");
-            sb.AppendLine("#   requireCompanion       - if true, peers without the ServerGuard.Client plugin are kicked.");
+            sb.AppendLine("#   requireCompanion       - if true, peers whose client is not running ServerGuard are kicked.");
             sb.AppendLine("#   companionTimeoutSeconds - how long to wait for the manifest before declaring 'no companion'.");
             sb.AppendLine("#   requireHmac            - if true, manifests must carry a valid HMAC signature.");
             sb.AppendLine("#   sharedSecret           - secret string. Must match every client's client.yaml `sharedSecret`.");
@@ -964,17 +1071,19 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("#   characterLimit         - max distinct character names a SteamID may use on this server.");
             sb.AppendLine("#");
             sb.AppendLine("# Devcommands gate (anti-cheat):");
-            sb.AppendLine("#   enableDevcommandGate   - if true, devcommand attempts reported by the companion");
-            sb.AppendLine("#                            plugin are logged + posted + counted. The companion");
-            sb.AppendLine("#                            ALWAYS blocks `devcommands` and forces");
-            sb.AppendLine("#                            Console.IsCheatsEnabled=false on multiplayer clients;");
-            sb.AppendLine("#                            this toggle only affects server-side accounting.");
+            sb.AppendLine("#   enableDevcommandGate   - if true, devcommand attempts reported by the client");
+            sb.AppendLine("#                            are logged + posted + counted. The client ALWAYS");
+            sb.AppendLine("#                            blocks `devcommands` for ordinary players; this toggle");
+            sb.AppendLine("#                            only affects server-side accounting. Staff are the");
+            sb.AppendLine("#                            exception - see 'Staff dev commands' below.");
             sb.AppendLine("#");
             sb.AppendLine("# Movement-speed sanity check (anti-cheat):");
             sb.AppendLine("#   enableSpeedCheck                  - master toggle.");
             sb.AppendLine("#   speedCheckMaxMetersPerSecond      - horizontal speed cap. Vanilla sprint ~5 m/s,");
-            sb.AppendLine("#                                       longship sail ~9-10 m/s. 15 m/s is a generous");
-            sb.AppendLine("#                                       default; raise for modded mounts/skills.");
+            sb.AppendLine("#                                       longship sail ~9-10 m/s. The 70 m/s default");
+            sb.AppendLine("#                                       leaves room for modded mounts/skills and only");
+            sb.AppendLine("#                                       catches outright teleport-style movement; lower");
+            sb.AppendLine("#                                       it for a vanilla-ish server.");
             sb.AppendLine("#   speedCheckSampleSeconds           - poll interval. Lower = faster detection,");
             sb.AppendLine("#                                       more sensitive to lag spikes. 1.0 is balanced.");
             sb.AppendLine("#   speedCheckConsecutiveStrikes      - over-threshold samples needed to fire SpeedHack.");
@@ -1126,6 +1235,37 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("#   consoleAllowedCommands  - the permitted set (mode: whitelist).");
             sb.AppendLine("#   consoleGuardReportAttempts - log/post/count blocked attempts.");
             sb.AppendLine("#");
+            sb.AppendLine("# Cheat taint detection (uses Valheim 1.0's own 'cheated' marks):");
+            sb.AppendLine("#   enableCheatTaintDetection - report items/builds the game itself marked as cheat-made.");
+            sb.AppendLine("#                             The mark travels in the character file, so gear spawned");
+            sb.AppendLine("#                             in single-player is caught on arrival.");
+            sb.AppendLine("#   cheatTaintPolicy        - 'log' (default) admin-channel post only;");
+            sb.AppendLine("#                             'strip' also removes the flagged items from the player;");
+            sb.AppendLine("#                             'violation' also records a CheatedItem strike.");
+            sb.AppendLine("#   cheatTaintExemptModerators - false (default): moderators are reported too.");
+            sb.AppendLine("#   cheatTaintFlagUsedCheats - also report characters carrying the permanent 'used");
+            sb.AppendLine("#                             dev commands' mark (once per session).");
+            sb.AppendLine("#   cheatTaintIgnoredItems  - prefab names to ignore. Valheim auto-flags any item");
+            sb.AppendLine("#                             with >10000 total damage - list modded weapons here.");
+            sb.AppendLine("#   enableDebugFlyCheck     - flag players whose character reports DebugFly=true");
+            sb.AppendLine("#                             (server-observed; rule DebugFly).");
+            sb.AppendLine("#   Owners are exempt from all of it. CheatedBuild / DebugFly / CheatedItem strikes");
+            sb.AppendLine("#   are governed by countAsViolation (all three default to informational).");
+            sb.AppendLine("#");
+            sb.AppendLine("# Staff dev commands:");
+            sb.AppendLine("#   enableOwnerDevcommands  - owners (owners.yaml) can use EVERY dev command on this");
+            sb.AppendLine("#                             server, exactly as in single-player: type `devcommands`");
+            sb.AppendLine("#                             then `fly`, `god`, `spawn`, `goto`, `skiptime`, ... Owners");
+            sb.AppendLine("#                             are also treated as vanilla admins by the server, so the");
+            sb.AppendLine("#                             commands Valheim runs server-side work without adminlist.txt.");
+            sb.AppendLine("#   enableModeratorDevcommands");
+            sb.AppendLine("#                           - moderators (moderators.yaml) can use the commands in");
+            sb.AppendLine("#                             moderatorDevcommands and nothing else. Anything outside the");
+            sb.AppendLine("#                             list is refused and posted to the admin channel (no strike).");
+            sb.AppendLine("#   moderatorDevcommands    - the moderator list. `devcommands` itself is always allowed.");
+            sb.AppendLine("#                             `debugmode` also unlocks the debug hotkeys (Z fly, B free");
+            sb.AppendLine("#                             build, K/L, Ctrl+click map teleport) - list it deliberately.");
+            sb.AppendLine("#");
             sb.AppendLine(_yamlOutFull.Serialize(defaults));
             File.WriteAllText(SettingsYaml, sb.ToString());
         }
@@ -1199,9 +1339,12 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("#   required_mods: every connecting client MUST report all of these in its manifest.");
             sb.AppendLine("#   allowed_mods : extra mods the client may run beyond the required set.");
             sb.AppendLine("#   banned_mods  : if any of these appear in the client manifest, the client is kicked.");
+            sb.AppendLine("#   moderator_allowed_mods : extra mods that ONLY moderators (moderators.yaml) may run,");
+            sb.AppendLine("#                  on top of required_mods + allowed_mods. Moderators go through the same");
+            sb.AppendLine("#                  mod check as players; owners are the only tier that skips it.");
             sb.AppendLine("#");
             sb.AppendLine("# Recommended workflow:");
-            sb.AppendLine("#   1. Install the ServerGuard companion plugin on a client that has your full modpack.");
+            sb.AppendLine("#   1. Install ServerGuard (this same mod) on a client that has your full modpack.");
             sb.AppendLine("#   2. Launch Valheim once. The client writes a snippet to:");
             sb.AppendLine("#        <profile>/BepInEx/config/ServerGuard/mods_for_allowed_mods.yaml");
             sb.AppendLine("#   3. Paste that snippet's `allowed_mods:` block into this file.");
@@ -1210,11 +1353,13 @@ public class Plugin : BaseUnityPlugin
             sb.AppendLine("# real client - every GUID will appear in BepInEx/LogOutput.log.");
             sb.AppendLine();
             sb.AppendLine("required_mods:");
-            sb.AppendLine("  - com.taeguk.valheim.serverguard.client    # the ServerGuard companion plugin");
+            sb.AppendLine($"  - {ServerGuardPlugin.GUID}    # ServerGuard itself (the same mod, installed on the client)");
             sb.AppendLine();
             sb.AppendLine("allowed_mods: []");
             sb.AppendLine();
             sb.AppendLine("banned_mods: []");
+            sb.AppendLine();
+            sb.AppendLine("moderator_allowed_mods: []");
             sb.AppendLine();
             File.WriteAllText(AllowedModsYaml, sb.ToString());
         }
@@ -2055,7 +2200,8 @@ public class Plugin : BaseUnityPlugin
             _requiredMods = ParseAllowedList(doc.required_mods);
             _allowedMods  = ParseAllowedList(doc.allowed_mods);
             _bannedMods   = ParseAllowedList(doc.banned_mods);
-            LogS.LogInfo($"[ServerGuard] allowed_mods.yaml loaded (required={_requiredMods.Count}, allowed={_allowedMods.Count}, banned={_bannedMods.Count})");
+            _moderatorAllowedMods = ParseAllowedList(doc.moderator_allowed_mods);
+            LogS.LogInfo($"[ServerGuard] allowed_mods.yaml loaded (required={_requiredMods.Count}, allowed={_allowedMods.Count}, banned={_bannedMods.Count}, moderatorOnly={_moderatorAllowedMods.Count})");
             if (_bootCompleted)
             {
                 PostAdminEvent($":arrows_counterclockwise: allowed_mods.yaml reloaded — req={_requiredMods.Count} allow={_allowedMods.Count} ban={_bannedMods.Count}");
@@ -2067,6 +2213,7 @@ public class Plugin : BaseUnityPlugin
             _requiredMods = new List<AllowedModEntry>();
             _allowedMods  = new List<AllowedModEntry>();
             _bannedMods   = new List<AllowedModEntry>();
+            _moderatorAllowedMods = new List<AllowedModEntry>();
         }
 
         RecomputeModsetFingerprint();
@@ -2128,6 +2275,22 @@ public class Plugin : BaseUnityPlugin
             var key = parts[0].Trim();
             var sha = parts.Length > 1 ? parts[1].Trim().ToLowerInvariant() : null;
             if (string.IsNullOrEmpty(key)) continue;
+
+            // 2.0 merge: the client companion no longer has its own GUID - it reports
+            // as the one merged plugin. An allowed_mods.yaml written for 1.x still lists
+            // the old companion GUID under required_mods, so treat it as the new one
+            // rather than kicking every player for a "missing" mod. The pinned hash
+            // (if any) is dropped: it was the hash of the old client DLL and can never
+            // match the merged binary. The operator should re-pin against 2.0.
+            if (string.Equals(key, ServerGuardPlugin.LEGACY_CLIENT_GUID, StringComparison.OrdinalIgnoreCase))
+            {
+                LogS?.LogWarning($"[ServerGuard] allowed_mods.yaml lists the pre-2.0 client GUID `{key}` - "
+                    + $"treating it as `{ServerGuardPlugin.GUID}` (the merged mod). Update the file to the new GUID"
+                    + (sha != null ? " and re-pin the hash against the 2.0 DLL." : "."));
+                key = ServerGuardPlugin.GUID;
+                sha = null;
+            }
+
             result.Add(new AllowedModEntry { Key = key.ToLowerInvariant(), Sha256 = sha });
         }
         return result;
@@ -2506,6 +2669,9 @@ public class Plugin : BaseUnityPlugin
             case RULE_STACK_OVERFLOW:       return string.IsNullOrEmpty(detail) ? "had an over-sized item stack" : $"had an over-sized item stack ({detail})";
             case RULE_ANIMATION_CANCEL:     return string.IsNullOrEmpty(detail) ? "tried to cancel attack animation" : $"tried to cancel attack with {detail}";
             case RULE_SKILL_OVERFLOW:       return string.IsNullOrEmpty(detail) ? "skill level above cap" : $"skill level above cap ({detail})";
+            case RULE_CHEATED_ITEM:         return string.IsNullOrEmpty(detail) ? "carried cheat-spawned items" : $"carried cheat-spawned items ({detail})";
+            case RULE_CHEATED_BUILD:        return string.IsNullOrEmpty(detail) ? "built with cheats" : $"built with cheats ({detail})";
+            case RULE_DEBUG_FLY:            return "used debug fly";
             default:                        return "policy violation";
         }
     }
@@ -2862,7 +3028,7 @@ public class Plugin : BaseUnityPlugin
 
             try
             {
-                if (!_settings.EnableSpeedCheck) continue;
+                if (!_settings.EnableSpeedCheck && !_settings.EnableDebugFlyCheck) continue;
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) continue;
                 TickSpeedCheck();
             }
@@ -2889,7 +3055,6 @@ public class Plugin : BaseUnityPlugin
 
             var steamId = GetPeerPlatformId(peer);
             if (string.IsNullOrWhiteSpace(steamId)) continue;
-            if (IsAdmin(steamId)) continue;
 
             // Player character must be spawned. m_characterID is set after the client
             // sends RPC_CharacterID, which happens shortly after PeerInfo completes.
@@ -2901,15 +3066,24 @@ public class Plugin : BaseUnityPlugin
             var zdo = ZDOMan.instance?.GetZDO(charId);
             if (zdo == null) continue;
 
-            Vector3 pos;
-            try { pos = zdo.GetPosition(); }
-            catch { continue; }
-
             if (!_speedState.TryGetValue(peer.m_uid, out var state) || state == null)
             {
                 state = new SpeedState();
                 _speedState[peer.m_uid] = state;
             }
+
+            // Debug-fly probe (2.0). Player.ToggleDebugFly writes DebugFly onto the
+            // player's own ZDO, which the server holds - no client report involved.
+            // Runs before the staff bypass because moderators are subject to it unless
+            // they were actually granted fly/debugmode.
+            if (_settings.EnableDebugFlyCheck) TickDebugFly(steamId, zdo, state);
+
+            if (!_settings.EnableSpeedCheck) continue;
+            if (IsAdmin(steamId)) continue;
+
+            Vector3 pos;
+            try { pos = zdo.GetPosition(); }
+            catch { continue; }
 
             if (state.HasLastPos)
             {
@@ -3042,18 +3216,18 @@ public class Plugin : BaseUnityPlugin
         {
             try
             {
-                if (Plugin.Instance == null) return true;
-                var s = Plugin.Instance._settings;
+                if (ServerPlugin.Instance == null) return true;
+                var s = ServerPlugin.Instance._settings;
                 if (s == null || !s.EnableInventoryCheck) return true;
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
                 if (item == null || item.m_shared == null) return true;
 
-                var issues = Plugin.Instance.ValidateInventoryItem(item);
+                var issues = ServerPlugin.Instance.ValidateInventoryItem(item);
                 if (issues == null || issues.Count == 0) return true;
 
                 foreach (var issue in issues)
                 {
-                    Plugin.LogS.LogWarning($"[ServerGuard] Inventory check: {issue} (logOnly={s.InventoryCheckLogOnly})");
+                    ServerPlugin.LogS.LogWarning($"[ServerGuard] Inventory check: {issue} (logOnly={s.InventoryCheckLogOnly})");
                 }
 
                 // Pick the most specific rule to attribute to. If we couldn't even find
@@ -3065,14 +3239,14 @@ public class Plugin : BaseUnityPlugin
                 // to a specific peer). Record as anonymous so admins can correlate via
                 // log timestamps. AddViolation tolerates empty platformId by treating
                 // it as a no-op counter, so this is safe.
-                Plugin.LogS.LogWarning($"[ServerGuard] {rule} - {detail}");
+                ServerPlugin.LogS.LogWarning($"[ServerGuard] {rule} - {detail}");
 
                 // If logOnly is OFF, block the add by returning false.
                 if (!s.InventoryCheckLogOnly) return false;
             }
             catch (Exception ex)
             {
-                Plugin.LogS.LogWarning($"[ServerGuard] Inventory check error: {ex.Message}");
+                ServerPlugin.LogS.LogWarning($"[ServerGuard] Inventory check error: {ex.Message}");
             }
             return true;
         }
@@ -3369,28 +3543,28 @@ public class Plugin : BaseUnityPlugin
             try
             {
                 if (!__result) return;                       // already denied by vanilla
-                if (Plugin.Instance == null) return;
+                if (ServerPlugin.Instance == null) return;
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
 
-                if (!Plugin.Instance.IsBannedId(hostName, out var entry)) return;
+                if (!ServerPlugin.Instance.IsBannedId(hostName, out var entry)) return;
 
                 __result = false;
 
-                var who = Plugin.Instance.FormatPlayer(entry.id);
+                var who = ServerPlugin.Instance.FormatPlayer(entry.id);
                 var name = string.IsNullOrWhiteSpace(playerName) ? "?" : playerName;
-                Plugin.LogS.LogWarning($"[ServerGuard] Refused banned SteamID at handshake: {who} (character '{name}') — {entry.reason}");
-                Plugin.Instance.PostAdminEvent($":no_entry_sign: Blocked banned **{who}** at connect — {entry.reason}");
+                ServerPlugin.LogS.LogWarning($"[ServerGuard] Refused banned SteamID at handshake: {who} (character '{name}') — {entry.reason}");
+                ServerPlugin.Instance.PostAdminEvent($":no_entry_sign: Blocked banned **{who}** at connect — {entry.reason}");
 
-                if (Plugin.Instance._settings.EnableMetrics)
+                if (ServerPlugin.Instance._settings.EnableMetrics)
                 {
-                    Plugin.Instance._metrics.ban_layer_blocks++;
-                    Plugin.Instance.SaveMetrics();
+                    ServerPlugin.Instance._metrics.ban_layer_blocks++;
+                    ServerPlugin.Instance.SaveMetrics();
                 }
             }
             catch (Exception ex)
             {
                 // Never let this throw - an exception here would break every login.
-                Plugin.LogS?.LogError($"[ServerGuard] IsAllowed ban gate error: {ex}");
+                ServerPlugin.LogS?.LogError($"[ServerGuard] IsAllowed ban gate error: {ex}");
             }
         }
     }
@@ -3411,23 +3585,23 @@ public class Plugin : BaseUnityPlugin
                 // Steam the socket host name is the SteamID64, which means a banned
                 // player is dropped without ever getting a PeerInfo round-trip. We
                 // return before registering any handler or issuing a challenge.
-                var socketId = Plugin.GetPeerSocketId(peer);
-                if (Plugin.Instance.IsBannedId(socketId, out var banEntry))
+                var socketId = ServerPlugin.GetPeerSocketId(peer);
+                if (ServerPlugin.Instance.IsBannedId(socketId, out var banEntry))
                 {
-                    var banned = Plugin.Instance.FormatPlayer(banEntry.id);
-                    Plugin.LogS.LogWarning($"[ServerGuard] Refused banned SteamID at socket accept: {banned} — {banEntry.reason}");
-                    Plugin.Instance.PostAdminEvent($":no_entry_sign: Blocked banned **{banned}** at socket accept — {banEntry.reason}");
-                    if (Plugin.Instance._settings.EnableMetrics)
+                    var banned = ServerPlugin.Instance.FormatPlayer(banEntry.id);
+                    ServerPlugin.LogS.LogWarning($"[ServerGuard] Refused banned SteamID at socket accept: {banned} — {banEntry.reason}");
+                    ServerPlugin.Instance.PostAdminEvent($":no_entry_sign: Blocked banned **{banned}** at socket accept — {banEntry.reason}");
+                    if (ServerPlugin.Instance._settings.EnableMetrics)
                     {
-                        Plugin.Instance._metrics.ban_layer_blocks++;
-                        Plugin.Instance.SaveMetrics();
+                        ServerPlugin.Instance._metrics.ban_layer_blocks++;
+                        ServerPlugin.Instance.SaveMetrics();
                     }
-                    Plugin.Instance.DisconnectAsBanned(peer);
+                    ServerPlugin.Instance.DisconnectAsBanned(peer);
                     return;
                 }
 
-                var pid   = Plugin.GetPeerPlatformId(peer);
-                Plugin.LogS.LogInfo($"[ServerGuard] Incoming connection: {Plugin.Instance.FormatPlayer(pid)}");
+                var pid   = ServerPlugin.GetPeerPlatformId(peer);
+                ServerPlugin.LogS.LogInfo($"[ServerGuard] Incoming connection: {ServerPlugin.Instance.FormatPlayer(pid)}");
 
                 // Always register the per-peer RPC handlers BEFORE checking admin
                 // status. The previous version returned early for admins and never
@@ -3437,44 +3611,50 @@ public class Plugin : BaseUnityPlugin
                 // 1. Manifest receiver - reply path for the attestation challenge.
                 peer.m_rpc.Register<string>("ServerGuard_Manifest", (rpc, json) =>
                 {
-                    Plugin.Instance.OnManifestReceived(peer, json);
+                    ServerPlugin.Instance.OnManifestReceived(peer, json);
                 });
 
                 // Devcommands gate (#5).
                 peer.m_rpc.Register<string>("ServerGuard_DevcommandAttempt", (rpc, command) =>
                 {
-                    Plugin.Instance.OnDevcommandAttemptReceived(peer, command);
+                    ServerPlugin.Instance.OnDevcommandAttemptReceived(peer, command);
                 });
 
                 // Animation-cancel gate.
                 peer.m_rpc.Register<string>("ServerGuard_AnimationCancelAttempt", (rpc, source) =>
                 {
-                    Plugin.Instance.OnAnimationCancelReceived(peer, source);
+                    ServerPlugin.Instance.OnAnimationCancelReceived(peer, source);
                 });
 
                 // Skill-level cap (#10).
                 peer.m_rpc.Register<string>("ServerGuard_SkillReport", (rpc, payload) =>
                 {
-                    Plugin.Instance.OnSkillReportReceived(peer, payload);
+                    ServerPlugin.Instance.OnSkillReportReceived(peer, payload);
+                });
+
+                // Cheat taint (2.0): the client's snapshot of flagged inventory items.
+                peer.m_rpc.Register<string>("ServerGuard_CheatState", (rpc, payload) =>
+                {
+                    ServerPlugin.Instance.OnCheatStateReceived(peer, payload);
                 });
 
                 // Death log.
                 peer.m_rpc.Register<string>("ServerGuard_PlayerDeath", (rpc, payload) =>
                 {
-                    Plugin.Instance.OnPlayerDeathReceived(peer, payload);
+                    ServerPlugin.Instance.OnPlayerDeathReceived(peer, payload);
                 });
 
                 // Shout log: the companion reports outgoing shouts (chat can't be seen
                 // server-side on current Valheim builds). Payload: "<type>|<text>".
                 peer.m_rpc.Register<string>("ServerGuard_Chat", (rpc, payload) =>
                 {
-                    Plugin.Instance.OnChatReceived(peer, payload);
+                    ServerPlugin.Instance.OnChatReceived(peer, payload);
                 });
 
                 // Build log (#14): place events from the companion.
                 peer.m_rpc.Register<string>("ServerGuard_BuildPlace", (rpc, payload) =>
                 {
-                    Plugin.Instance.OnBuildPlaceReceived(peer, payload);
+                    ServerPlugin.Instance.OnBuildPlaceReceived(peer, payload);
                 });
 
                 // Build log (#14): destroy events from the companion. The companion's
@@ -3485,7 +3665,7 @@ public class Plugin : BaseUnityPlugin
                 // only ever runs on one machine.
                 peer.m_rpc.Register<string>("ServerGuard_BuildDestroy", (rpc, payload) =>
                 {
-                    Plugin.Instance.OnBuildDestroyReceived(peer, payload);
+                    ServerPlugin.Instance.OnBuildDestroyReceived(peer, payload);
                 });
 
                 // Admin console commands (#16): companion forwards `sg ...` lines.
@@ -3493,55 +3673,55 @@ public class Plugin : BaseUnityPlugin
                 // it for every peer is safe.
                 peer.m_rpc.Register<string>("ServerGuard_AdminCommand", (rpc, command) =>
                 {
-                    Plugin.Instance.OnAdminCommandReceived(peer, command);
+                    ServerPlugin.Instance.OnAdminCommandReceived(peer, command);
                 });
 
                 // Arrival-shout policy. Pushed to EVERY peer (admins included, hence
                 // before the early-return below) so the companion knows whether to
                 // swallow the first-spawn "I have arrived!" shout.
-                Plugin.Instance.SendArrivalShoutPolicy(peer);
+                ServerPlugin.Instance.SendArrivalShoutPolicy(peer);
 
                 // Console policy. Also pushed to every peer including admins, since
                 // the payload carries the caller's own admin flag.
-                Plugin.Instance.SendConsolePolicy(peer);
+                ServerPlugin.Instance.SendConsolePolicy(peer);
 
-                if (Plugin.Instance.IsAdmin(pid))
+                // Only OWNERS skip the mod check (2.0). Moderators go through the same
+                // attestation as players, with moderator_allowed_mods on top of the
+                // normal lists; their "joined as moderator" post fires from
+                // OnManifestReceived once they pass.
+                if (ServerPlugin.Instance.IsOwner(pid))
                 {
-                    Plugin.LogS.LogInfo($"[ServerGuard] {Plugin.Instance.FormatPlayer(pid)} is {Plugin.Instance.RoleOf(pid)} - skipping attestation challenge.");
-                    if (Plugin.Instance._settings.EnableMetrics)
+                    ServerPlugin.LogS.LogInfo($"[ServerGuard] {ServerPlugin.Instance.FormatPlayer(pid)} is owner - skipping attestation challenge.");
+                    if (ServerPlugin.Instance._settings.EnableMetrics)
                     {
-                        Plugin.Instance._metrics.admin_bypasses++;
-                        Plugin.Instance.SaveMetrics();
+                        ServerPlugin.Instance._metrics.admin_bypasses++;
+                        ServerPlugin.Instance.SaveMetrics();
                     }
-                    // Admins skip attestation, so the "joined" event from OnManifestReceived
-                    // never fires for them. Fire it here so admins still show up in the
-                    // admin channel (PostPlayerEvent routes admin events away from public).
-                    Plugin.Instance.PostPlayerEvent(
-                        Plugin.Instance.IsOwner(pid) ? ":crown:" : ":shield:",
-                        pid,
-                        Plugin.Instance.IsOwner(pid) ? "joined as owner" : "joined as moderator");
+                    // The "joined" event from OnManifestReceived never fires for an owner,
+                    // so fire it here (PostPlayerEvent routes admin events away from public).
+                    ServerPlugin.Instance.PostPlayerEvent(":crown:", pid, "joined as owner");
                     return;
                 }
 
-                if (Plugin.Instance._settings.EnableMetrics)
+                if (ServerPlugin.Instance._settings.EnableMetrics)
                 {
-                    Plugin.Instance._metrics.total_players_checked++;
-                    Plugin.Instance.SaveMetrics();
+                    ServerPlugin.Instance._metrics.total_players_checked++;
+                    ServerPlugin.Instance.SaveMetrics();
                 }
 
                 // 2. Generate a fresh challenge bound to this peer + session.
-                var challenge = Plugin.Instance.GenerateChallenge();
-                Plugin.Instance.RegisterPending(peer, pid, challenge);
+                var challenge = ServerPlugin.Instance.GenerateChallenge();
+                ServerPlugin.Instance.RegisterPending(peer, pid, challenge);
 
                 // 3. Ask the client to attest. Companion plugin replies via ServerGuard_Manifest.
                 peer.m_rpc.Invoke("ServerGuard_RequestManifest", challenge);
 
                 // 4. Schedule a kick if the client never replies (= vanilla / wrong-version client).
-                Plugin.Instance.StartCoroutine(Plugin.Instance.AttestationTimeoutCoroutine(peer, pid));
+                ServerPlugin.Instance.StartCoroutine(ServerPlugin.Instance.AttestationTimeoutCoroutine(peer, pid));
             }
             catch (Exception ex)
             {
-                Plugin.LogS.LogError($"[ServerGuard] OnNewConnection error: {ex}");
+                ServerPlugin.LogS.LogError($"[ServerGuard] OnNewConnection error: {ex}");
             }
         }
     }
@@ -3559,41 +3739,44 @@ public class Plugin : BaseUnityPlugin
             {
                 if (peer == null) return;
                 if (!ZNet.instance || !ZNet.instance.IsServer()) return;
-                if (Plugin.Instance == null) return;
+                if (ServerPlugin.Instance == null) return;
 
                 // Suppress if we initiated this disconnect ourselves.
                 bool suppress;
-                lock (Plugin.Instance._suppressLogoutFor)
+                lock (ServerPlugin.Instance._suppressLogoutFor)
                 {
-                    suppress = Plugin.Instance._suppressLogoutFor.Remove(peer.m_uid);
+                    suppress = ServerPlugin.Instance._suppressLogoutFor.Remove(peer.m_uid);
                 }
                 if (suppress) return;
 
                 // Drop any pending attestation slot so we don't keep dead state around.
-                lock (Plugin.Instance._pendingLock)
+                lock (ServerPlugin.Instance._pendingLock)
                 {
-                    Plugin.Instance._pending.Remove(peer.m_uid);
+                    ServerPlugin.Instance._pending.Remove(peer.m_uid);
                 }
 
                 // Drop speed-check baseline; a fresh login should start a fresh window.
-                Plugin.Instance._speedState.Remove(peer.m_uid);
+                ServerPlugin.Instance._speedState.Remove(peer.m_uid);
 
                 // Drop skill-overflow throttle state.
-                Plugin.Instance._skillOverflowState.Remove(peer.m_uid);
+                ServerPlugin.Instance._skillOverflowState.Remove(peer.m_uid);
 
-                var steamId = Plugin.GetPeerPlatformId(peer);
+                // Drop cheat-taint dedup state.
+                ServerPlugin.Instance._cheatTaintState.Remove(peer.m_uid);
+
+                var steamId = ServerPlugin.GetPeerPlatformId(peer);
                 if (string.IsNullOrWhiteSpace(steamId)) return;
 
-                var who = Plugin.Instance.FormatPlayer(steamId);
-                Plugin.LogS.LogInfo($"[ServerGuard] {who} left the server.");
-                Plugin.Instance.PostPlayerEvent(":wave:", steamId, "left");
+                var who = ServerPlugin.Instance.FormatPlayer(steamId);
+                ServerPlugin.LogS.LogInfo($"[ServerGuard] {who} left the server.");
+                ServerPlugin.Instance.PostPlayerEvent(":wave:", steamId, "left");
 
                 // Flush session-avg ping line (#18) to admin channel (if enabled).
-                Plugin.Instance.FlushPingOnDisconnect(peer.m_uid, steamId);
+                ServerPlugin.Instance.FlushPingOnDisconnect(peer.m_uid, steamId);
             }
             catch (Exception ex)
             {
-                Plugin.LogS.LogWarning($"[ServerGuard] Disconnect hook error: {ex.Message}");
+                ServerPlugin.LogS.LogWarning($"[ServerGuard] Disconnect hook error: {ex.Message}");
             }
         }
     }
@@ -3610,51 +3793,51 @@ public class Plugin : BaseUnityPlugin
 				var peer = ResolvePeerFromRpc(__instance, rpc);
 				if (peer == null) return;
 
-				var steamId  = Plugin.GetPeerPlatformId(peer);
-				var charName = Plugin.GetPeerPlayerName(peer)?.Trim();
+				var steamId  = ServerPlugin.GetPeerPlatformId(peer);
+				var charName = ServerPlugin.GetPeerPlayerName(peer)?.Trim();
 
-				if (!IsValidSteamId(steamId)) { Plugin.LogS.LogWarning("[ServerGuard] PeerInfo without valid SteamID; deferring."); return; }
+				if (!IsValidSteamId(steamId)) { ServerPlugin.LogS.LogWarning("[ServerGuard] PeerInfo without valid SteamID; deferring."); return; }
 				if (string.IsNullOrWhiteSpace(charName) || string.Equals(charName, "Unknown", StringComparison.OrdinalIgnoreCase)) return;
 
-				if (Plugin.Instance.IsAdmin(steamId)) return;
+				if (ServerPlugin.Instance.IsAdmin(steamId)) return;
 
-				if (!Plugin.Instance._registrations.TryGetValue(steamId, out var names) || names == null)
+				if (!ServerPlugin.Instance._registrations.TryGetValue(steamId, out var names) || names == null)
 				{
 					names = new List<string>();
-					Plugin.Instance._registrations[steamId] = names;
+					ServerPlugin.Instance._registrations[steamId] = names;
 				}
 
 				if (names.Any(n => string.Equals(n, charName, StringComparison.Ordinal)))
 				{
-					Plugin.Instance.SendCheatItemRemovalIfEnabled(peer);
+					ServerPlugin.Instance.SendCheatItemRemovalIfEnabled(peer);
 					return;
 				}
 
-				int limit = Math.Max(1, Plugin.Instance._settings.CharacterLimit);
+				int limit = Math.Max(1, ServerPlugin.Instance._settings.CharacterLimit);
 				if (names.Count < limit)
 				{
 					names.Add(charName);
-					Plugin.Instance.SaveRegistrations();
-					Plugin.LogS.LogInfo($"[ServerGuard] Registered character #{names.Count}/{limit} for {Plugin.Instance.FormatPlayer(steamId)} -> '{charName}'");
-					Plugin.Instance.SendCheatItemRemovalIfEnabled(peer);
+					ServerPlugin.Instance.SaveRegistrations();
+					ServerPlugin.LogS.LogInfo($"[ServerGuard] Registered character #{names.Count}/{limit} for {ServerPlugin.Instance.FormatPlayer(steamId)} -> '{charName}'");
+					ServerPlugin.Instance.SendCheatItemRemovalIfEnabled(peer);
 				}
 				else
 				{
-					Plugin.Instance.AddViolation(steamId, RULE_CHAR_NAME_LIMIT, charName);
-					if (Plugin.Instance._settings.Enforce)
+					ServerPlugin.Instance.AddViolation(steamId, RULE_CHAR_NAME_LIMIT, charName);
+					if (ServerPlugin.Instance._settings.Enforce)
 					{
-						Plugin.Instance.PostPlayerEvent(":door:", steamId, "was kicked", FriendlyReason(RULE_CHAR_NAME_LIMIT));
-						Plugin.Instance.TryKick(peer, $"{Plugin.Instance._settings.KickMessage} (Character limit {limit} reached: {string.Join(", ", names)})");
+						ServerPlugin.Instance.PostPlayerEvent(":door:", steamId, "was kicked", FriendlyReason(RULE_CHAR_NAME_LIMIT));
+						ServerPlugin.Instance.TryKick(peer, $"{ServerPlugin.Instance._settings.KickMessage} (Character limit {limit} reached: {string.Join(", ", names)})");
 					}
 					else
 					{
-						Plugin.LogS.LogWarning($"[ServerGuard] {Plugin.Instance.FormatPlayer(steamId)} exceeded character limit ({limit}). Tried '{charName}'. Allowed: {string.Join(", ", names)}");
+						ServerPlugin.LogS.LogWarning($"[ServerGuard] {ServerPlugin.Instance.FormatPlayer(steamId)} exceeded character limit ({limit}). Tried '{charName}'. Allowed: {string.Join(", ", names)}");
 					}
 				}
 			}
 			catch (Exception ex)
 			{
-				Plugin.LogS.LogError($"[ServerGuard] RPC_PeerInfo error: {ex}");
+				ServerPlugin.LogS.LogError($"[ServerGuard] RPC_PeerInfo error: {ex}");
 			}
 		}
 	}
@@ -3699,18 +3882,18 @@ public class Plugin : BaseUnityPlugin
         {
             try
             {
-                var s = Plugin.Instance?._settings;
+                var s = ServerPlugin.Instance?._settings;
                 if (s == null || !s.EnableForceMapPositions) return;
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
 
                 var peer = ResolvePeerFromRpc(__instance, rpc);
                 if (peer == null) return;
 
-                Plugin.Instance.ApplyForcedMapPosition(peer);
+                ServerPlugin.Instance.ApplyForcedMapPosition(peer);
             }
             catch (Exception ex)
             {
-                Plugin.LogS?.LogWarning($"[ServerGuard] Force-map-position patch error: {ex.Message}");
+                ServerPlugin.LogS?.LogWarning($"[ServerGuard] Force-map-position patch error: {ex.Message}");
             }
         }
     }
@@ -3739,7 +3922,7 @@ public class Plugin : BaseUnityPlugin
             }
         }
 
-        Plugin.LogS.LogWarning("[ServerGuard] ResolvePeerFromRpc: unable to resolve peer from ZRpc.");
+        ServerPlugin.LogS.LogWarning("[ServerGuard] ResolvePeerFromRpc: unable to resolve peer from ZRpc.");
         return null;
     }
 
@@ -3822,7 +4005,7 @@ public class Plugin : BaseUnityPlugin
             if (_settings.Enforce)
             {
                 PostPlayerEvent(":door:", steamId, "was kicked", FriendlyReason(RULE_COMPANION_MISSING));
-                TryKick(peer, $"{_settings.KickMessage} (Missing required companion plugin: ServerGuard.Client)");
+                TryKick(peer, $"{_settings.KickMessage} (ServerGuard is not installed on your client)");
             }
         }
     }
@@ -3932,8 +4115,8 @@ public class Plugin : BaseUnityPlugin
                 LogS.LogInfo($"[ServerGuard] Manifest from {who} ({manifest.Mods?.Count ?? 0} mods):\n" + string.Join("\n", lines));
             }
 
-            // 5. Validate against allowed_mods.yaml.
-            var verdict = ValidateAgainstPolicy(manifest);
+            // 5. Validate against allowed_mods.yaml (moderators also get moderator_allowed_mods).
+            var verdict = ValidateAgainstPolicy(manifest, steamId);
             if (!verdict.Allowed)
             {
                 LogS.LogWarning($"[ServerGuard] {who} REJECTED: {verdict.Rule} - {verdict.Reason}");
@@ -3976,7 +4159,8 @@ public class Plugin : BaseUnityPlugin
             }
 
             LogS.LogInfo($"[ServerGuard] {who} attested OK ({manifest.Mods?.Count ?? 0} mods, {fpStatus}).");
-            PostPlayerEvent(":white_check_mark:", steamId, "joined");
+            if (IsModerator(steamId)) PostPlayerEvent(":shield:", steamId, "joined as moderator");
+            else                      PostPlayerEvent(":white_check_mark:", steamId, "joined");
         }
         catch (Exception ex)
         {
@@ -4110,7 +4294,10 @@ public class Plugin : BaseUnityPlugin
 
     // Appends one row to today's CSV file. Creates the file (with header) on first
     // write of the day.
-    private void LogBuildEvent(string action, string steamId, string charName, string pieceName, Vector3 pos)
+    // `cheated` is "1"/"0" for place events (2.0, from Valheim's own PlacePiece flag),
+    // "" for destroy events. Trailing column so `sg build at` (which reads by index
+    // and requires >= 8 fields) keeps parsing pre-2.0 files.
+    private void LogBuildEvent(string action, string steamId, string charName, string pieceName, Vector3 pos, string cheated = "")
     {
         try
         {
@@ -4125,7 +4312,7 @@ public class Plugin : BaseUnityPlugin
             {
                 if (fresh)
                 {
-                    sw.WriteLine("timestamp,action,steamId,charName,pieceName,x,y,z");
+                    sw.WriteLine("timestamp,action,steamId,charName,pieceName,x,y,z,cheated");
                 }
                 var inv = System.Globalization.CultureInfo.InvariantCulture;
                 var ts = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", inv);
@@ -4133,8 +4320,8 @@ public class Plugin : BaseUnityPlugin
                 // safe identifiers / numbers.
                 var cn = (charName ?? "").Replace("\"", "\"\"");
                 sw.WriteLine(string.Format(inv,
-                    "{0},{1},{2},\"{3}\",{4},{5:F1},{6:F1},{7:F1}",
-                    ts, action, steamId ?? "", cn, pieceName ?? "", pos.x, pos.y, pos.z));
+                    "{0},{1},{2},\"{3}\",{4},{5:F1},{6:F1},{7:F1},{8}",
+                    ts, action, steamId ?? "", cn, pieceName ?? "", pos.x, pos.y, pos.z, cheated ?? ""));
             }
         }
         catch (Exception ex)
@@ -4235,7 +4422,12 @@ public class Plugin : BaseUnityPlugin
             if (_registrations != null && _registrations.TryGetValue(steamId, out var names) && names != null && names.Count > 0)
                 charName = names[0];
 
-            LogBuildEvent("place", steamId, charName, pieceName, new Vector3(x, y, z));
+            // 2.0: optional 5th field - the `cheated` argument Valheim 1.0 passes to
+            // Player.PlacePiece (nocost, or cheated materials). Absent from older clients.
+            var clientCheated = parts.Length > 4 && parts[4].Trim() == "1";
+
+            LogBuildEvent("place", steamId, charName, pieceName, new Vector3(x, y, z), clientCheated ? "1" : "0");
+            QueueCheatedBuildCheck(steamId, pieceName, new Vector3(x, y, z), clientCheated);
         }
         catch (Exception ex)
         {
@@ -4306,8 +4498,8 @@ public class Plugin : BaseUnityPlugin
         {
             try
             {
-                if (Plugin.Instance == null) return;
-                if (Plugin.Instance._settings == null || !Plugin.Instance._settings.EnableBuildLog) return;
+                if (ServerPlugin.Instance == null) return;
+                if (ServerPlugin.Instance._settings == null || !ServerPlugin.Instance._settings.EnableBuildLog) return;
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
                 if (__instance == null || hit == null) return;
 
@@ -4344,8 +4536,8 @@ public class Plugin : BaseUnityPlugin
                     AttackerName = attackerName,
                     At           = DateTime.UtcNow,
                 };
-                Plugin.Instance._lastHitOnPiece.Remove(__instance);
-                Plugin.Instance._lastHitOnPiece.Add(__instance, box);
+                ServerPlugin.Instance._lastHitOnPiece.Remove(__instance);
+                ServerPlugin.Instance._lastHitOnPiece.Add(__instance, box);
             }
             catch { /* never let the hook throw into Valheim */ }
         }
@@ -4358,8 +4550,8 @@ public class Plugin : BaseUnityPlugin
         {
             try
             {
-                if (Plugin.Instance == null) return;
-                if (Plugin.Instance._settings == null || !Plugin.Instance._settings.EnableBuildLog) return;
+                if (ServerPlugin.Instance == null) return;
+                if (ServerPlugin.Instance._settings == null || !ServerPlugin.Instance._settings.EnableBuildLog) return;
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
                 if (__instance == null) return;
 
@@ -4375,9 +4567,9 @@ public class Plugin : BaseUnityPlugin
                 string destroyerSteamId = "";
                 string destroyerName    = "";
 
-                if (Plugin.Instance._lastHitOnPiece.TryGetValue(__instance, out var box) && box != null)
+                if (ServerPlugin.Instance._lastHitOnPiece.TryGetValue(__instance, out var box) && box != null)
                 {
-                    Plugin.Instance._lastHitOnPiece.Remove(__instance);
+                    ServerPlugin.Instance._lastHitOnPiece.Remove(__instance);
 
                     // Step 1: try to resolve a connected player peer by the attacker
                     // ZDOID. Works for PvP-style "player breaks server-owned piece".
@@ -4391,9 +4583,9 @@ public class Plugin : BaseUnityPlugin
                                 if (p == null) continue;
                                 if (p.m_characterID == box.Attacker)
                                 {
-                                    destroyerSteamId = Plugin.GetPeerPlatformId(p);
-                                    if (Plugin.Instance._registrations != null
-                                        && Plugin.Instance._registrations.TryGetValue(destroyerSteamId, out var names)
+                                    destroyerSteamId = ServerPlugin.GetPeerPlatformId(p);
+                                    if (ServerPlugin.Instance._registrations != null
+                                        && ServerPlugin.Instance._registrations.TryGetValue(destroyerSteamId, out var names)
                                         && names != null && names.Count > 0)
                                     {
                                         destroyerName = names[0];
@@ -4416,11 +4608,11 @@ public class Plugin : BaseUnityPlugin
                     }
                 }
 
-                Plugin.Instance.LogBuildEvent("destroy", destroyerSteamId, destroyerName, pieceName, pos);
+                ServerPlugin.Instance.LogBuildEvent("destroy", destroyerSteamId, destroyerName, pieceName, pos);
             }
             catch (Exception ex)
             {
-                Plugin.LogS?.LogWarning($"[ServerGuard] WearNTear.Destroy hook error: {ex.Message}");
+                ServerPlugin.LogS?.LogWarning($"[ServerGuard] WearNTear.Destroy hook error: {ex.Message}");
             }
         }
     }
@@ -4549,8 +4741,8 @@ public class Plugin : BaseUnityPlugin
     private string CmdStatus()
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"[ServerGuard] v1.7.0  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
-        sb.AppendLine($"  Allowlist  required={_requiredMods.Count}  allowed={_allowedMods.Count}  banned={_bannedMods.Count}");
+        sb.AppendLine($"[ServerGuard] v{ServerGuardPlugin.VERSION}  enforce={_settings.Enforce}  requireCompanion={_settings.RequireCompanion}  requireHmac={_settings.RequireHmac}");
+        sb.AppendLine($"  Allowlist  required={_requiredMods.Count}  allowed={_allowedMods.Count}  banned={_bannedMods.Count}  moderatorOnly={_moderatorAllowedMods.Count}");
         sb.AppendLine($"  Modset     loose={ModsetFingerprint.Short(_modsetFingerprintLoose)}  strict={ModsetFingerprint.Short(_modsetFingerprintStrict)}");
         try
         {
@@ -4569,6 +4761,11 @@ public class Plugin : BaseUnityPlugin
                       + (_settings.ConsoleGuardExemptModerators ? "  (moderators exempt)" : "")
                       + "  (owners always exempt)");
         sb.AppendLine($"  Staff      {_owners.Count} owner(s)  {_admins.Count} moderator(s)");
+        sb.AppendLine($"  DevCmds    owners={(_settings.EnableOwnerDevcommands ? "ALL" : "off")}  "
+                      + $"moderators={(_settings.EnableModeratorDevcommands ? ModeratorDevcommandSet().Count + " command(s)" : "off")}");
+        sb.AppendLine($"  CheatTaint {(_settings.EnableCheatTaintDetection ? "ON policy=" + NormalizedCheatTaintPolicy() : "off")}"
+                      + $"  debugFly={(_settings.EnableDebugFlyCheck ? "ON" : "off")}"
+                      + (_settings.CheatTaintExemptModerators ? "  (moderators exempt)" : ""));
         return sb.ToString().TrimEnd();
     }
 
@@ -5085,7 +5282,7 @@ public class Plugin : BaseUnityPlugin
 
     // Plain out-parameter pair instead of a value tuple. Valheim's Mono runtime
     // doesn't load System.ValueTuple, and any compiler-generated closure carrying
-    // a value tuple field fails the whole containing Plugin type at load with
+    // a value tuple field fails the whole containing ServerPlugin type at load with
     // TypeLoadException.
     private static bool TryParseXZ(string xStr, string zStr, out float x, out float z)
     {
@@ -5312,6 +5509,16 @@ public class Plugin : BaseUnityPlugin
             if (cmd.Length > 64) cmd = cmd.Substring(0, 64); // bound any client-supplied string
             if (string.IsNullOrWhiteSpace(cmd)) cmd = "(unknown)";
 
+            // A moderator asked for a dev command outside moderatorDevcommands. The
+            // client refused it; this is visibility for the operator, not a strike -
+            // staff exploring the console is not cheating.
+            if (category == "moderator")
+            {
+                LogS.LogInfo($"[ServerGuard] {who} ({RoleOf(steamId)}) tried dev command `{cmd}` - not in moderatorDevcommands, refused client-side.");
+                PostAdminEvent($":no_entry_sign: **{who}** (moderator) tried dev command `{cmd}` — not in `moderatorDevcommands`");
+                return;
+            }
+
             // Admin bypass - operators may legitimately use console for moderation.
             if (IsAdmin(steamId))
             {
@@ -5351,9 +5558,10 @@ public class Plugin : BaseUnityPlugin
         public string Detail; // short label (mod name / guid) for Discord friendly text
     }
 
-    private PolicyVerdict ValidateAgainstPolicy(ModManifest manifest)
+    private PolicyVerdict ValidateAgainstPolicy(ModManifest manifest, string platformId = null)
     {
         var mods = manifest.Mods ?? new List<ModManifestEntry>();
+        var isModerator = !string.IsNullOrEmpty(platformId) && IsModerator(platformId);
 
         // Index manifest by lowercase guid AND name for matching.
         var byKey = new Dictionary<string, ModManifestEntry>(StringComparer.OrdinalIgnoreCase);
@@ -5393,6 +5601,8 @@ public class Plugin : BaseUnityPlugin
             var allow = new Dictionary<string, AllowedModEntry>(StringComparer.OrdinalIgnoreCase);
             foreach (var e in _requiredMods) allow[e.Key] = e;
             foreach (var e in _allowedMods)  allow[e.Key] = e;
+            if (isModerator)
+                foreach (var e in _moderatorAllowedMods) allow[e.Key] = e;
 
             foreach (var m in mods)
             {
@@ -5611,6 +5821,330 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    // ==================== Cheat taint detection (2.0) ====================
+    //
+    // Valheim 1.0's "cheated" bookkeeping, read as an anti-cheat signal. See the
+    // Settings comment for the model; claude/features-and-rules.md for the full map
+    // of where the game sets and propagates the mark.
+    //
+    //   OnCheatStateReceived   - CheatedItem (client report; policy log/strip/violation)
+    //   QueueCheatedBuildCheck - CheatedBuild (client flag, confirmed against the piece ZDO)
+    //   TickDebugFly           - DebugFly (player ZDO, server-observed)
+
+    private static readonly string[] VALID_TAINT_POLICIES = { "log", "strip", "violation" };
+
+    private string NormalizedCheatTaintPolicy()
+    {
+        var p = (_settings?.CheatTaintPolicy ?? "log").Trim().ToLowerInvariant();
+        return VALID_TAINT_POLICIES.Contains(p) ? p : "log";
+    }
+
+    private HashSet<string> CheatTaintIgnoredSet()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in _settings?.CheatTaintIgnoredItems ?? new List<string>())
+        {
+            var v = (s ?? "").Trim();
+            if (v.Length > 0) set.Add(v);
+        }
+        return set;
+    }
+
+    // Exemption for the whole family. Owners always; moderators only by setting.
+    private bool CheatTaintExempt(string pid)
+    {
+        if (IsOwner(pid)) return true;
+        if (IsModerator(pid) && _settings != null && _settings.CheatTaintExemptModerators) return true;
+        return false;
+    }
+
+    // Per-peer dedup so a 60-second report cadence doesn't produce a 60-second post
+    // cadence. Keyed by peer.m_uid, cleared on disconnect.
+    private class CheatTaintState
+    {
+        public string LastItemSignature = "";
+        public bool   UsedCheatsReported;
+        public bool   BypassReported;
+    }
+    private readonly Dictionary<long, CheatTaintState> _cheatTaintState = new Dictionary<long, CheatTaintState>();
+
+    // Payload: "usedCheats|bypass|count|prefab:stack,prefab:stack,..."
+    //   usedCheats - "1" when PlayerProfile.m_usedCheats (the character has ever run a cheat command)
+    //   bypass     - "1" when the character carries the `bypasscheatchecks` unique key
+    //   count      - number of flagged items before the ignore list (sanity only)
+    public void OnCheatStateReceived(ZNetPeer peer, string payload)
+    {
+        try
+        {
+            if (peer == null || _settings == null || !_settings.EnableCheatTaintDetection) return;
+            if (payload == null) return;
+
+            var pid = GetPeerPlatformId(peer);
+            if (string.IsNullOrWhiteSpace(pid) || CheatTaintExempt(pid)) return;
+
+            var parts = payload.Split('|');
+            if (parts.Length < 4) return;
+
+            var usedCheats = parts[0].Trim() == "1";
+            var bypass     = parts[1].Trim() == "1";
+            var ignored    = CheatTaintIgnoredSet();
+
+            // Parse "prefab:stack" entries, drop ignored prefabs, bound the string.
+            var items = new List<KeyValuePair<string, int>>();
+            foreach (var entry in parts[3].Split(','))
+            {
+                var e = entry.Trim();
+                if (e.Length == 0) continue;
+                var colon = e.LastIndexOf(':');
+                var name  = colon > 0 ? e.Substring(0, colon) : e;
+                var stack = 1;
+                if (colon > 0) int.TryParse(e.Substring(colon + 1), out stack);
+                if (name.Length > 48) name = name.Substring(0, 48);
+                if (ignored.Contains(name)) continue;
+                items.Add(new KeyValuePair<string, int>(name, Math.Max(1, stack)));
+                if (items.Count >= 64) break;
+            }
+            items.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+
+            if (!_cheatTaintState.TryGetValue(peer.m_uid, out var st) || st == null)
+            {
+                st = new CheatTaintState();
+                _cheatTaintState[peer.m_uid] = st;
+            }
+
+            var who = FormatPlayer(pid);
+            var role = RoleOf(pid);
+            var roleTag = role == "player" ? "" : $" ({role})";
+
+            // The bypass key means every flagging site in the game is switched off for
+            // this character - the rest of this report is blind. Say so, once.
+            if (bypass && !st.BypassReported)
+            {
+                st.BypassReported = true;
+                LogS.LogWarning($"[ServerGuard] {who} carries the bypasscheatchecks key - the game will not mark cheats for this character.");
+                PostAdminEvent($":warning: **{who}**{roleTag} has the `bypasscheatchecks` key set — Valheim will not mark anything this character does as cheated");
+            }
+
+            if (usedCheats && _settings.CheatTaintFlagUsedCheats && !st.UsedCheatsReported)
+            {
+                st.UsedCheatsReported = true;
+                LogS.LogInfo($"[ServerGuard] {who} character carries the permanent 'used cheats' mark.");
+                PostAdminEvent($":test_tube: **{who}**{roleTag} — this character has used dev commands before (permanent \"Cheater!\" mark)");
+            }
+
+            var signature = string.Join(",", items.Select(kv => kv.Key + ":" + kv.Value));
+            var policy = NormalizedCheatTaintPolicy();
+
+            if (items.Count == 0)
+            {
+                if (st.LastItemSignature.Length > 0)
+                    LogS.LogInfo($"[ServerGuard] {who} no longer carries flagged items.");
+                st.LastItemSignature = "";
+                return;
+            }
+
+            var changed = !string.Equals(signature, st.LastItemSignature, StringComparison.Ordinal);
+            st.LastItemSignature = signature;
+
+            var total = items.Sum(kv => kv.Value);
+            var listing = string.Join(", ", items.Take(12).Select(kv => kv.Value > 1 ? $"{kv.Key} x{kv.Value}" : kv.Key))
+                        + (items.Count > 12 ? $", +{items.Count - 12} more" : "");
+
+            if (changed)
+            {
+                LogS.LogWarning($"[ServerGuard] {who} is carrying {total} cheat-flagged item(s): {listing} (policy={policy})");
+                if (_settings.EnableMetrics) { _metrics.cheat_taint_reports++; SaveMetrics(); }
+
+                if (policy == "log")
+                    PostAdminEvent($":test_tube: **{who}**{roleTag} is carrying **{total}** cheat-flagged item(s): {listing}");
+                else if (policy == "strip")
+                    PostAdminEvent($":test_tube: **{who}**{roleTag} was carrying **{total}** cheat-flagged item(s) — removed: {listing}");
+                else
+                    AddViolation(pid, RULE_CHEATED_ITEM, listing);   // posts to admin channel itself
+            }
+
+            // Strip on every report while anything flagged remains: a player who picks
+            // the item back up from the ground gets it taken again.
+            if (policy == "strip" || policy == "violation")
+            {
+                try
+                {
+                    var ignoredCsv = string.Join(",", ignored);
+                    peer.m_rpc?.Invoke("ServerGuard_StripCheated", ignoredCsv);
+                }
+                catch (Exception ex)
+                {
+                    LogS.LogWarning($"[ServerGuard] StripCheated send failed: {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogS.LogError($"[ServerGuard] OnCheatStateReceived error: {ex}");
+        }
+    }
+
+    // ---- CheatedBuild ----
+    //
+    // The client's build report carries Valheim's `cheated` argument, but the piece's
+    // ZDO carries the same fact ("cheated", set by Player.PlacePiece right after
+    // Instantiate) plus "creator". The ZDO reaches the server a moment after the RPC,
+    // so verification is queued and swept every few seconds: one pass over ZDOMan's
+    // object table for all pending pieces, not one scan per placement.
+
+    private sealed class PendingBuildCheck
+    {
+        public string  Pid;
+        public string  PieceName;
+        public int     PrefabHash;
+        public Vector3 Pos;
+        public bool    ClientCheated;
+        public float   QueuedAt;
+    }
+    private readonly List<PendingBuildCheck> _pendingBuildChecks = new List<PendingBuildCheck>();
+    private const float BuildCheckDelaySeconds   = 3f;    // let the ZDO arrive first
+    private const float BuildCheckTimeoutSeconds = 30f;   // then fall back to the client's word
+
+    private static readonly FieldInfo ZdoObjectsByIdField =
+        typeof(ZDOMan).GetField("m_objectsByID", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+    private void QueueCheatedBuildCheck(string pid, string pieceName, Vector3 pos, bool clientCheated)
+    {
+        try
+        {
+            if (_settings == null || !_settings.EnableCheatTaintDetection) return;
+            if (string.IsNullOrWhiteSpace(pid) || CheatTaintExempt(pid)) return;
+            if (string.IsNullOrEmpty(pieceName)) return;
+            if (_pendingBuildChecks.Count >= 2000) return;   // builder spam guard; oldest entries still drain
+
+            _pendingBuildChecks.Add(new PendingBuildCheck
+            {
+                Pid = pid, PieceName = pieceName, PrefabHash = pieceName.GetStableHashCode(),
+                Pos = pos, ClientCheated = clientCheated, QueuedAt = Time.realtimeSinceStartup,
+            });
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] QueueCheatedBuildCheck failed: {ex.Message}");
+        }
+    }
+
+    public IEnumerator CheatedBuildSweepLoop()
+    {
+        yield return new WaitForSeconds(10f);
+        while (true)
+        {
+            yield return new WaitForSeconds(5f);
+            try
+            {
+                if (_pendingBuildChecks.Count == 0) continue;
+                if (ZNet.instance == null || !ZNet.instance.IsServer()) continue;
+                SweepCheatedBuildChecks();
+            }
+            catch (Exception ex)
+            {
+                LogS.LogWarning($"[ServerGuard] CheatedBuild sweep error: {ex.Message}");
+            }
+        }
+    }
+
+    private void SweepCheatedBuildChecks()
+    {
+        var now = Time.realtimeSinceStartup;
+        var due = _pendingBuildChecks.Where(p => now - p.QueuedAt >= BuildCheckDelaySeconds).ToList();
+        if (due.Count == 0) return;
+
+        var wanted = new HashSet<int>(due.Select(p => p.PrefabHash));
+        var found  = new Dictionary<PendingBuildCheck, ZDO>();
+
+        var table = ZdoObjectsByIdField?.GetValue(ZDOMan.instance) as System.Collections.IDictionary;
+        if (table != null)
+        {
+            foreach (System.Collections.DictionaryEntry entry in table)
+            {
+                if (!(entry.Value is ZDO zdo)) continue;
+                int prefab;
+                try { prefab = zdo.GetPrefab(); } catch { continue; }
+                if (!wanted.Contains(prefab)) continue;
+
+                Vector3 zpos;
+                try { zpos = zdo.GetPosition(); } catch { continue; }
+                foreach (var p in due)
+                {
+                    if (p.PrefabHash != prefab || found.ContainsKey(p)) continue;
+                    if ((zpos - p.Pos).sqrMagnitude <= 1.0f) { found[p] = zdo; break; }
+                }
+            }
+        }
+
+        foreach (var p in due)
+        {
+            if (found.TryGetValue(p, out var zdo))
+            {
+                bool zdoCheated = false;
+                long creator = 0;
+                try { zdoCheated = zdo.GetBool(ZDOVars.s_cheated); creator = zdo.GetLong(ZDOVars.s_creator); } catch { }
+                _pendingBuildChecks.Remove(p);
+                ResolveCheatedBuild(p, zdoCheated, "zdo", creator);
+            }
+            else if (now - p.QueuedAt >= BuildCheckTimeoutSeconds)
+            {
+                // ZDO never showed up (piece destroyed again, or out of our lookup). Go
+                // with what the client said, and say that we did.
+                _pendingBuildChecks.Remove(p);
+                ResolveCheatedBuild(p, p.ClientCheated, "client", 0);
+            }
+        }
+    }
+
+    private void ResolveCheatedBuild(PendingBuildCheck p, bool cheated, string source, long creator)
+    {
+        // Only the positive case is interesting; mismatches between the two sources
+        // are logged because a client that says "clean" while the world says "cheated"
+        // is a modified client.
+        if (source == "zdo" && cheated != p.ClientCheated)
+            LogS.LogWarning($"[ServerGuard] CheatedBuild source mismatch for {FormatPlayer(p.Pid)}: client={p.ClientCheated} zdo={cheated} ({p.PieceName} @ {p.Pos.x:F0},{p.Pos.z:F0})");
+
+        if (!cheated) return;
+
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var where = string.Format(inv, "{0} @ {1:F0}, {2:F0}", p.PieceName, p.Pos.x, p.Pos.z);
+        LogS.LogWarning($"[ServerGuard] {FormatPlayer(p.Pid)} placed a cheat-flagged piece: {where} (confirmed by {source}"
+            + (creator != 0 ? $", creator={creator}" : "") + ")");
+        if (_settings.EnableMetrics) { _metrics.cheat_taint_builds++; SaveMetrics(); }
+        AddViolation(p.Pid, RULE_CHEATED_BUILD, where);
+    }
+
+    // ---- DebugFly ----
+    private void TickDebugFly(string steamId, ZDO playerZdo, SpeedState state)
+    {
+        try
+        {
+            bool flying;
+            try { flying = playerZdo.GetBool(ZDOVars.s_debugFly); } catch { return; }
+
+            if (!flying)
+            {
+                state.DebugFlyFlagged = false;   // next fly session flags again
+                return;
+            }
+            if (state.DebugFlyFlagged) return;
+            // Owners only (or moderators via cheatTaintExemptModerators). Moderators can
+            // never be granted fly/debugmode, so a flying moderator is always a finding.
+            if (CheatTaintExempt(steamId)) return;
+
+            state.DebugFlyFlagged = true;
+            LogS.LogWarning($"[ServerGuard] {FormatPlayer(steamId)} has DebugFly set on their character.");
+            if (_settings.EnableMetrics) { _metrics.debug_fly_detections++; SaveMetrics(); }
+            PostPlayerEvent(":dove:", steamId, "is using debug fly");
+            AddViolation(steamId, RULE_DEBUG_FLY);
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] DebugFly check error: {ex.Message}");
+        }
+    }
+
     // ==================== Cheat item removal ====================
     //
     // Sends the configured prefab-name list to the peer's companion plugin, which
@@ -5690,6 +6224,15 @@ public class Plugin : BaseUnityPlugin
             var allowed = string.Join(",", (_settings.ConsoleAllowedCommands ?? new List<string>())
                 .Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim().ToLowerInvariant()));
 
+            // 2.0: two trailing fields carry the staff dev-command grant. A pre-2.0
+            // client ignores fields it doesn't know about.
+            var devMode = DevcommandModeFor(pid);
+            var devCsv  = devMode == "list" ? string.Join(",", ModeratorDevcommandSet().OrderBy(c => c)) : "";
+
+            // 2.0: field 9 tells the client whether (and how) cheat-taint detection is
+            // on, so it can show the one-time notice panel with the right consequence.
+            var taint = _settings.EnableCheatTaintDetection ? NormalizedCheatTaintPolicy() : "0";
+
             var payload = string.Join("|", new[]
             {
                 NormalizedConsoleMode(),
@@ -5698,6 +6241,9 @@ public class Plugin : BaseUnityPlugin
                 NormalizedBindPolicy(),
                 blocked,
                 allowed,
+                devMode,
+                devCsv,
+                taint,
             });
 
             peer.m_rpc.Invoke("ServerGuard_ConsolePolicy", payload);
@@ -5720,6 +6266,291 @@ public class Plugin : BaseUnityPlugin
         {
             LogS.LogWarning($"[ServerGuard] BroadcastConsolePolicy failed: {ex.Message}");
         }
+    }
+
+    // ==================== Staff dev commands (2.0) ====================
+    //
+    // How a dev command actually executes in multiplayer, and therefore what has to
+    // be unlocked where (facts from the shipped Terminal / ZNet code, Valheim 1.0.7):
+    //
+    //   * ConsoleCommand.IsValid refuses IsCheat commands unless IsCheatsEnabled(),
+    //     which is `m_cheat && ZNet.IsServer()` - always false on a dedicated-server
+    //     client. It also refuses OnlyServer commands (every onlyAdmin: true command
+    //     sets OnlyServer) on a client.
+    //   * A command that fails IsValid but has RemoteCommand = true is forwarded by
+    //     TryRunCommand to the server as RPC_RemoteCommand, where ZNet checks the
+    //     sender against adminlist.txt and, if listed, runs it on the SERVER console.
+    //     `devcommands` itself is always forwarded too, and toggles the server's
+    //     global Terminal.m_cheat - which is how vanilla admins get `skiptime` etc.
+    //   * `randomevent` / `stopevent` run locally but call into RandEventSystem, which
+    //     routes to the server and checks ZNet.IsAdmin (adminlist.txt) there.
+    //
+    // The client half lifts the IsValid / IsCheatsEnabled gates for granted commands
+    // (see ClientPlugin, "Staff dev commands"). This section is the server half:
+    //
+    //   Patch_ZNet_RPC_RemoteCommand   - staff-forwarded commands run regardless of
+    //                                    adminlist.txt, with m_cheat forced on for the
+    //                                    duration of the call (not toggled globally);
+    //                                    `devcommands` is acknowledged, not executed.
+    //   Patch_ZNet_ListContainsId      - owners read as vanilla admins everywhere ZNet
+    //                                    consults adminlist.txt (kick/ban/save RPCs,
+    //                                    ZNet.IsAdmin), so an owner never needs to be
+    //                                    in that file. Moderators are NOT promoted -
+    //                                    their list is enforced per command instead.
+    //   Patch_RandEvent_Console*       - the two routed event RPCs, checked against the
+    //                                    per-command grant instead of adminlist.txt.
+
+    private string DevcommandModeFor(string pid)
+    {
+        if (_settings == null) return "none";
+        if (IsOwner(pid))     return _settings.EnableOwnerDevcommands ? "all" : "none";
+        if (IsModerator(pid)) return _settings.EnableModeratorDevcommands && ModeratorDevcommandSet().Count > 0 ? "list" : "none";
+        return "none";
+    }
+
+    // Commands a moderator can never be granted, whatever moderatorDevcommands says:
+    // everything that creates items, builds for free, or flies. The operator's list is
+    // filtered against this on read (with a log line), so the client never even sees
+    // them in the grant, and IsDevcommandAllowed refuses them server-side as well.
+    private static readonly HashSet<string> ModeratorReservedCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "fly", "debugmode", "spawn", "itemset", "nocost", "noplacementcost", "location",
+    };
+    private string _lastReservedWarning = "";
+
+    private HashSet<string> ModeratorDevcommandSet()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var dropped = new List<string>();
+        foreach (var c in _settings?.ModeratorDevcommands ?? new List<string>())
+        {
+            var v = (c ?? "").Trim().TrimStart('/').ToLowerInvariant();
+            if (v.Length == 0) continue;
+            if (ModeratorReservedCommands.Contains(v)) { dropped.Add(v); continue; }
+            set.Add(v);
+        }
+        if (dropped.Count > 0)
+        {
+            var msg = string.Join(", ", dropped);
+            if (msg != _lastReservedWarning)
+            {
+                _lastReservedWarning = msg;
+                LogS?.LogWarning($"[ServerGuard] moderatorDevcommands lists command(s) moderators can never have - ignored: {msg}");
+            }
+        }
+        return set;
+    }
+
+    // The single authorisation question: may this player run this dev command?
+    internal bool IsDevcommandAllowed(string pid, string command)
+    {
+        if (_settings == null || string.IsNullOrWhiteSpace(pid)) return false;
+        var cmd = (command ?? "").Trim();
+        int sp = cmd.IndexOf(' ');
+        if (sp >= 0) cmd = cmd.Substring(0, sp);
+        cmd = cmd.TrimStart('/').ToLowerInvariant();
+        if (cmd.Length == 0) return false;
+
+        if (IsOwner(pid)) return _settings.EnableOwnerDevcommands;
+        if (IsModerator(pid))
+        {
+            if (!_settings.EnableModeratorDevcommands) return false;
+            if (ModeratorReservedCommands.Contains(cmd)) return false;
+            var set = ModeratorDevcommandSet();
+            if (set.Count == 0) return false;
+            return cmd == "devcommands" || set.Contains(cmd);
+        }
+        return false;
+    }
+
+    private static ZNetPeer FindPeerByRpc(ZRpc rpc)
+    {
+        try
+        {
+            if (rpc == null || ZNet.instance == null) return null;
+            foreach (var p in ZNet.instance.GetPeers())
+                if (p != null && ReferenceEquals(p.m_rpc, rpc)) return p;
+        }
+        catch { }
+        return null;
+    }
+
+    // Returns true when the command was handled here (vanilla must be skipped).
+    internal bool TryHandleStaffRemoteCommand(ZRpc rpc, string command)
+    {
+        try
+        {
+            if (rpc == null || _settings == null) return false;
+            var peer = FindPeerByRpc(rpc);
+            if (peer == null) return false;
+
+            var pid  = GetPeerPlatformId(peer);
+            var role = RoleOf(pid);
+            if (role == "player") return false;                       // vanilla path (adminlist.txt)
+
+            var text = (command ?? "").Trim();
+            var name = text.Split(' ')[0].TrimStart('/').ToLowerInvariant();
+            if (name.Length == 0) return false;
+
+            if (!IsDevcommandAllowed(pid, name))
+            {
+                // Staff, but this command isn't granted (moderator outside the list, or
+                // the feature is off). Fall through to vanilla so an adminlist.txt entry
+                // still works exactly as it did before 2.0.
+                return false;
+            }
+
+            var who = FormatPlayer(pid);
+
+            // The client forwards `devcommands` every time it is toggled. Vanilla would
+            // flip the server's global m_cheat; we don't need that (m_cheat is forced on
+            // per call below), so just acknowledge it.
+            if (name == "devcommands")
+            {
+                ZNet.instance.RemotePrint(rpc, $"[ServerGuard] Dev commands granted by ServerGuard ({role}).");
+                return true;
+            }
+
+            LogS.LogInfo($"[ServerGuard] {who} ({role}) ran server-side command `{text}`.");
+            PostAdminEvent($":wrench: **{who}** ({role}) ran server command `{text}`");
+
+            var console = global::Console.instance;
+            if (console == null)
+            {
+                ZNet.instance.RemotePrint(rpc, "[ServerGuard] Server console is not available.");
+                return true;
+            }
+
+            bool prevCheat = Terminal.m_cheat;
+            Terminal.m_cheat = true;
+            try
+            {
+                console.TryRunCommand(text);
+            }
+            finally
+            {
+                Terminal.m_cheat = prevCheat;
+            }
+            ZNet.instance.RemotePrint(rpc, $"[ServerGuard] Ran `{text}` on the server.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] Staff remote command failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    // True when `platformId` should be treated as a vanilla admin. Owners only, and
+    // only while the owner grant is on: the vanilla admin RPCs (Kick/Ban/Unban/Save/
+    // PrintBanned/RemoteCommand) are all-or-nothing, so they can't be reconciled with
+    // a moderator's per-command list.
+    internal bool IsVanillaAdminByGrant(string platformId)
+    {
+        if (_settings == null || !_settings.EnableOwnerDevcommands) return false;
+        return IsOwner(platformId);
+    }
+
+    [HarmonyPatch(typeof(ZNet), "RPC_RemoteCommand")]
+    public static class Patch_ZNet_RPC_RemoteCommand
+    {
+        public static bool Prefix(ZRpc rpc, string command)
+        {
+            try
+            {
+                if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
+                if (ServerPlugin.Instance == null) return true;
+                return !ServerPlugin.Instance.TryHandleStaffRemoteCommand(rpc, command);
+            }
+            catch (Exception ex)
+            {
+                ServerPlugin.LogS?.LogWarning($"[ServerGuard] RPC_RemoteCommand patch error: {ex.Message}");
+                return true;
+            }
+        }
+    }
+
+    // ZNet.ListContainsId(SyncedList, string) is the one place every adminlist.txt
+    // check funnels through (the banned and permitted lists go through it too, hence
+    // the reference comparison against m_adminList).
+    [HarmonyPatch(typeof(ZNet), "ListContainsId")]
+    public static class Patch_ZNet_ListContainsId
+    {
+        private static readonly FieldInfo AdminListField =
+            typeof(ZNet).GetField("m_adminList", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        public static void Postfix(ZNet __instance, SyncedList list, string idString, ref bool __result)
+        {
+            try
+            {
+                if (__result) return;
+                if (ServerPlugin.Instance == null || __instance == null || list == null) return;
+                if (!__instance.IsServer()) return;
+                if (AdminListField == null || !ReferenceEquals(AdminListField.GetValue(__instance), list)) return;
+
+                if (!TryNormalizeSteamId(idString, out var sid)) return;
+                if (ServerPlugin.Instance.IsVanillaAdminByGrant(sid)) __result = true;
+            }
+            catch (Exception ex)
+            {
+                ServerPlugin.LogS?.LogWarning($"[ServerGuard] ListContainsId patch error: {ex.Message}");
+            }
+        }
+    }
+
+    // `randomevent` / `stopevent` from a client arrive here as routed RPCs. Owners
+    // already pass the vanilla IsAdmin check via Patch_ZNet_ListContainsId; this is
+    // for moderators whose list includes them.
+    [HarmonyPatch(typeof(RandEventSystem), "RPC_ConsoleStartRandomEvent")]
+    public static class Patch_RandEvent_ConsoleStart
+    {
+        public static bool Prefix(RandEventSystem __instance, long sender)
+        {
+            try
+            {
+                if (!StaffRoutedEventAllowed(sender, "randomevent")) return true;
+                __instance.StartRandomEvent();
+                return false;
+            }
+            catch (Exception ex)
+            {
+                ServerPlugin.LogS?.LogWarning($"[ServerGuard] RPC_ConsoleStartRandomEvent patch error: {ex.Message}");
+                return true;
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(RandEventSystem), "RPC_ConsoleResetRandomEvent")]
+    public static class Patch_RandEvent_ConsoleReset
+    {
+        public static bool Prefix(RandEventSystem __instance, long sender)
+        {
+            try
+            {
+                if (!StaffRoutedEventAllowed(sender, "stopevent")) return true;
+                __instance.ResetRandomEvent();
+                return false;
+            }
+            catch (Exception ex)
+            {
+                ServerPlugin.LogS?.LogWarning($"[ServerGuard] RPC_ConsoleResetRandomEvent patch error: {ex.Message}");
+                return true;
+            }
+        }
+    }
+
+    private static bool StaffRoutedEventAllowed(long sender, string command)
+    {
+        if (ZNet.instance == null || !ZNet.instance.IsServer() || ServerPlugin.Instance == null) return false;
+        var peer = ZNet.instance.GetPeer(sender);
+        if (peer == null) return false;
+        var pid = GetPeerPlatformId(peer);
+        if (!ServerPlugin.Instance.IsDevcommandAllowed(pid, command)) return false;
+        var who  = ServerPlugin.Instance.FormatPlayer(pid);
+        var role = ServerPlugin.Instance.RoleOf(pid);
+        ServerPlugin.LogS?.LogInfo($"[ServerGuard] {who} ({role}) ran `{command}`.");
+        ServerPlugin.Instance.PostAdminEvent($":wrench: **{who}** ({role}) ran server command `{command}`");
+        return true;
     }
 
     // ==================== Arrival shout policy ====================
@@ -5842,12 +6673,12 @@ public class Plugin : BaseUnityPlugin
                     "SetRandomEvent",
                     BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
                 if (m == null)
-                    Plugin.LogS?.LogWarning("[ServerGuard] RandEventSystem.SetRandomEvent not found — raid start logging unavailable.");
+                    ServerPlugin.LogS?.LogWarning("[ServerGuard] RandEventSystem.SetRandomEvent not found — raid start logging unavailable.");
                 return m;
             }
             catch (Exception ex)
             {
-                Plugin.LogS?.LogWarning($"[ServerGuard] Failed to locate RandEventSystem.SetRandomEvent: {ex.Message}");
+                ServerPlugin.LogS?.LogWarning($"[ServerGuard] Failed to locate RandEventSystem.SetRandomEvent: {ex.Message}");
                 return null;
             }
         }
@@ -5858,11 +6689,11 @@ public class Plugin : BaseUnityPlugin
             {
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
                 if (ev == null || string.IsNullOrEmpty(ev.m_name)) return;
-                Plugin.Instance.OnRaidStarted(ev.m_name, pos);
+                ServerPlugin.Instance.OnRaidStarted(ev.m_name, pos);
             }
             catch (Exception ex)
             {
-                Plugin.LogS?.LogError($"[ServerGuard] SetRandomEvent patch error: {ex.Message}");
+                ServerPlugin.LogS?.LogError($"[ServerGuard] SetRandomEvent patch error: {ex.Message}");
             }
         }
     }
@@ -5875,11 +6706,11 @@ public class Plugin : BaseUnityPlugin
             try
             {
                 if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-                Plugin.Instance.OnRaidEnded();
+                ServerPlugin.Instance.OnRaidEnded();
             }
             catch (Exception ex)
             {
-                Plugin.LogS?.LogError($"[ServerGuard] ResetRandomEvent patch error: {ex.Message}");
+                ServerPlugin.LogS?.LogError($"[ServerGuard] ResetRandomEvent patch error: {ex.Message}");
             }
         }
     }

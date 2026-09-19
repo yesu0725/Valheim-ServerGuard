@@ -1,6 +1,8 @@
 # Installation
 
-ServerGuard has two pieces — the **server mod** and a **client companion**. Both are required.
+ServerGuard is **one mod installed in two places**: on the dedicated server and on every player's game. The same `Valheim_ServerGuard` package, the same DLL — it detects which side it is on when it loads.
+
+> **Upgrading from 1.x?** The separate `Valheim_ServerGuard_Client` package is retired. Remove it from every player's profile / modpack and install `Valheim_ServerGuard` there instead. Nothing else changes: `client.yaml`, the server's `conf/` files and the `sharedSecret` all carry over. An `allowed_mods.yaml` that still lists the old client GUID keeps working (the server logs a reminder to update it).
 
 ## Server side (dedicated server only)
 
@@ -21,13 +23,13 @@ ServerGuard has two pieces — the **server mod** and a **client companion**. Bo
 
 ## Client side (every player)
 
-1. Install **TaegukGaming-Valheim_ServerGuard_Client** via your mod manager (r2modman / Thunderstore Mod Manager).
-2. Launch Valheim once to the main menu, then close. The companion creates `BepInEx/config/ServerGuard/client.yaml`.
+1. Install **TaegukGaming-Valheim_ServerGuard** — the same package as the server — via your mod manager (r2modman / Gale / Thunderstore Mod Manager), or add it to your modpack.
+2. Launch Valheim once to the main menu, then close. ServerGuard creates `BepInEx/config/ServerGuard/client.yaml`.
 3. Open `client.yaml`. Paste in the `sharedSecret` your server host gave you:
    ```yaml
    sharedSecret: "<the value from the server's settings.yaml>"
    ```
-4. Save. Restart Valheim. Done — the next time you connect to the ServerGuard server, the companion handles the handshake automatically.
+4. Save. Restart Valheim. Done — the next time you connect to the ServerGuard server, the handshake happens automatically.
 
 ## Self-test
 
@@ -35,4 +37,4 @@ After boot, the server runs a smoke test. If it passes silently, you're good. If
 
 ## Updating
 
-Server and client versions must match. When you update one, update the other in the same session.
+Update the server and the players' modpack to the same version in the same session. The version is checked at the handshake through the mod allowlist: if `required_mods` pins ServerGuard's hash, a player on a different build is refused until they update.

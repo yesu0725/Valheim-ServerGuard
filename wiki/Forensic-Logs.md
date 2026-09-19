@@ -45,7 +45,7 @@ Every piece placement and every piece destruction is appended to a daily CSV fil
 ### CSV format
 
 ```csv
-timestamp,action,steamId,charName,pieceName,x,y,z
+timestamp,action,steamId,charName,pieceName,x,y,z,cheated
 2026-05-30T15:42:00Z,place,76561198000000000,"Erik",wood_wall_log,123.4,5.0,-456.7
 2026-05-30T15:42:30Z,destroy,76561198999999999,"Loki",wood_wall_log,123.4,5.0,-456.7
 2026-05-30T16:01:12Z,destroy,,"Troll",wood_pillar,123.4,4.5,-455.2

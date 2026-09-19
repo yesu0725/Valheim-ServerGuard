@@ -1,6 +1,6 @@
 # Quick Login Panel
 
-The companion plugin (`Valheim_ServerGuard_Client`) can add an optional **one-click login panel** to the Valheim title screen. It lets players join a specific server without the server browser, without typing an IP, and without a password prompt.
+ServerGuard's client half can add an optional **one-click login panel** to the Valheim title screen. It lets players join a specific server without the server browser, without typing an IP, and without a password prompt.
 
 This is a **client-side** feature configured in `client.yaml`. It is **off by default** and has no effect on the server.
 
@@ -11,6 +11,7 @@ A panel in the upper-right of the main menu showing:
 - The server **logo** (an image you provide)
 - The server **name** (heading)
 - A short **description**
+- A scrollable **Announcements** box, with clickable links
 - A **live player count** (queried while the player sits on the menu)
 - A **Connect** button styled like the game's own buttons
 
@@ -26,9 +27,41 @@ serverPassword: ""                # the server password, if any
 serverName: "My Server"
 serverDescription: "Welcome to the server!"
 serverLogoPath: "logo.png"        # image file in BepInEx/config/ServerGuard/
+serverAnnouncements: ""           # see below
 ```
 
 Restart Valheim. The panel appears on the title screen.
+
+## Announcements
+
+`serverAnnouncements` fills a scrollable box under the description, headed
+**Announcements**. It is edited in the same `client.yaml` as everything else above.
+
+Write it as a YAML **block scalar** — the `|` keeps your line breaks exactly as typed.
+Indent every line of the text by two spaces; YAML strips that indent back off:
+
+```yaml
+serverAnnouncements: |
+  <b>Server events</b>
+  Bosses every Saturday, 20:00 UTC.
+
+  Join our [Discord](https://discord.gg/example) for the schedule.
+  Rules: [read them first](https://example.com/rules)
+```
+
+- **Length:** unlimited. The box scrolls with the mouse wheel, by dragging, or with the
+  scrollbar on its right edge. The panel grows taller when announcements are present.
+- **Links:** `[label](https://example.com)` renders as underlined blue text; clicking it
+  opens the URL in the player's browser. Only `http://` and `https://` are opened —
+  anything else (`file://`, custom schemes) is shown as plain text and is not clickable,
+  because `client.yaml` often ships inside a modpack rather than being written by the
+  player. Watch for `Opening announcement link:` in the BepInEx log.
+- **Styling:** TextMeshPro rich text works — `<b>bold</b>`, `<i>italic</i>`,
+  `<color=#ffcc00>colour</color>`.
+- **Leaving it empty** (`serverAnnouncements: ""`) hides the header and the box entirely.
+
+Upgrading from an older companion version? The key is appended to your existing
+`client.yaml`, with the same notes as comments, the first time the new build starts.
 
 ## The logo image
 

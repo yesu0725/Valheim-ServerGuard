@@ -10,12 +10,12 @@ A vanilla Valheim dedicated server has no way to know which BepInEx plugins a co
 
 ServerGuard v1.3 solves it by making the client tell the server, in a way the server can verify:
 
-- A small **companion plugin** runs on every client.
+- The **client half** of the same mod runs on every player's game (pre-2.0 this was a separate "companion" package; 2.0 merged both into one DLL that picks its side at load).
 - On connect, the server challenges the client to send a **manifest** of its loaded plugins.
 - The manifest is **signed with HMAC-SHA256** using a secret shared between server and clients.
 - The server checks the signature, the freshness, and whether the listed mods are on its allowlist.
 
-Vanilla clients don't have the companion plugin, so they never reply — and get kicked on timeout.
+Vanilla clients don't run ServerGuard, so they never reply — and get kicked on timeout.
 
 ---
 
@@ -28,14 +28,20 @@ Vanilla clients don't have the companion plugin, so they never reply — and get
                 │   Canonical-string format     │
                 │   HMAC-SHA256 helpers         │
                 └────────────┬──────────────────┘
-                             │ (linked into both projects)
+                             │
+                ┌────────────┴──────────────────┐
+                │ ServerGuardPlugin.cs          │  ← the only [BepInPlugin]
+                │   headless? → ServerPlugin    │
+                │   else     → ClientPlugin     │
+                │   PatchNested(harmony, half)  │
+                └────────────┬──────────────────┘
               ┌──────────────┴─────────────────┐
               │                                │
               ▼                                ▼
 ┌──────────────────────────┐      ┌────────────────────────────┐
-│ Plugin.cs                │      │ ServerGuard.Client/        │
-│ (server)                 │      │   ClientPlugin.cs          │
-│                          │      │ (client)                   │
+│ ServerPlugin.cs          │      │ ClientPlugin.cs            │
+│ (server half)            │      │ (client half)              │
+│                          │      │                            │
 │ • Awake                  │      │                            │
 │   - boot notification    │      │ • Awake                    │
 │ • OnDestroy              │      │ • EnsureConfig             │
@@ -61,17 +67,19 @@ Vanilla clients don't have the companion plugin, so they never reply — and get
 │ • Patch_SetRandomEvent   │
 │ • Patch_ResetRandomEvent │
 │   (raid event logging)   │
+│ • Patch_ZNet_RPC_Remote- │
+│   Command / ListContainsId
+│   (staff dev commands)   │
 │ • SendPublic / SendAdmin │
 │ • TryKick / TryBan       │
 └──────────────────────────┘
 ```
 
-Both projects build to a single DLL each (no other side files needed):
+One project, one DLL, installed unchanged on both sides:
 
 | Project | Output |
 |---|---|
 | [Valheim-ServerGuard.csproj](Valheim-ServerGuard.csproj) | `Valheim-ServerGuard.dll` |
-| [ServerGuard.Client/Valheim-ServerGuard-Client.csproj](ServerGuard.Client/Valheim-ServerGuard-Client.csproj) | `Valheim-ServerGuard-Client.dll` |
 
 The csproj for the server has `<Compile Remove="ServerGuard.Client/**/*.cs" />` so the client subdirectory doesn't accidentally compile into the server build.
 
@@ -313,6 +321,26 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 
 ## Version
 
+**2.0.0** — **one mod for both sides, and staff dev commands.** The server plugin and the client companion are merged into a single assembly with a single `[BepInPlugin]` (`ServerGuardPlugin`, GUID `com.taeguk.valheim.serverguard`). `ServerPlugin` (was `Plugin.cs`) and `ClientPlugin` are plain `MonoBehaviour`s; the entry plugin attaches one of them based on `SystemInfo.graphicsDeviceType == Null` (headless ⇒ server), overridable via BepInEx cfg `General.Mode`. Each half patches only its own nested patch classes through `ServerGuardPlugin.PatchNested` — `Harmony.PatchAll()` is gone. The old client GUID is aliased to the new one in `ParseAllowedList` so existing `required_mods` entries survive. `ClientPlugin.VERSION` and every server version string read `ServerGuardPlugin.VERSION`. New feature: `enableOwnerDevcommands` / `enableModeratorDevcommands` / `moderatorDevcommands`. Client: `Patch_Terminal_IsCheatsEnabled` returns `m_cheat` under a grant, `Patch_ConsoleCommand_IsValid` re-validates permitted non-`RemoteCommand` commands without the `IsCheat`/`OnlyServer` terms, and `ShouldBlockConsoleCommand` enforces the moderator list first (category `moderator`, no strike). Server: `Patch_ZNet_RPC_RemoteCommand` runs forwarded commands for granted staff with `Terminal.m_cheat` forced on per call, `Patch_ZNet_ListContainsId` makes owners vanilla admins, `Patch_RandEvent_Console*` covers `randomevent`/`stopevent` for moderators. The policy push gained `devMode|devCsv`. Default moderator list: `goto pos removedrops stopevent find`; `fly debugmode spawn itemset nocost noplacementcost location` can never be granted to moderators. Moderators now **attest like players** (only owners skip), with a new `moderator_allowed_mods:` list in `allowed_mods.yaml`. Moderators get a chat welcome on every login (greeting, live command list, `sg help`, responsibility note); everyone gets a one-per-launch cheat-detection notice popup (`UnifiedPopup`/`WarningPopup`) when the feature is on; staff see cursor world coordinates on the large map (`Patch_Minimap_UpdateBiome_StaffCoords`). `speedCheckMaxMetersPerSecond` default 15 → 70. **Cheat taint detection** (rules `CheatedItem` / `CheatedBuild` / `DebugFly`, all informational by default; `cheatTaintPolicy` log/strip/violation): the client reports Valheim 1.0's `ItemData.m_cheated` inventory items (`ServerGuard_CheatState`), the build report carries `PlacePiece`'s `cheated` flag and the server confirms it against the piece ZDO, and the speed loop reads the player ZDO's `DebugFly`. Thunderstore: the `(client)` package folder is removed; the server folder is now `Thunderstore files/Valheim-ServerGuard/`. Verified: headless boot on Valheim 1.0.7 → `starting as SERVER`, `Applied 14 server-side Harmony patch class(es)`, self-test 8/0.
+
+**1.8.1** — compatibility release for **Valheim 1.0.7** (network version 39, Unity 6000.0.75, BepInEx 5.4.23.5). **No code changes in either plugin**; the version exists to carry the changelog note and keep the pair matched.
+
+Valheim 1.0 needed no fixes. Verified 2026-09-09 by (a) compiling both plugins against the 1.0 assemblies, (b) resolving all ~123 string-based lookups — Harmony patch targets and `GetField`/`GetMethod` names — against `assembly_valheim.dll` with a `MetadataLoadContext` tool and diffing the result against a pre-1.0 baseline, and (c) booting the dedicated server headless and confirming the plugin loads with `Self-test pass=8 fail=0` and no errors. Step (b) is the one that matters: compiling proves almost nothing here, because most Valheim access is by string and fails silently. Keep a pre-update copy of `assembly_valheim.dll` — the 5 members that report "missing" are pre-existing fallback paths (`ZNetPeer.m_platformUserID`, `ZRpc.GetUID`/`m_ping`, …), and without a baseline they read as regressions.
+
+1.0 changes that were checked and are harmless:
+- `Player.PlacePiece` gained a trailing `bool cheated`. `Patch_PlacePiece_Report` is a Postfix binding `piece`/`pos` **by name**, and it is the only overload, so Harmony still resolves it. **`cheated` is an unused anti-cheat signal worth adopting** — but binding it would break the patch on pre-1.0, where the parameter doesn't exist.
+- `Terminal.ConsoleCommand`'s constructor went 12 → 13 args (added `onlyAdmin`) and gained a `HideBehindDevCommands` field. ServerGuard never constructs one, so it is unaffected — but this breaks *other* mods (Server Devcommands 1.109 throws `MissingMethodException` at startup). `ConsoleCommand.IsCheat` is unchanged, and `ReadBoolMember` already probes `IsCheat` first, so dynamic cheat detection still works.
+- `ZoneSystem.m_instance` → `s_instance`; the code uses the `instance` property. `Inventory.AddItem(ItemData)` — the patched overload — survived, though several sibling overloads changed. `Version.m_networkVersion` → `c_networkVersion` (36 → 39), unreferenced.
+- TMP kept `enableWordWrapping` alongside Unity 6's new `textWrappingMode`, and `TMP_TextUtilities.FindIntersectingLink(TMP_Text, Vector3, Camera)` is unchanged, so the 1.8.0 announcements panel and its link handler still work.
+
+Not resolved: 46 registered console commands (`setkeyplayer`, `findbiometp`, `nospawn`, `repairall`, …) sit in no console-guard tier. Whether any are *new* in 1.0 could not be established — Steam overwrote the pre-1.0 assembly before a command-list diff was taken. An attempt to classify them by reading the `isCheat` ctor argument out of `Terminal.InitTerminal` IL produced visibly drifting values (`findbiometp` → `7` for a bool), so that output is indicative only and was not acted on. See `claude/console-guard.md` before changing the tiers.
+
+**1.8.0** — client-only feature release; the server plugin is version-matched but functionally unchanged.
+- **Quick Login announcements.** New `serverAnnouncements` key in `client.yaml` (a YAML `|` block scalar, so the editing surface is the same file as the rest of the panel settings). `EnsureConfig` gained a migration branch: the file is still only *written* when missing, but an existing one without the key gets `AnnouncementsYamlBlock()` appended, since otherwise nobody upgrading would ever see the option. Empty (the default) omits the header and the box entirely, so the 1.7.0 panel is unchanged.
+- **Scroll box.** `BuildAnnouncementsScrollBox` hand-builds the standard `ScrollRect` → viewport → content → text hierarchy (no prefab to clone). The viewport carries a **`RectMask2D`** rather than a `Mask`: no extra material, and it implements `ICanvasRaycastFilter`, so links scrolled out of view aren't clickable through the clip. It also carries a fully transparent `Image` with `raycastTarget` on — without a `Graphic` under the pointer the mouse wheel has nothing to bubble an `IScrollHandler` event up from. Content height can't come from a `ContentSizeFitter`: the cloned menu-button label's own `ContentSizeFitter`/`LayoutElement` are `Destroy()`d but stay alive for the rest of the frame, so `FitAnnouncementContent` defers a frame and measures `preferredHeight` explicitly, twice (first pass establishes the width, second measures against it), falling back to `GetPreferredValues(width, 32767)` if the property reads 0. Height is floored at the viewport height — a content rect smaller than its viewport makes `ScrollRect` place it oddly.
+- **Layout.** The panel is no longer a fixed 320×440: with announcements present it grows to `Mathf.Clamp(-contentTop + 266, 560, 720)` so the scroll box always clears `AnnMinViewport` (140px) regardless of logo/description height, and the player count moves from top-flowed to bottom-anchored (`CreateThemedLabelComponent` gained `anchorBottom`/`bottomOffset`) so the box owns the flexible middle.
+- **Links.** `[label](url)` is rewritten to TMP `<link="url">` markup by `FormatAnnouncementsRich`; everything else passes through, so `<b>`/`<i>`/`<color>` work too. Clicks are handled by `AnnouncementLinkClicker`, a nested `MonoBehaviour` implementing `IPointerClickHandler` — the project doesn't reference `Unity.TextMeshPro`, so the hit test resolves `TMPro.TMP_TextUtilities.FindIntersectingLink(TMP_Text, Vector3, Camera)` by reflection (matched by parameter *shape*, since the `TMP_Text` type can't be named at compile time) and reads `textInfo.linkInfo[i].GetLinkID()` the same way. **Only `http://` and `https://` are opened** — `client.yaml` ships inside modpacks, so the text isn't necessarily written by the person at the keyboard, and a click must not be able to launch `file://` or a custom scheme handler. A URL that fails the check isn't styled as a link either, so nothing looks clickable that won't be.
+
 **1.7.0** — feature release. Three new subsystems.
 - **Privilege tiers.** New `conf/owners.yaml` (`OwnersDoc`, hot-reloaded, fails **closed** on parse error). `IsAdmin` keeps its old meaning and is redefined as `IsModerator || IsOwner`, so every pre-existing call site is unchanged and owners inherit all staff bypasses by being a superset; `RoleOf` returns `owner`/`moderator`/`player`. The owner bypass is enforced at choke points rather than per rule: `AddViolation` returns early (which is what makes "exempt from every rule" true by construction — every rule funnels through it), `TryKick` refuses, `IsBannedId` returns false before the lookup, `AddBan` refuses to write, plus explicit exemptions in `ApplyForcedMapPosition` and `SendCheatItemRemovalIfEnabled`. `moderators.yaml` deliberately keeps its filename — renaming it would silently drop every existing server's staff list on upgrade. See `claude/privilege-tiers.md`.
 - **SteamID ban layer** (`enableBanLayer`, `banLayerKickMessage`, `banLayerMirrorToVanilla`; list in `conf/bans.yaml`, hot-reloaded). Vanilla applies `banlist.txt` from `ZNet.UpdateBanList`, which only runs when `m_banlistTimer > 5f` and then calls `InternalKick` — hence the observed "banned player plays for a few seconds first". The primary gate is `Patch_ZNet_IsAllowed`, a **postfix** on the private `ZNet.IsAllowed(hostName, playerName)` called from `RPC_PeerInfo` *before* the peer is accepted; setting `__result = false` makes vanilla send `ConnectionStatus.ErrorBanned` (8) and return, so no character is spawned. Postfix rather than prefix so vanilla decides first and we only ever flip allow→deny (a `permittedlist.txt` whitelist keeps working). A second gate sits at the top of `Patch_OnNewConnection` reading `peer.m_socket.GetHostName()` — the SteamID64 on Steam sockets — which fires before any PeerInfo round-trip; it calls `DisconnectAsBanned` and returns before registering handlers. `SweepBannedPeers()` is the third layer, applying a new ban to peers already online. `LoadBans` fails **open** on a parse error (keeps the last good list) so a malformed file can't lock a server out; `BanEntry.IsExpired` fails **closed** on an unparseable `expires`. `TryBan` (the `violationThreshold` auto-ban) now routes through `AddBan`. `sg ban` / `sg unban` / `sg bans`; new metric `ban_layer_blocks`. See `claude/ban-layer.md`.
@@ -340,14 +368,11 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 
 **1.3.0** — first release of the client-attestation architecture.
 
-The version string is set independently in:
-- `Plugin.cs` — `[BepInPlugin("com.taeguk.valheim.serverguard", "Valheim ServerGuard", "1.7.0")]` + hardcoded `v1.7.0` in log/config strings
-- `ClientPlugin.cs` — `public const string VERSION = "1.7.0";`
-- `Valheim-ServerGuard.csproj` — `<Version>1.7.0</Version>`
-- `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` — `<Version>1.7.0</Version>`
-- `Thunderstore files/Valheim-ServerGuard (server)/manifest.json` — `"version_number": "1.7.0"`
-- `Thunderstore files/Valheim-ServerGuard (client)/manifest.json` — `"version_number": "1.7.0"`
-- `README.md`, `claude/IMPLEMENTATION_SUMMARY.md`, `DEPLOYMENT_GUIDE.md`, `BUILD.md` — inline version references
-- Both Thunderstore `README.md` and `CHANGELOG.md` files
+The version string is set in:
+- `ServerGuardPlugin.cs` — `public const string VERSION = "2.0.0";` (the only literal in code; `ServerPlugin`'s log/config strings and `ClientPlugin.VERSION` read it)
+- `Valheim-ServerGuard.csproj` — `<Version>2.0.0</Version>`
+- `Thunderstore files/Valheim-ServerGuard/manifest.json` — `"version_number": "2.0.0"`
+- `README.md`, `CLAUDE.md`, `claude/IMPLEMENTATION_SUMMARY.md`, `wiki/Home.md`, `wiki/Discord-Integration.md` — inline version references
+- The Thunderstore `README.md` and `CHANGELOG.md`
 
-Bump all locations together when releasing. Add a new `## x.y.z` section at the top of each `CHANGELOG.md`; do not rename the previous heading.
+Bump all locations together when releasing. Add a new `## x.y.z` section at the top of `CHANGELOG.md`; do not rename the previous heading.

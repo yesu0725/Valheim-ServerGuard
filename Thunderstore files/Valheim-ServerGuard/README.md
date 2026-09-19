@@ -1,11 +1,15 @@
 # Valheim ServerGuard
 
-A single mod that handles the messy parts of running a dedicated Valheim server with a curated modpack: mod allowlist, anti-cheat, moderation tools, Discord integration, and forensic logging — all configurable from YAML.
+A single mod that handles the messy parts of running a dedicated Valheim server with a curated modpack: mod allowlist, anti-cheat, dev commands for staff, moderation tools, Discord integration, and forensic logging — all configurable from YAML.
+
+**Install this same mod on the dedicated server and on every player's game.** It detects which side it is on. (Since 2.0 there is no separate client package — if you still have `Valheim_ServerGuard_Client` installed, remove it.)
 
 ## What it does (in plain English)
 
 - **Locks your server to a specific modpack.** Players running the wrong mods are kicked at the door.
-- **Blocks common cheats.** `devcommands` / `god` / `fly` / `spawn` and other console cheats are silently neutered. Emote attack-cancel exploit is blocked. Suspicious movement speed and skill levels are flagged.
+- **Blocks common cheats.** `devcommands` / `god` / `fly` / `spawn` and other console cheats are silently neutered for players. Emote attack-cancel exploit is blocked. Suspicious movement speed and skill levels are flagged.
+- **Sees what the game marks as cheated.** Valheim 1.0 flags spawned items, things crafted from them and `nocost` builds. Players carrying flagged gear — including gear spawned in single-player — are reported to your admin channel, optionally stripped.
+- **Gives your staff dev commands.** Owners get every dev command on the dedicated server, exactly as in single-player (`devcommands`, `fly`, `god`, `spawn`, `goto`, `skiptime`, world modifiers, ...) with no `adminlist.txt` needed. Moderators get only the commands you list in `settings.yaml`. Everything run server-side is logged to your admin Discord channel.
 - **Sends events to Discord.** Public channel for player events (joined / kicked / died / **shouts** / **raid alerts**). Optional admin channel for moderation events (violations / config reloads / daily summary).
 - **Announces raids by their real name.** Random-event raids are posted to Discord using the in-game event name (e.g. "The Horde Is Attacking") with coordinates, plus pause/resume/end updates.
 - **Strips cheat items on login.** Configured items (`SwordCheat`, `SledgeCheat` by default) are removed from non-admin players' inventories when they join.
@@ -17,10 +21,11 @@ A single mod that handles the messy parts of running a dedicated Valheim server 
 ## Quick setup
 
 1. Install this mod on your **dedicated server**.
-2. Install **Valheim_ServerGuard_Client** on every player's machine.
+2. Install **this same mod** on every player's machine (add it to your modpack).
 3. Launch the server. It writes `BepInEx/config/ServerGuard/conf/settings.yaml` with a random `sharedSecret`.
 4. Copy that `sharedSecret` value. Each player pastes it into their `BepInEx/config/ServerGuard/client.yaml`.
-5. Add your modpack to `BepInEx/config/ServerGuard/conf/allowed_mods.yaml`. The companion plugin generates a ready-to-paste snippet at `mods_for_allowed_mods.yaml` after a player runs Valheim once.
+5. Add your modpack to `BepInEx/config/ServerGuard/conf/allowed_mods.yaml`. The mod generates a ready-to-paste snippet at `mods_for_allowed_mods.yaml` on each player's PC after they run Valheim once.
+6. Put your own SteamID in `conf/owners.yaml` — that gives you every dev command in-game. Staff go in `conf/moderators.yaml` and get the `moderatorDevcommands` list.
 
 That's the minimum. Everything else is optional.
 
@@ -42,6 +47,6 @@ This mod is **free to use as is**. Voluntary support is appreciated.
 
 ---
 
-**Version:** 1.7.0
+**Version:** 2.0.0
 **Source / issues / wiki:** https://github.com/yesu0725/Valheim-ServerGuard
-**Companion (required on every client):** `TaegukGaming-Valheim_ServerGuard_Client`
+**Required on every client:** this same mod. The old `Valheim_ServerGuard_Client` package is retired.

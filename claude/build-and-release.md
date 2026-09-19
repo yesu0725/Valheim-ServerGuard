@@ -2,30 +2,40 @@
 
 ## Build commands
 
-### Build both projects
+### Build (one project, one DLL — since 2.0)
 ```
 cd "E:\Valheim Modding\Valheim-ServerGuard"
 dotnet build Valheim-ServerGuard.csproj -c Release
-dotnet build ServerGuard.Client\Valheim-ServerGuard-Client.csproj -c Release
 ```
 
-Or from Visual Studio / Rider: Build → Build Solution.
+Or from Visual Studio / Rider: Build → Build Solution. The client half compiles into
+the same assembly; `ServerGuard.Client/` and its csproj no longer exist.
 
-### Output locations
+### Output location
 ```
-bin/Release/Valheim-ServerGuard.dll
-ServerGuard.Client/bin/Release/Valheim-ServerGuard-Client.dll
+bin/Release/Valheim-ServerGuard.dll      ← installed unchanged on server AND client
 ```
 
 ---
 
 ## Auto-copy on build
 
-Both `.csproj` files have a post-build `<Target Name="CopyTo...">` that silently copies the DLL if the destination folder exists.
+The csproj has one post-build target, `CopyToTestInstalls`, that silently copies the
+DLL to each destination that exists.
 
 **Server** → `C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard`
 
-**Client** → `C:\Users\yesu0725\AppData\Roaming\com.kesomannen.gale\valheim\profiles\HB Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard_Client`
+**Client** → `C:\Users\yesu0725\AppData\Roaming\com.kesomannen.gale\valheim\profiles\HB Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard`
+
+**HB Test is the only Gale profile that ever receives a build.** The other profiles
+(`HB Modpack Ref`, `Hearthbound - Admin`, `Hearthbound Valheim`, `TG Mods Only`) stay on
+published releases — never add them to the target or copy there by hand. The target
+creates the `TaegukGaming-Valheim_ServerGuard` folder in HB Test if it is missing.
+
+The client destination is the **merged** package folder (no `_Client` suffix). The
+target also emits a build *warning* if the pre-2.0 `TaegukGaming-Valheim_ServerGuard_Client`
+folder still holds `Valheim-ServerGuard-Client.dll` in that profile — the old companion
+must be uninstalled, or both would run.
 
 The client test profile is managed by **[Gale](https://thunderstore.io/c/valheim/p/Kesomannen/GaleModManager/)**, not r2modman — hence the `com.kesomannen.gale` app-data root and the `HB Test` profile name. The old r2modman profile (`r2modmanPlus-local\...\Hearthbound Valheim - Test`) is no longer the test target; if it still exists on disk it is stale and gets no new builds.
 
@@ -35,44 +45,52 @@ Override at build time with env vars `SERVERGUARD_TEST_SERVER_DIR` or `SERVERGUA
 
 ---
 
-## Version bump — 6 locations, all must match
+## Version bump — every site, all must match
 
-When bumping version (e.g. 1.4.0 → 1.5.0), update **all six**:
+One mod, one version. Thunderstore rejects a re-upload of an already-published
+`version_number`, so never reuse one.
+
+### Source
 
 | File | What to change |
 |---|---|
-| `Plugin.cs` line 20 | `[BepInPlugin("...", "...", "1.4.0")]` → new version |
-| `Plugin.cs` Awake log | `$"[ServerGuard] Loaded (v1.4.0)."` → new version |
-| `Plugin.cs` Awake admin post | `$":rocket: **ServerGuard online** v1.4.0"` → new version |
-| `ServerGuard.Client/ClientPlugin.cs` | `public const string VERSION = "1.4.0";` → new version |
-| `Valheim-ServerGuard.csproj` | `<Version>1.4.0</Version>` → new version |
-| `ServerGuard.Client/Valheim-ServerGuard-Client.csproj` | `<Version>1.4.0</Version>` → new version |
+| `ServerGuardPlugin.cs` | `public const string VERSION = "x.y.z";` — **the only version literal in code.** `ServerPlugin` (the `Loaded (vX)` log, the `ServerGuard online vX` post, the settings.yaml header, `sg status`) and `ClientPlugin.VERSION` all read it. |
+| `Valheim-ServerGuard.csproj` | `<Version>x.y.z</Version>` |
+| `README.md` | `**Version:** x.y.z` footer + a new `### New in x.y.z` / `### Fixed in x.y.z` section at the top |
+| `CLAUDE.md` | `| **Current version** | x.y.z |` |
+| `claude/IMPLEMENTATION_SUMMARY.md` | New `**x.y.z**` entry in the Version section |
+| `wiki/Home.md` | the version line |
+| `wiki/Discord-Integration.md` | the `ServerGuard online vx.y.z` example line |
 
-Then also update Thunderstore manifests (separate files — see below).
+### Thunderstore files
+
+| File | What to change |
+|---|---|
+| `manifest.json` | `"version_number": "x.y.z"` |
+| `README.md` | `**Version:** x.y.z` footer |
+| `CHANGELOG.md` | New `## x.y.z` section at the **top** — never rename a previous heading |
+
+After bumping, **re-grep the old version** and confirm every remaining hit is
+historical prose (`"Fixed in 1.6.1"`, `"renamed in 1.7.0"`, changelog headings).
+Do not rewrite those.
 
 ---
 
 ## Thunderstore package structure
 
-### Server package
+### The one package (since 2.0)
 ```
-Thunderstore files/Valheim-ServerGuard (server)/
-├── manifest.json       ← version_number must match plugin version
+Thunderstore files/Valheim-ServerGuard/
+├── manifest.json       ← version_number must match plugin version; name "Valheim_ServerGuard"
 ├── README.md           ← user-facing, non-technical
 ├── CHANGELOG.md        ← user-facing release notes
 ├── icon.png            ← 256×256 PNG
 └── Valheim-ServerGuard.dll
 ```
 
-### Client package
-```
-Thunderstore files/Valheim-ServerGuard (client)/
-├── manifest.json       ← version_number must match plugin version
-├── README.md
-├── CHANGELOG.md
-├── icon.png
-└── Valheim-ServerGuard-Client.dll
-```
+The pre-2.0 `Valheim_ServerGuard_Client` package is retired. Its folder was removed
+from the repo in 2.0.0; the Thunderstore listing stays as-is (Thunderstore has no
+delete) — its README already points at the merged package.
 
 ### manifest.json format
 ```json
@@ -89,28 +107,75 @@ Thunderstore files/Valheim-ServerGuard (client)/
 
 ## Release checklist
 
-1. **Bump version** in all 6 locations above
-2. **Build both projects** — verify no errors
-3. **Copy DLLs to Thunderstore folders:**
+1. **Bump version** at every site listed above
+2. **Build** — verify no errors. The post-build target auto-deploys to the test server
+   and the Gale test profile; nothing to copy by hand there.
+3. **Copy the DLL to the Thunderstore folder:**
    ```
-   copy bin\Release\Valheim-ServerGuard.dll "Thunderstore files\Valheim-ServerGuard (server)\"
-   copy ServerGuard.Client\bin\Release\Valheim-ServerGuard-Client.dll "Thunderstore files\Valheim-ServerGuard (client)\"
+   copy bin\Release\Valheim-ServerGuard.dll "Thunderstore files\Valheim-ServerGuard\"
    ```
-4. **Update Thunderstore manifests** — `version_number` in both `manifest.json`
-5. **Update CHANGELOGs** — user-friendly, non-technical (readers are mod users, not developers)
-6. **Update READMEs** if needed
-7. **Zip each package:**
+   Then **verify the staged DLL's `FileVersion` actually reads the new number** before
+   zipping (`(Get-Item <dll>).VersionInfo.FileVersion`). A stale DLL zipped under a new
+   `version_number` is the most embarrassing release mistake available.
+4. **Update the Thunderstore manifest** — `version_number` in `manifest.json`
+5. **Update the CHANGELOG** — user-friendly, non-technical (readers are mod users, not developers)
+6. **Update the README** if needed
+7. **Zip the package — into the `Thunderstore files\` root, never into the package folder:**
    ```powershell
-   $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-   $ver = "1.4.0"
-   Compress-Archive -Path "Thunderstore files\Valheim-ServerGuard (server)\*" `
-       -DestinationPath "Thunderstore files\Valheim-ServerGuard (server)\Valheim-ServerGuard_v${ver}_${ts}.zip"
-   Compress-Archive -Path "Thunderstore files\Valheim-ServerGuard (client)\*" `
-       -DestinationPath "Thunderstore files\Valheim-ServerGuard (client)\Valheim-ServerGuard-Client_v${ver}_${ts}.zip"
+   $ts = "E:\Valheim Modding\Valheim-ServerGuard\Thunderstore files"
+   $stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+   $items = Get-ChildItem (Join-Path $ts "Valheim-ServerGuard") | Where-Object { $_.Extension -ne ".zip" } | Select-Object -ExpandProperty FullName
+   Compress-Archive -Path $items -DestinationPath (Join-Path $ts ("Valheim-ServerGuard_" + $stamp + ".zip")) -Force
    ```
-   **Do NOT include the wiki/ directory in zips.** Wiki files are only for GitHub Wiki.
+   **Why the `.zip` exclusion and the root destination:** an earlier version of this
+   step wrote the zip *into* the package folder, so the next release's zip swallowed the
+   previous release's zip as a package file. Keep zips out of the package folder.
+   The zip must contain exactly five root entries: `CHANGELOG.md`, `icon.png`,
+   `manifest.json`, `README.md`, and `Valheim-ServerGuard.dll`. **Never the `wiki/` directory.**
 8. **Commit and push to GitHub**
 9. **Upload zips to Thunderstore** manually (Claude cannot do this)
+
+---
+
+## Verifying against a new Valheim release
+
+Done for Valheim 1.0.7 on 2026-09-09 (shipped as 1.8.1 — no code changes were needed).
+Repeat this on every game update; the result goes in `CLAUDE.md` (*Game verified
+against*) and `IMPLEMENTATION_SUMMARY.md`.
+
+**A clean compile proves almost nothing here.** Most of this mod's access to Valheim is
+by *string* — `[HarmonyPatch(typeof(X), "Method")]`, `GetField("m_x")`,
+`GetMethod("Y")` — and those fail silently at runtime, not at build time. The order
+below is deliberate; only the last step proves the patches actually apply.
+
+1. **Copy the pre-update `assembly_valheim.dll` aside *first*.** Steam can finish updating
+   the dedicated server mid-session and overwrite it, and without a baseline, absent
+   members read as regressions when several are long-standing fallback paths
+   (`ZNetPeer.m_platformUserID`, `ZRpc.GetUID`, `ZRpc.m_ping`, `ConsoleCommand.m_isCheat`
+   all report "missing" on *every* build).
+2. **Compile** against the new `Managed\` folders — catches direct references only.
+3. **Enumerate every string lookup**: grep `HarmonyPatch(`, `AccessTools.`, `GetField("`,
+   `GetMethod("`, `GetProperty("`, `GetType("`, and the `GetField(obj, "m_…")` helper calls.
+4. **Resolve each against the new assembly** with a `System.Reflection.MetadataLoadContext`
+   tool (reflects without executing; target `net6.0` — the local SDK default refuses
+   `net9.0`). Members the client reflects on in `Unity.TextMeshPro.dll` and
+   `UnityEngine.ImageConversionModule.dll` need the same check with that assembly loaded.
+5. **Diff signatures *and parameter names*, not just existence.** A method that survives
+   with a changed signature breaks a patch just as hard, and Harmony injects postfix
+   arguments by **name**. (1.0 added a trailing `bool cheated` to `Player.PlacePiece`;
+   the patch survived only because `piece`/`pos` kept their names and positions.)
+6. **Boot the dedicated server headless** and read `BepInEx\LogOutput.log` for the
+   `Loading [Valheim ServerGuard x.y.z]` line, `Self-test pass=N fail=0`, and any Harmony
+   patch error. Isolate the run: `-public 0`, an off-band `-port`, a throwaway `-savedir`.
+   **BepInEx truncates `LogOutput.log` on every run** — read the whole file afterwards;
+   capturing "new bytes" by offset skips the entire plugin-load preamble.
+7. Errors from *other* plugins in that log are useful triage for the user but are not
+   this mod's problem — attribute by stack frame before reporting.
+
+The client half can be verified through steps 2–5 only; step 6 needs the game GUI. Step 6
+on the server proves the entry plugin picked the server half (`starting as SERVER`) and
+applied the expected patch-class count (`Applied 14 server-side Harmony patch class(es)`
+as of 2.0.0).
 
 ---
 

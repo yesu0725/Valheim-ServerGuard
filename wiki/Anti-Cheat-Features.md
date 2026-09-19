@@ -74,7 +74,7 @@ The player typed a cheat-flagged console command (or `devcommands` itself). Bloc
 The player moved faster than `speedCheckMaxMetersPerSecond` for `speedCheckConsecutiveStrikes` consecutive samples.
 
 - **Default:** Counted.
-- **Settings:** `enableSpeedCheck`, `speedCheckMaxMetersPerSecond` (default 15), `speedCheckSampleSeconds` (default 1), `speedCheckConsecutiveStrikes` (default 3), `speedCheckTeleportToleranceMeters` (default 60).
+- **Settings:** `enableSpeedCheck`, `speedCheckMaxMetersPerSecond` (default 70 since 2.0), `speedCheckSampleSeconds` (default 1), `speedCheckConsecutiveStrikes` (default 3), `speedCheckTeleportToleranceMeters` (default 60).
 - **False-positive defenses:** Vertical motion is ignored (jumping/falling doesn't count). Big single-sample jumps (portal/stone) reset the strike counter. Lag spikes need to sustain for N seconds before flagging.
 - **Tuning:** Modded mounts and skills may legitimately push speed higher — raise the threshold rather than disabling.
 
@@ -96,6 +96,43 @@ The player tried to cancel an attack-recovery animation with an emote — the cl
 - **Setting:** `enableAnimationCancelGate: true`.
 - **Notes:** The companion blocks the cancel client-side (the emote silently fails). This toggle controls server-side accounting.
 - **Sheathing is not part of this rule.** Holstering your weapon mid-attack is ordinary play — weapon swaps, picking up items, opening chests and building all do it — so it is neither blocked nor reported. Servers still running an older companion on some clients are covered too: the server discards `sheathe` reports on arrival.
+
+### CheatedItem, CheatedBuild, DebugFly *(2.0)*
+
+Valheim 1.0 keeps its own record of cheating, built for achievements: every item that
+came out of `spawn` (and everything crafted, smelted, cooked or looted from it) carries
+a hidden "cheated" mark; a piece built with `nocost` or with marked materials is marked;
+a creature hit by a player in god, ghost or fly mode is marked. The item mark is saved in
+the character file, so gear spawned in a single-player world **arrives on your server
+still marked**. ServerGuard reads all of this.
+
+- **CheatedItem** — the client reports every marked item in the player's inventory on
+  spawn, whenever the set changes, and every minute. What happens is `cheatTaintPolicy`:
+  `log` (default) posts to the admin channel; `strip` also removes the items on the spot
+  (the player sees *"cheat-spawned item(s) removed by server policy"*); `violation` also
+  records a strike. The character's permanent "used dev commands" mark and the
+  `bypasscheatchecks` key (which switches the game's marking off) are each reported once
+  per session.
+- **CheatedBuild** — a placed piece was marked. The client says so in its build report,
+  the build log gets a `cheated` column, and the server checks the piece itself in the
+  world a few seconds later so a lying client is contradicted by the world state.
+- **DebugFly** — the player's character reports debug fly. Read by the server directly;
+  nothing to trust.
+
+Owners are exempt. Moderators are reported unless `cheatTaintExemptModerators: true` —
+and since a moderator can never be granted `fly` or `debugmode`, a flying moderator is
+always reported. All three rules start as informational in `countAsViolation`.
+
+Every player sees a one-time notice panel on their first login after launching the game
+(not on a relog) explaining that cheat detection is on and what the consequence is under
+the server's current `cheatTaintPolicy`.
+
+**Limits:** this is the game being honest about itself. A modified client never sets the
+mark — attestation is still what keeps those out. Valheim also auto-marks any item over
+10000 total damage, so add such modded weapons to `cheatTaintIgnoredItems`. And a
+crafting station built with `nocost` marks everything crafted at it, forever — if an
+owner builds event infrastructure with cheats, expect the players who use it to show up
+in the log.
 
 ### SkillOverflow
 

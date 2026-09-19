@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Bootstrap;
@@ -14,19 +15,25 @@ using BepInEx.Logging;
 using HarmonyLib;
 using Newtonsoft.Json;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
 using ValheimServerGuard.Shared;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
-namespace ValheimServerGuardClient
+namespace ValheimServerGuard
 {
-    [BepInPlugin(GUID, NAME, VERSION)]
-    public class ClientPlugin : BaseUnityPlugin
+    // The CLIENT half of ServerGuard. Attached by ServerGuardPlugin.Awake on a
+    // player's game (never on a dedicated server). Not a BepInEx plugin itself: it is
+    // a plain MonoBehaviour on the entry plugin's GameObject, so Awake / coroutines /
+    // OnDestroy behave exactly as they did when this was the standalone companion.
+    internal class ClientPlugin : MonoBehaviour
     {
-        public const string GUID    = "com.taeguk.valheim.serverguard.client";
-        public const string NAME    = "Valheim ServerGuard Client";
-        public const string VERSION = "1.7.0";
+        // Same GUID/name/version as the server half - there is one mod now. Kept as
+        // aliases so the manifest export and log lines read naturally.
+        public const string GUID    = ServerGuardPlugin.GUID;
+        public const string NAME    = ServerGuardPlugin.NAME;
+        public const string VERSION = ServerGuardPlugin.VERSION;
 
         internal static ClientPlugin Instance;
         internal static ManualLogSource LogS;
@@ -65,6 +72,10 @@ namespace ValheimServerGuardClient
         {
             // Master switches
             "devcommands", "debugmode", "imacheater",
+            // Sets the `bypasscheatchecks` unique key on the character, after which the
+            // game stops marking anything as cheated (1.0). Not IsCheat in vanilla, so
+            // it has to be listed by name. The server also reports the key itself.
+            "yesiuseddevcommandsbutiwantmyachievementsanyway",
             // Self state / invulnerability
             "god", "ghost", "heal", "puke", "damage", "addstatus", "clearstatus",
             "resetcharacter", "setpower", "model", "beard", "hair",
@@ -179,8 +190,47 @@ namespace ValheimServerGuardClient
         // opportunity to wave through. `role` from the console-policy push is the only
         // channel carrying the tier, so it does double duty here.
         internal static bool IsOwnerClient => _consoleRole == "owner";
+        internal static bool IsStaffClient => _consoleRole == "owner" || _consoleRole == "moderator";
 
-        // Payload: mode|exempt|role|bindPolicy|blockedCsv|allowedCsv
+        // 2.0: cheat-taint detection state on the server ("0" = off, else the policy
+        // name: log / strip / violation). Drives the one-time notice panel.
+        private static string _cheatTaintServerPolicy = "0";
+        // Once per game process - the user asked for the notice on a fresh launch, not
+        // on every relog. Static and never reset.
+        private static bool _cheatTaintNoticeShown = false;
+        // Once per connection - reset with the rest of the policy on ZNet.Shutdown.
+        private static bool _moderatorWelcomeShown = false;
+
+        // ---- Staff dev commands (2.0) ----
+        //
+        // The server's grant for THIS player, from the last two policy fields:
+        //   "none" - vanilla behaviour (cheat commands refused on a dedicated-server client)
+        //   "list" - only _devCommands may run (moderators)
+        //   "all"  - every dev command may run (owners)
+        // Enforced by Patch_Terminal_IsCheatsEnabled + Patch_ConsoleCommand_IsValid
+        // (unlock) and by ShouldBlockConsoleCommand (moderator list). See the "Staff
+        // dev commands" section below for how the pieces fit.
+        private static string _devMode = "none";
+        private static HashSet<string> _devCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Last grant we told the player about, so hot-reload re-pushes don't repeat it.
+        private static string _devModeAnnounced = "";
+
+        internal static bool DevAccessGranted =>
+            _devMode == "all" || (_devMode == "list" && _devCommands.Count > 0);
+
+        // May this player run `cmd` under the current grant? `devcommands` is always
+        // permitted once anything is granted: it only flips the local m_cheat toggle,
+        // and every other dev command is dead without it.
+        internal static bool IsDevCommandPermitted(string cmd)
+        {
+            if (string.IsNullOrEmpty(cmd)) return false;
+            if (_devMode == "all") return true;
+            if (_devMode == "list" && _devCommands.Count > 0)
+                return _devCommands.Contains(cmd) || string.Equals(cmd, "devcommands", StringComparison.OrdinalIgnoreCase);
+            return false;
+        }
+
+        // Payload: mode|exempt|role|bindPolicy|blockedCsv|allowedCsv[|devMode|devCsv]
         internal static void OnConsolePolicyReceived(string payload)
         {
             try
@@ -200,11 +250,22 @@ namespace ValheimServerGuardClient
                 _consoleExtraBlocked = ToSet(parts.Length > 4 ? parts[4] : "");
                 _consoleAllowed      = ToSet(parts.Length > 5 ? parts[5] : "");
 
+                // 2.0 fields. A pre-2.0 server sends six fields: no grant.
+                var devMode = parts.Length > 6 ? parts[6].Trim().ToLowerInvariant() : "none";
+                _devMode     = devMode == "all" || devMode == "list" ? devMode : "none";
+                _devCommands = ToSet(parts.Length > 7 ? parts[7] : "");
+                if (_devMode == "list" && _devCommands.Count == 0) _devMode = "none";
+                _cheatTaintServerPolicy = parts.Length > 8 ? parts[8].Trim().ToLowerInvariant() : "0";
+                if (_cheatTaintServerPolicy.Length == 0) _cheatTaintServerPolicy = "0";
+
                 LogS?.LogInfo($"[ServerGuard.Client] Console policy: mode={_consoleMode} binds={_consoleBindPolicy} "
                     + $"role={_consoleRole} exempt={_consoleExempt} "
-                    + $"extraBlocked={_consoleExtraBlocked.Count} allowed={_consoleAllowed.Count}");
+                    + $"extraBlocked={_consoleExtraBlocked.Count} allowed={_consoleAllowed.Count} "
+                    + $"devcommands={_devMode}{(_devMode == "list" ? $"({_devCommands.Count})" : "")}");
 
                 ApplyBindPolicy();
+                AnnounceDevGrant();
+                Instance?.QueueLoginMessages();
             }
             catch (Exception ex)
             {
@@ -233,6 +294,222 @@ namespace ValheimServerGuardClient
             _consoleExempt       = false;
             _consoleExtraBlocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _consoleAllowed      = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _devMode             = "none";
+            _devCommands         = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _devModeAnnounced    = "";
+            _cheatTaintServerPolicy = "0";
+            _moderatorWelcomeShown  = false;   // _cheatTaintNoticeShown deliberately NOT reset
+        }
+
+        // ====================== Login messages (2.0) ======================
+        //
+        // Two things shown after the player has actually spawned (the policy push
+        // arrives during the handshake, long before there is a chat window or a
+        // character to greet):
+        //
+        //   * Moderator welcome - every login, in the local chat window: greeting, the
+        //     live dev-command list from the server, where the sg tools are, and a
+        //     reminder to moderate responsibly. Owners don't get it.
+        //   * Cheat-taint notice - a native warning popup, ONCE per game launch, when
+        //     the server has cheat-taint detection on. Relogging without restarting
+        //     the game does not show it again.
+        //
+        // Both are driven by the policy push, so a hot-reload re-push can re-trigger
+        // the coroutine; the two flags make each message fire at most once.
+
+        private Coroutine _loginMessagesCo;
+
+        private void QueueLoginMessages()
+        {
+            try
+            {
+                if (!IsActiveMultiplayerClient()) return;
+                bool wantWelcome = _consoleRole == "moderator" && !_moderatorWelcomeShown;
+                bool wantNotice  = _cheatTaintServerPolicy != "0" && !_cheatTaintNoticeShown;
+                if (!wantWelcome && !wantNotice) return;
+                if (_loginMessagesCo != null) return;
+                _loginMessagesCo = StartCoroutine(LoginMessagesCoroutine());
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] QueueLoginMessages error: {ex.Message}");
+            }
+        }
+
+        private IEnumerator LoginMessagesCoroutine()
+        {
+            // Wait for the character to be in the world. Up to 3 minutes - a slow modded
+            // load can take a while, and the policy push arrives before any of it.
+            float waited = 0f;
+            while (waited < 180f && (Player.m_localPlayer == null || Chat.instance == null))
+            {
+                yield return new WaitForSeconds(0.5f);
+                waited += 0.5f;
+            }
+            _loginMessagesCo = null;
+            if (Player.m_localPlayer == null || !IsActiveMultiplayerClient()) yield break;
+
+            // A beat after spawn so the messages land after the vanilla arrival noise.
+            yield return new WaitForSeconds(2f);
+
+            try
+            {
+                if (_consoleRole == "moderator" && !_moderatorWelcomeShown)
+                {
+                    _moderatorWelcomeShown = true;
+                    ShowModeratorWelcome();
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Moderator welcome error: {ex.Message}");
+            }
+
+            try
+            {
+                if (_cheatTaintServerPolicy != "0" && !_cheatTaintNoticeShown)
+                {
+                    _cheatTaintNoticeShown = true;
+                    ShowCheatTaintNotice(_cheatTaintServerPolicy);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Cheat-taint notice error: {ex.Message}");
+            }
+        }
+
+        private static void ShowModeratorWelcome()
+        {
+            var chat = Chat.instance;
+            if (chat == null) return;
+
+            string name = "Viking";
+            try { name = Player.m_localPlayer?.GetPlayerName() ?? name; } catch { }
+
+            var cmds = _devMode == "list" && _devCommands.Count > 0
+                ? string.Join(", ", _devCommands.OrderBy(c => c))
+                : "(none granted right now)";
+
+            var lines = new[]
+            {
+                $"<color=#ffd700>[ServerGuard]</color> Welcome back, <color=#ffd700>{name}</color>. You are a <color=#ffd700>moderator</color> on this server.",
+                $"Dev commands available to you: <color=#a0e0ff>{cmds}</color>",
+                "Type <color=#a0e0ff>devcommands</color> in the F5 console to enable them. Anything not on this list is refused and reported to the owner.",
+                "Moderator tools: <color=#a0e0ff>sg help</color> in the console (kick, ban, whois, build log).",
+                "Please moderate responsibly. Your actions are logged and posted to the admin channel, and the same cheat-detection rules that apply to players apply to you. Use your commands to help players, never to gain an advantage.",
+            };
+
+            foreach (var line in lines)
+            {
+                try { chat.AddString(line); }
+                catch (Exception ex) { LogS?.LogInfo($"[ServerGuard.Client] {line} ({ex.Message})"); }
+            }
+            // Make sure the chat window is actually visible for a moment.
+            try
+            {
+                var hide = typeof(Chat).GetField("m_hideTimer", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                hide?.SetValue(chat, 0f);
+            }
+            catch { }
+        }
+
+        private const float CheatTaintNoticeScale = 1.75f;
+
+        // UnifiedPopup keeps its whole dialog under a private `popupUIParent`; scaling
+        // that RectTransform enlarges panel, header, body and button together.
+        //
+        // The header and the OK button don't need the full enlargement (they are sized
+        // fine in vanilla), so they are counter-scaled: the header ends up ~1.15x, the
+        // button at its original size. Everything is put back to 1 on OK.
+        private const float CheatTaintHeaderNet = 1.15f;
+        private const float CheatTaintButtonNet = 1.0f;
+
+        private static void ScaleUnifiedPopup(float scale)
+        {
+            try
+            {
+                const BindingFlags F = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+                var instField   = typeof(UnifiedPopup).GetField("instance", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                var inst        = instField?.GetValue(null);
+                if (inst == null) return;
+
+                var parent = typeof(UnifiedPopup).GetField("popupUIParent", F)?.GetValue(inst) as GameObject;
+                if (parent == null) return;
+                parent.transform.localScale = new Vector3(scale, scale, 1f);
+
+                bool reset = Math.Abs(scale - 1f) < 0.001f;
+                float headerScale = reset ? 1f : CheatTaintHeaderNet / scale;
+                float buttonScale = reset ? 1f : CheatTaintButtonNet / scale;
+
+                if (typeof(UnifiedPopup).GetField("headerText", F)?.GetValue(inst) is Component header)
+                    header.transform.localScale = new Vector3(headerScale, headerScale, 1f);
+                if (typeof(UnifiedPopup).GetField("buttonCenter", F)?.GetValue(inst) is Component button)
+                    button.transform.localScale = new Vector3(buttonScale, buttonScale, 1f);
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Popup scale failed: {ex.Message}");
+            }
+        }
+
+        private static void ShowCheatTaintNotice(string policy)
+        {
+            string consequence = policy == "strip"
+                ? "Flagged items and builds are reported to the server staff automatically, and flagged items are removed from your inventory."
+                : policy == "violation"
+                    ? "Flagged items and builds are reported to the server staff automatically, flagged items are removed from your inventory, and each occurrence counts as a strike toward a ban."
+                    : "Flagged items and builds are reported to the server staff automatically, and depending on server policy flagged items may be removed from your inventory or count as a strike toward a ban.";
+
+            var body =
+                "Valheim marks every item, build and creature that comes from a cheat command — spawned items, anything crafted from them, pieces built for free, kills made in god or fly mode. The mark is saved with your character, so it follows gear brought in from single-player.\n\n" +
+                "This server reads those marks. " + consequence + "\n\n" +
+                "If you have used cheats on this character elsewhere, don't bring that gear here. Play fair and none of this will ever concern you.";
+
+            try
+            {
+                if (UnifiedPopup.IsAvailable())
+                {
+                    // The vanilla warning popup is sized for two-line messages; at this
+                    // length the text is unreadable. Scale the whole popup up while ours
+                    // is showing (font scales with it) and put it back on OK so every
+                    // vanilla popup that follows looks normal.
+                    UnifiedPopup.Push(new WarningPopup("Cheat detection is active on this server", body,
+                        () => { ScaleUnifiedPopup(1f); try { UnifiedPopup.Pop(); } catch { } }, localizeText: false));
+                    ScaleUnifiedPopup(CheatTaintNoticeScale);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Notice popup unavailable ({ex.Message}); falling back to chat.");
+            }
+
+            // Fallback: the same text in the chat window.
+            try
+            {
+                Chat.instance?.AddString("<color=#ffd700>[ServerGuard]</color> Cheat detection is active on this server. " + body.Replace("\n\n", " "));
+            }
+            catch { }
+        }
+
+        // One console line telling staff what they just got, printed when the grant
+        // changes (connect, or a hot-reload that promoted / demoted them).
+        private static void AnnounceDevGrant()
+        {
+            try
+            {
+                var key = _devMode == "list" ? "list:" + string.Join(",", _devCommands.OrderBy(c => c)) : _devMode;
+                if (key == _devModeAnnounced) return;
+                _devModeAnnounced = key;
+
+                if (_devMode == "all")
+                    Instance?.DisplayAdminReply("[ServerGuard] Dev commands unlocked for you (owner). Type `devcommands` to enable them.");
+                else if (_devMode == "list")
+                    Instance?.DisplayAdminReply("[ServerGuard] Dev commands available to you (moderator): "
+                        + string.Join(", ", _devCommands.OrderBy(c => c)) + ". Type `devcommands` to enable them.");
+            }
+            catch { }
         }
 
         private static readonly string ConfDir    = Path.Combine(Paths.ConfigPath, "ServerGuard");
@@ -255,17 +532,24 @@ namespace ValheimServerGuardClient
             public string ServerDescription   { get; set; } = "";
             // PNG/JPG filename relative to BepInEx/config/ServerGuard/. Empty = no logo.
             public string ServerLogoPath      { get; set; } = "";
+            // Free-form multi-line text shown in the scrollable "Announcements" box
+            // below the description. Supports [label](https://url) links and TMP rich
+            // text. Empty = the whole Announcements section is omitted.
+            public string ServerAnnouncements { get; set; } = "";
         }
 
         private void Awake()
         {
             Instance = this;
-            LogS = Logger;
+            LogS = ServerGuardPlugin.Log;
 
             EnsureConfig();
 
-            _harmony = new Harmony(GUID);
-            _harmony.PatchAll();
+            // Only the patch classes nested in THIS type - the server half's patches
+            // must never be applied on a client (see ServerGuardPlugin.PatchNested).
+            _harmony = new Harmony(GUID + ".client");
+            var patched = ServerGuardPlugin.PatchNested(_harmony, typeof(ClientPlugin));
+            LogS.LogInfo($"[ServerGuard.Client] Applied {patched} client-side Harmony patch class(es).");
 
             // Don't enumerate Chainloader.PluginInfos yet - we may have loaded earlier
             // than other plugins in this BepInEx session (alphabetical order, dependencies),
@@ -292,6 +576,9 @@ namespace ValheimServerGuardClient
             // Skill-level cap reporter (#10). Background coroutine that periodically
             // packages the local player's skill levels and sends them to the server.
             StartCoroutine(SkillReportLoop());
+
+            // Cheat-taint reporter (2.0): what the game itself has marked as cheated.
+            StartCoroutine(CheatStateLoop());
 
             // Compute and log this client's modset fingerprint (#2). Players can compare
             // the short value against the one the server admin publishes (or against
@@ -344,8 +631,8 @@ namespace ValheimServerGuardClient
                 sb.AppendLine("# To loosen, drop the `|<sha256>` suffix - the entry will then accept any hash.");
                 sb.AppendLine("# To tighten further, leave it as-is - the server will require an exact DLL match.");
                 sb.AppendLine("#");
-                sb.AppendLine("# The companion plugin (this DLL) is intentionally listed under required_mods,");
-                sb.AppendLine("# NOT allowed_mods - the server demands its presence.");
+                sb.AppendLine("# ServerGuard itself (this DLL, the same mod the server runs) is intentionally listed");
+                sb.AppendLine("# under required_mods, NOT allowed_mods - the server demands its presence.");
                 sb.AppendLine();
 
                 // Required: just the companion itself, hash-pinned to this client's build.
@@ -451,7 +738,22 @@ namespace ValheimServerGuardClient
                     sb.AppendLine("serverName: \"\"         # displayed as the panel heading");
                     sb.AppendLine("serverDescription: \"\" # shown below the name");
                     sb.AppendLine("serverLogoPath: \"\"    # PNG/JPG filename in BepInEx/config/ServerGuard/");
+                    sb.Append(AnnouncementsYamlBlock());
                     File.WriteAllText(ClientYaml, sb.ToString());
+                }
+                else
+                {
+                    // Migration: client.yaml is only written when missing, so an existing
+                    // file from an older version has no announcements block. Append the
+                    // commented template once so the key is discoverable in the editor
+                    // rather than only in the docs.
+                    var existing = File.ReadAllText(ClientYaml);
+                    if (existing.IndexOf("serverAnnouncements", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        if (!existing.EndsWith("\n")) existing += Environment.NewLine;
+                        File.WriteAllText(ClientYaml, existing + AnnouncementsYamlBlock());
+                        LogS.LogInfo("[ServerGuard.Client] Added the serverAnnouncements block to client.yaml.");
+                    }
                 }
 
                 var deser = new DeserializerBuilder()
@@ -466,6 +768,40 @@ namespace ValheimServerGuardClient
             {
                 LogS.LogWarning($"[ServerGuard.Client] EnsureConfig failed: {ex.Message}");
             }
+        }
+
+        // The announcements editor: a YAML block scalar in client.yaml, so the text is
+        // edited in the same file as the rest of the Quick Login panel settings.
+        //
+        // `|` (literal block) keeps every line break as typed - that's what makes this
+        // usable as a plain text box. Every line of the value must be indented by two
+        // spaces; YAML strips that indent back off when reading.
+        private static string AnnouncementsYamlBlock()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("");
+            sb.AppendLine("# ---------------------------------------------------------------");
+            sb.AppendLine("# Announcements (scrollable box under the description)");
+            sb.AppendLine("#");
+            sb.AppendLine("# Write as many lines as you like - the box scrolls (mouse wheel or");
+            sb.AppendLine("# the scrollbar on its right edge). Leave empty to hide the section.");
+            sb.AppendLine("#");
+            sb.AppendLine("# Links:   [label](https://example.com)  -> clickable, opens a browser.");
+            sb.AppendLine("#          Only http:// and https:// links are opened.");
+            sb.AppendLine("# Styling: <b>bold</b>, <i>italic</i>, <color=#ffcc00>colour</color>.");
+            sb.AppendLine("#");
+            sb.AppendLine("#");
+            sb.AppendLine("# To use it, replace the \"\" below with a `|` block and indent EVERY");
+            sb.AppendLine("# line of text by two spaces:");
+            sb.AppendLine("#");
+            sb.AppendLine("#   serverAnnouncements: |");
+            sb.AppendLine("#     <b>Welcome!</b>");
+            sb.AppendLine("#     Server wipe: never. Raids: on.");
+            sb.AppendLine("#");
+            sb.AppendLine("#     Join our [Discord](https://discord.gg/example) for events.");
+            sb.AppendLine("# ---------------------------------------------------------------");
+            sb.AppendLine("serverAnnouncements: \"\"");
+            return sb.ToString();
         }
 
         private void BuildManifestCache()
@@ -707,10 +1043,14 @@ namespace ValheimServerGuardClient
         // We MUST NOT declare a `bool __result` parameter - HarmonyX rejects that
         // signature against a void method ("Cannot get result from void method")
         // and aborts patching of this whole class.
+        //
+        // Valheim 1.0 added a trailing `bool cheated` (nocost, or cheated materials) and
+        // stamps it onto the new piece's ZDO. It is read from `__args` rather than bound
+        // by name so the patch still attaches on a build without it.
         [HarmonyPatch(typeof(Player), nameof(Player.PlacePiece))]
         public static class Patch_PlacePiece_Report
         {
-            public static void Postfix(Player __instance, Piece piece, Vector3 pos)
+            public static void Postfix(Player __instance, Piece piece, Vector3 pos, object[] __args)
             {
                 try
                 {
@@ -723,7 +1063,16 @@ namespace ValheimServerGuardClient
                     var cloneIdx = pieceName.IndexOf("(Clone)", StringComparison.Ordinal);
                     if (cloneIdx > 0) pieceName = pieceName.Substring(0, cloneIdx).Trim();
 
-                    ClientPlugin.Instance?.SendBuildPlace(pieceName, pos);
+                    bool cheated = false;
+                    try
+                    {
+                        // The last parameter is `cheated` on 1.0+; on older builds the
+                        // last one is `doAttack`, so require it to be the 5th argument.
+                        if (__args != null && __args.Length >= 5 && __args[4] is bool c) cheated = c;
+                    }
+                    catch { }
+
+                    ClientPlugin.Instance?.SendBuildPlace(pieceName, pos, cheated);
                 }
                 catch (Exception ex)
                 {
@@ -732,16 +1081,17 @@ namespace ValheimServerGuardClient
             }
         }
 
-        internal void SendBuildPlace(string pieceName, Vector3 pos)
+        internal void SendBuildPlace(string pieceName, Vector3 pos, bool cheated = false)
         {
             if (_serverRpc == null) return;
             try
             {
                 var name = SanitiseShort(pieceName, 64);
                 var inv = System.Globalization.CultureInfo.InvariantCulture;
+                // Trailing `cheated` field is new in 2.0; older servers ignore it.
                 var payload = string.Format(inv,
-                    "{0}|{1:F1}|{2:F1}|{3:F1}",
-                    name, pos.x, pos.y, pos.z);
+                    "{0}|{1:F1}|{2:F1}|{3:F1}|{4}",
+                    name, pos.x, pos.y, pos.z, cheated ? "1" : "0");
                 _serverRpc.Invoke("ServerGuard_BuildPlace", payload);
             }
             catch (Exception ex)
@@ -1290,6 +1640,14 @@ namespace ValheimServerGuardClient
                         catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] RemoveItems handler error: {ex.Message}"); }
                     });
 
+                    // Cheat taint (2.0): strip every item the game itself marked as
+                    // cheat-made, except the prefab names in the payload.
+                    peer.m_rpc.Register<string>("ServerGuard_StripCheated", (rpc, ignoredCsv) =>
+                    {
+                        try { ClientPlugin.Instance?.OnStripCheatedReceived(ignoredCsv); }
+                        catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] StripCheated handler error: {ex.Message}"); }
+                    });
+
                     // Arrival-shout policy: "1" = shout normally, "0" = swallow the
                     // vanilla first-spawn shout. Sent on connect and on every
                     // server-side settings.yaml reload.
@@ -1384,7 +1742,9 @@ namespace ValheimServerGuardClient
                     ? "key binds are disabled on this server"
                     : category == "notallowed"
                         ? "this server only permits a whitelist of console commands"
-                        : "this command is blocked by the server's security policy";
+                        : category == "moderator"
+                            ? "this dev command is not in the server's moderator list"
+                            : "this command is blocked by the server's security policy";
                 ClientPlugin.Instance?.DisplayAdminReply($"[ServerGuard] `{cmd}` refused — {why}.");
             }
             catch { }
@@ -1488,6 +1848,24 @@ namespace ValheimServerGuardClient
         // block - Valheim will just print "not a recognized command".
         private static bool IsRegisteredCommand(string cmd) => LookupCommandObject(cmd) != null;
 
+        // True when `cmd` is something vanilla only runs on the server / for admins
+        // (ConsoleCommand.OnlyServer, which every onlyAdmin: true command also sets).
+        // Together with IsCheat this is the set a moderator's list has to be checked
+        // against: everything else was already runnable by any player.
+        private static bool IsRegisteredServerOnlyCommand(string cmd)
+        {
+            var cmdObj = LookupCommandObject(cmd);
+            if (cmdObj == null) return false;
+            // Two separate flags: the ConsoleEvent ctor sets OnlyServer from onlyServer
+            // alone and keeps onlyAdmin in its own field, so both have to be read.
+            // ReadBoolMember returns at the first member it FINDS, hence two calls.
+            return ReadBoolMember(cmdObj, new[] { "OnlyServer", "onlyServer" })
+                || ReadBoolMember(cmdObj, new[] { "OnlyAdmin", "onlyAdmin" });
+        }
+
+        private static bool IsDevOnlyCommand(string cmd) =>
+            CheatCommands.Contains(cmd) || IsRegisteredCheatCommand(cmd) || IsRegisteredServerOnlyCommand(cmd);
+
         private static bool ReadBoolMember(object target, string[] names)
         {
             var t = target.GetType();
@@ -1512,6 +1890,25 @@ namespace ValheimServerGuardClient
         {
             category = null;
             if (string.IsNullOrEmpty(cmd)) return false;
+
+            // Moderator dev-command list. Evaluated before every exemption: the list is
+            // the server's answer to "which dev commands may this moderator run", and
+            // it applies whatever the console-guard mode is. Only dev-only commands are
+            // held against it - `help`, `ping`, emotes etc. were never gated by it.
+            //
+            // This is load-bearing, not cosmetic: once a grant is active the
+            // IsCheatsEnabled patch below reads m_cheat, so a cheat command that is NOT
+            // OnlyServer (`find`, `printcreatures`, `nospawn`, ...) would otherwise pass
+            // vanilla's own IsValid for a moderator who wasn't given it.
+            if (_devMode == "list" && IsDevOnlyCommand(cmd))
+            {
+                // Granted commands bypass the tiers below too - a moderator who is NOT
+                // console-guard exempt would otherwise hit the cheat tier for `fly`.
+                if (IsDevCommandPermitted(cmd)) return false;
+                category = "moderator";
+                return true;
+            }
+
             if (ConsoleGuardExempt) return false;
             if (_consoleMode == "open") return false;
 
@@ -1794,6 +2191,83 @@ namespace ValheimServerGuardClient
             }
         }
 
+        // ====================== Staff dev commands (2.0) ======================
+        //
+        // Why cheats don't work on a dedicated-server client, and what we lift:
+        //
+        //   Terminal.IsCheatsEnabled()  = m_cheat && ZNet.instance && ZNet.IsServer()
+        //   ConsoleCommand.IsValid()    = (!IsCheat || IsCheatsEnabled())
+        //                              && (isAllowedCommand || skipAllowedCheck)   <- stub, always true
+        //                              && (!IsNetwork || ZNet.instance)
+        //                              && (!OnlyServer || ZNet.IsServer())
+        //
+        // On a client IsServer() is false, so every IsCheat command AND every
+        // OnlyServer command (all the onlyAdmin: true ones - fly, god, spawn, goto...)
+        // fails IsValid. TryRunCommand then forwards the command to the server if it
+        // has RemoteCommand = true (skiptime, sleep, setworldmodifier, ...) and
+        // otherwise prints "not valid in the current context".
+        //
+        // With a grant from the server:
+        //   * IsCheatsEnabled() returns m_cheat - the local `devcommands` toggle - as it
+        //     does in single-player. This also lights up the debugmode hotkeys, which
+        //     read IsCheatsEnabled directly rather than going through a command.
+        //   * IsValid() is re-evaluated for a PERMITTED, non-RemoteCommand command with
+        //     the IsCheat / OnlyServer terms dropped, so it runs locally exactly as it
+        //     would for a listen-server host. RemoteCommand commands are left invalid
+        //     on purpose: vanilla then forwards them to the server, where the server
+        //     half authorises staff (ServerPlugin, Patch_ZNet_RPC_RemoteCommand).
+        //
+        // The moderator list is enforced in ShouldBlockConsoleCommand, which runs
+        // before dispatch, and nothing here widens IsValid for a non-permitted command.
+        // Both patches are inert without a grant, and the grant dies with the
+        // connection (ResetConsolePolicy), so single-player is untouched.
+
+        [HarmonyPatch(typeof(Terminal), nameof(Terminal.IsCheatsEnabled))]
+        public static class Patch_Terminal_IsCheatsEnabled
+        {
+            public static bool Prefix(ref bool __result)
+            {
+                try
+                {
+                    if (!DevAccessGranted) return true;
+                    if (!IsActiveMultiplayerClient()) return true;
+                    __result = Terminal.m_cheat;
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] IsCheatsEnabled patch error: {ex.Message}");
+                    return true;
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(Terminal.ConsoleCommand), nameof(Terminal.ConsoleCommand.IsValid))]
+        public static class Patch_ConsoleCommand_IsValid
+        {
+            public static void Postfix(Terminal.ConsoleCommand __instance, ref bool __result)
+            {
+                try
+                {
+                    if (__result) return;
+                    if (__instance == null || !DevAccessGranted) return;
+                    if (!IsActiveMultiplayerClient()) return;
+                    if (__instance.RemoteCommand) return;             // let vanilla forward it
+                    if (!IsDevCommandPermitted(__instance.Command)) return;
+
+                    // Vanilla's own terms minus IsCheat/OnlyServer. m_cheat must still be
+                    // on for cheat commands - that is the player's `devcommands` toggle.
+                    if (__instance.IsCheat && !Terminal.m_cheat) return;
+                    if (__instance.IsNetwork && ZNet.instance == null) return;
+                    __result = true;
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] ConsoleCommand.IsValid patch error: {ex.Message}");
+                }
+            }
+        }
+
         [HarmonyPatch(typeof(Terminal), nameof(Terminal.TryRunCommand))]
         public static class Patch_TryRunCommand
         {
@@ -1956,6 +2430,194 @@ namespace ValheimServerGuardClient
             catch (Exception ex)
             {
                 LogS?.LogWarning($"[ServerGuard.Client] Chat report failed: {ex.Message}");
+            }
+        }
+
+        // ====================== Cheat taint report (2.0) ======================
+        //
+        // Valheim 1.0 keeps ItemData.m_cheated on every item that came out of a cheat
+        // (spawned, crafted from spawned materials, dropped by a cheat-spawned creature,
+        // ...) and persists it in the character file, so it survives a trip through
+        // single-player. The game uses it to withhold achievements; the server uses it
+        // as an anti-cheat signal. Same trust model as the skill report: the server
+        // hash-pins this DLL, so a client that could lie here has already been kicked.
+        //
+        // Payload: "usedCheats|bypass|count|prefab:stack,prefab:stack,..."
+        //   usedCheats - PlayerProfile.m_usedCheats: the character has run a cheat command
+        //   bypass     - PlayerProfile.s_bypassCheatChecks: the `bypasscheatchecks` key is
+        //                set, meaning the game has stopped marking anything for this character
+        //
+        // Sent every CheatStateHeartbeatSeconds, and within CheatStatePollSeconds of the
+        // flagged set changing (pick up / drop / strip), so the server sees a change
+        // promptly without a per-frame patch.
+
+        private const float CheatStatePollSeconds      = 10f;
+        private const float CheatStateHeartbeatSeconds = 60f;
+        private string _lastCheatSignature = null;
+        private float  _lastCheatSentAt    = -1000f;
+
+        private IEnumerator CheatStateLoop()
+        {
+            yield return new WaitForSeconds(15f);
+            while (true)
+            {
+                yield return new WaitForSeconds(CheatStatePollSeconds);
+                try { SendCheatStateIfDue(false); }
+                catch (Exception ex) { LogS?.LogWarning($"[ServerGuard.Client] Cheat state tick error: {ex.Message}"); }
+            }
+        }
+
+        private void SendCheatStateIfDue(bool force)
+        {
+            if (_serverRpc == null) return;
+            if (!IsActiveMultiplayerClient()) return;
+            var player = Player.m_localPlayer;
+            var inv = player?.GetInventory();
+            if (inv == null) return;
+
+            bool usedCheats = false;
+            try { usedCheats = Game.instance != null && Game.instance.GetPlayerProfile().m_usedCheats; } catch { }
+            bool bypass = false;
+            try { bypass = PlayerProfile.s_bypassCheatChecks; } catch { }
+
+            var flagged = new List<KeyValuePair<string, int>>();
+            foreach (var item in inv.GetAllItems())
+            {
+                if (item == null || !item.m_cheated) continue;
+                var name = item.m_dropPrefab != null ? item.m_dropPrefab.name : (item.m_shared?.m_name ?? "unknown");
+                name = SanitiseShort(name, 48).Replace(':', '_').Replace(',', '_').Replace('|', '_');
+                flagged.Add(new KeyValuePair<string, int>(name, Math.Max(1, item.m_stack)));
+            }
+            flagged.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+
+            var sb = new StringBuilder();
+            sb.Append(usedCheats ? '1' : '0').Append('|');
+            sb.Append(bypass ? '1' : '0').Append('|');
+            sb.Append(flagged.Count).Append('|');
+            for (int i = 0; i < flagged.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append(flagged[i].Key).Append(':').Append(flagged[i].Value);
+            }
+            var payload = sb.ToString();
+
+            var now = Time.realtimeSinceStartup;
+            var changed = !string.Equals(payload, _lastCheatSignature, StringComparison.Ordinal);
+            if (!force && !changed && now - _lastCheatSentAt < CheatStateHeartbeatSeconds) return;
+
+            try
+            {
+                _serverRpc.Invoke("ServerGuard_CheatState", payload);
+                _lastCheatSignature = payload;
+                _lastCheatSentAt    = now;
+                if (changed && flagged.Count > 0)
+                    LogS?.LogInfo($"[ServerGuard.Client] Reported {flagged.Count} cheat-flagged inventory item(s) to the server.");
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Cheat state send failed: {ex.Message}");
+            }
+        }
+
+        // Server policy "strip" / "violation": remove every m_cheated item now, except
+        // the prefab names the operator chose to ignore. Runs immediately - the player
+        // is already spawned (the report that triggered this came from their inventory).
+        internal void OnStripCheatedReceived(string ignoredCsv)
+        {
+            try
+            {
+                var inv = Player.m_localPlayer?.GetInventory();
+                if (inv == null) return;
+
+                var ignored = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var s in (ignoredCsv ?? "").Split(','))
+                {
+                    var v = s.Trim();
+                    if (v.Length > 0) ignored.Add(v);
+                }
+
+                var toRemove = new List<ItemDrop.ItemData>();
+                foreach (var item in inv.GetAllItems())
+                {
+                    if (item == null || !item.m_cheated) continue;
+                    var name = item.m_dropPrefab != null ? item.m_dropPrefab.name : "";
+                    if (name.Length > 0 && ignored.Contains(name)) continue;
+                    toRemove.Add(item);
+                }
+                if (toRemove.Count == 0) return;
+
+                foreach (var item in toRemove)
+                    inv.RemoveItem(item);
+
+                var total = toRemove.Sum(i => Math.Max(1, i.m_stack));
+                LogS?.LogWarning($"[ServerGuard.Client] Removed {total} cheat-flagged item(s): "
+                    + string.Join(", ", toRemove.Select(i => i.m_dropPrefab != null ? i.m_dropPrefab.name : "?")));
+                try
+                {
+                    Player.m_localPlayer.Message(MessageHud.MessageType.Center,
+                        $"[ServerGuard] {total} cheat-spawned item(s) removed by server policy");
+                }
+                catch { }
+
+                // Tell the server right away so its dedup state reflects the strip.
+                SendCheatStateIfDue(true);
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] OnStripCheatedReceived error: {ex.Message}");
+            }
+        }
+
+        // ====================== Staff map coordinates (2.0) ======================
+        //
+        // On the large map, owners and moderators see the world X/Z of whatever the
+        // cursor is over, appended to the biome label at the top of the map (which
+        // vanilla already updates from the cursor position every frame in
+        // Minimap.UpdateBiome). Handy for `goto`, `sg build at` and grief reports.
+        //
+        // m_biomeNameLarge is a TMP_Text; the project deliberately does not reference
+        // Unity.TextMeshPro, so both the field and the `text` property go through
+        // reflection, like the Quick Login panel does.
+        private static readonly FieldInfo  MinimapBiomeLargeField =
+            typeof(Minimap).GetField("m_biomeNameLarge", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly MethodInfo MinimapScreenToWorld =
+            typeof(Minimap).GetMethod("ScreenToWorldPoint", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        [HarmonyPatch(typeof(Minimap), "UpdateBiome")]
+        public static class Patch_Minimap_UpdateBiome_StaffCoords
+        {
+            public static bool Prepare()
+            {
+                var ok = AccessTools.Method(typeof(Minimap), "UpdateBiome") != null
+                      && MinimapBiomeLargeField != null && MinimapScreenToWorld != null;
+                if (!ok) ClientPlugin.LogS?.LogWarning("[ServerGuard.Client] Minimap.UpdateBiome / m_biomeNameLarge / ScreenToWorldPoint not found — staff map coordinates disabled.");
+                return ok;
+            }
+
+            public static void Postfix(Minimap __instance)
+            {
+                try
+                {
+                    if (!IsStaffClient) return;
+                    if (!IsActiveMultiplayerClient()) return;
+                    if (__instance == null || __instance.m_mode != Minimap.MapMode.Large) return;
+
+                    var label = MinimapBiomeLargeField.GetValue(__instance);
+                    if (label == null) return;
+
+                    Vector3 screen = ZInput.IsMouseActive() ? (Vector3)ZInput.pointerPosition
+                                                            : new Vector3(Screen.width / 2f, Screen.height / 2f);
+                    var world = (Vector3)MinimapScreenToWorld.Invoke(__instance, new object[] { screen });
+
+                    var current = GetTmpProperty(label, "text") as string ?? "";
+                    var inv = System.Globalization.CultureInfo.InvariantCulture;
+                    var coords = string.Format(inv, "<size=70%><color=#a0e0ff>X {0:F0}   Z {1:F0}</color></size>", world.x, world.z);
+                    SetTmpProperty(label, "text", current.Length > 0 ? current + "   " + coords : coords);
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Map coordinate overlay error: {ex.Message}");
+                }
             }
         }
 
@@ -2177,10 +2839,35 @@ namespace ValheimServerGuardClient
                     _clientSettings.ServerDescription, 16f, false, new Color(0.85f, 0.85f, 0.85f, 1f), contentTop, 64f);
             }
 
+            // ---- Announcements (scrollable) ----
+            bool hasAnnouncements = !string.IsNullOrWhiteSpace(_clientSettings.ServerAnnouncements);
+            if (hasAnnouncements)
+            {
+                // Grow the panel so the scroll box gets a usable viewport no matter how
+                // tall the logo/name/description above it turned out. Capped so a large
+                // logo can't push the panel off the bottom of the screen.
+                float needed = -contentTop + AnnHeaderBlock + AnnMinViewport + AnnBottomStack;
+                rt.sizeDelta = new Vector2(320f, Mathf.Clamp(needed, 560f, 720f));
+
+                // Header.
+                contentTop = AddThemedLabel("SG_AnnHeader", _quickLoginPanel.transform, tmpTemplate,
+                    "Announcements", 18f, true, new Color(0.95f, 0.85f, 0.55f, 1f), contentTop, 22f);
+
+                BuildAnnouncementsScrollBox(_quickLoginPanel.transform, tmpTemplate,
+                    _clientSettings.ServerAnnouncements, contentTop, AnnBottomStack);
+            }
+
             // ---- Player count ----
-            _playerCountText = CreateThemedLabelComponent("SG_PlayerCount", _quickLoginPanel.transform,
-                tmpTemplate, "Players: querying...", 17f, false, new Color(0.7f, 0.9f, 0.7f, 1f),
-                contentTop - 6f, 26f);
+            // With announcements the scroll box owns the middle of the panel, so the
+            // count is pinned just above the Connect button instead of flowing after
+            // the description.
+            _playerCountText = hasAnnouncements
+                ? CreateThemedLabelComponent("SG_PlayerCount", _quickLoginPanel.transform,
+                    tmpTemplate, "Players: querying...", 17f, false, new Color(0.7f, 0.9f, 0.7f, 1f),
+                    0f, 24f, true, 72f)
+                : CreateThemedLabelComponent("SG_PlayerCount", _quickLoginPanel.transform,
+                    tmpTemplate, "Players: querying...", 17f, false, new Color(0.7f, 0.9f, 0.7f, 1f),
+                    contentTop - 6f, 26f);
 
             // ---- Connect button (cloned from a vanilla menu button for theme + font) ----
             AddConnectButton(menu, _quickLoginPanel.transform);
@@ -2192,6 +2879,388 @@ namespace ValheimServerGuardClient
             StartCoroutine(RefreshPlayerCount(
                 _clientSettings.ServerAddress,
                 _clientSettings.ServerPort));
+        }
+
+        // ================== Announcements box (scrollable, clickable links) ==================
+        //
+        // Vertical budget inside the panel, in px. The panel is grown in
+        // BuildQuickLoginPanel so the scroll box never drops below AnnMinViewport.
+        private const float AnnHeaderBlock = 26f;   // "Announcements" label + its gap
+        private const float AnnMinViewport = 140f;  // smallest scroll box we accept
+        private const float AnnBottomStack = 100f;  // player count + Connect button below it
+        private const float AnnScrollbarW  = 8f;
+        private const float AnnTextPad     = 6f;
+
+        // Standard Unity ScrollRect hierarchy, built by hand because there's no prefab
+        // to clone:
+        //
+        //   SG_AnnScroll        ScrollRect + frame Image
+        //   ├─ SG_AnnViewport   RectMask2D + invisible raycast Image
+        //   │  └─ SG_AnnContent RectTransform, height driven by the text
+        //   │     └─ SG_AnnText the TMP label (+ link click handler)
+        //   └─ SG_AnnScrollbar  Scrollbar
+        //      └─ SG_AnnScrollArea
+        //         └─ SG_AnnScrollHandle
+        //
+        // topOffset is negative (distance down from the panel's top edge); bottomInset
+        // is positive (distance up from its bottom edge).
+        private void BuildAnnouncementsScrollBox(Transform parent, Component tmpTemplate,
+            string raw, float topOffset, float bottomInset)
+        {
+            var scrollGo = CreateChild("SG_AnnScroll", parent);
+            var scrollRt = scrollGo.AddComponent<RectTransform>();
+            scrollRt.anchorMin = Vector2.zero;
+            scrollRt.anchorMax = Vector2.one;
+            scrollRt.pivot     = new Vector2(0.5f, 0.5f);
+            scrollRt.offsetMin = new Vector2(16f, bottomInset);
+            scrollRt.offsetMax = new Vector2(-16f, topOffset);
+
+            scrollGo.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.35f);
+
+            var scroll = scrollGo.AddComponent<ScrollRect>();
+            scroll.horizontal       = false;
+            scroll.vertical         = true;
+            scroll.movementType     = ScrollRect.MovementType.Clamped;
+            scroll.scrollSensitivity = 24f;
+            scroll.inertia          = false;
+
+            // ---- Viewport ----
+            var viewGo = CreateChild("SG_AnnViewport", scrollGo.transform);
+            var viewRt = viewGo.AddComponent<RectTransform>();
+            viewRt.anchorMin = Vector2.zero;
+            viewRt.anchorMax = Vector2.one;
+            viewRt.pivot     = new Vector2(0f, 1f);
+            viewRt.offsetMin = Vector2.zero;
+            viewRt.offsetMax = new Vector2(-AnnScrollbarW, 0f);
+
+            // Fully transparent, but still a raycast target: without a Graphic under the
+            // pointer the mouse wheel has nothing to bubble a scroll event up from.
+            var viewImg = viewGo.AddComponent<Image>();
+            viewImg.color = new Color(1f, 1f, 1f, 0f);
+            viewImg.raycastTarget = true;
+
+            // RectMask2D rather than Mask: no extra material, and it doubles as a raycast
+            // filter, so links scrolled out of view aren't clickable through the clip.
+            viewGo.AddComponent<RectMask2D>();
+
+            // ---- Content ----
+            var contentGo = CreateChild("SG_AnnContent", viewGo.transform);
+            var contentRt = contentGo.AddComponent<RectTransform>();
+            contentRt.anchorMin = new Vector2(0f, 1f);
+            contentRt.anchorMax = new Vector2(1f, 1f);
+            contentRt.pivot     = new Vector2(0.5f, 1f);
+            contentRt.anchoredPosition = Vector2.zero;
+            contentRt.sizeDelta = new Vector2(0f, AnnMinViewport);
+
+            var textComp = CreateAnnouncementText(contentGo.transform, tmpTemplate, raw);
+
+            // ---- Scrollbar ----
+            var sbGo = CreateChild("SG_AnnScrollbar", scrollGo.transform);
+            var sbRt = sbGo.AddComponent<RectTransform>();
+            sbRt.anchorMin = new Vector2(1f, 0f);
+            sbRt.anchorMax = new Vector2(1f, 1f);
+            sbRt.pivot     = new Vector2(1f, 1f);
+            sbRt.sizeDelta = new Vector2(AnnScrollbarW, 0f);
+            sbRt.anchoredPosition = Vector2.zero;
+            sbGo.AddComponent<Image>().color = new Color(1f, 1f, 1f, 0.07f);
+
+            var sb = sbGo.AddComponent<Scrollbar>();
+            sb.direction = Scrollbar.Direction.BottomToTop;
+
+            var areaGo = CreateChild("SG_AnnScrollArea", sbGo.transform);
+            var areaRt = areaGo.AddComponent<RectTransform>();
+            areaRt.anchorMin = Vector2.zero;
+            areaRt.anchorMax = Vector2.one;
+            areaRt.offsetMin = Vector2.zero;
+            areaRt.offsetMax = Vector2.zero;
+
+            var handleGo = CreateChild("SG_AnnScrollHandle", areaGo.transform);
+            var handleRt = handleGo.AddComponent<RectTransform>();
+            handleRt.offsetMin = Vector2.zero;
+            handleRt.offsetMax = Vector2.zero;
+            var handleImg = handleGo.AddComponent<Image>();
+            handleImg.color = new Color(0.85f, 0.78f, 0.6f, 0.55f);
+
+            sb.targetGraphic = handleImg;
+            sb.handleRect    = handleRt;
+
+            scroll.viewport                    = viewRt;
+            scroll.content                     = contentRt;
+            scroll.verticalScrollbar           = sb;
+            scroll.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.Permanent;
+
+            StartCoroutine(FitAnnouncementContent(scroll, viewRt, contentRt, textComp));
+        }
+
+        // Creates the announcement label. Unlike CreateThemedLabelComponent this one is
+        // left-aligned, stretches to fill its parent (the scroll content, whose height is
+        // set later from the measured text) and carries the link click handler.
+        private Component CreateAnnouncementText(Transform content, Component tmpTemplate, string raw)
+        {
+            var go = tmpTemplate != null
+                ? Instantiate(tmpTemplate.gameObject, content, false)
+                : CreateChild("SG_AnnText", content);
+            go.name = "SG_AnnText";
+            go.SetActive(true);
+
+            // Same reason as CreateThemedLabelComponent: the cloned menu-button label
+            // auto-sizes itself to one line and defeats word wrap.
+            var csf = go.GetComponent<ContentSizeFitter>();
+            if (csf != null) { csf.enabled = false; Destroy(csf); }
+            var le = go.GetComponent<LayoutElement>();
+            if (le != null) { le.enabled = false; Destroy(le); }
+
+            var rt = go.GetComponent<RectTransform>() ?? go.AddComponent<RectTransform>();
+            rt.anchorMin = Vector2.zero;
+            rt.anchorMax = Vector2.one;
+            rt.pivot     = new Vector2(0.5f, 1f);
+            rt.offsetMin = new Vector2(AnnTextPad, AnnTextPad);
+            rt.offsetMax = new Vector2(-AnnTextPad, -AnnTextPad);
+            rt.localScale = Vector3.one;
+
+            if (tmpTemplate != null)
+            {
+                var tmp = go.GetComponent(tmpTemplate.GetType());
+                SetTmpProperty(tmp, "text", FormatAnnouncementsRich(raw));
+                SetTmpProperty(tmp, "fontSize", 15f);
+                SetTmpProperty(tmp, "color", new Color(0.88f, 0.88f, 0.88f, 1f));
+                SetTmpProperty(tmp, "enableAutoSizing", false);
+                SetTmpProperty(tmp, "enableWordWrapping", true);
+                SetTmpProperty(tmp, "richText", true);
+                // Needed twice over: the link hit test needs a raycast on this graphic,
+                // and the wheel needs something to bubble a scroll from.
+                SetTmpProperty(tmp, "raycastTarget", true);
+                SetTmpEnum(tmp, "overflowMode", "Overflow");
+                SetTmpEnum(tmp, "alignment", "TopLeft");
+                SetTmpEnum(tmp, "fontStyle", "Normal");
+
+                go.AddComponent<AnnouncementLinkClicker>().Init(tmp);
+                return tmp;
+            }
+
+            // Fallback (no TMP available): no link clicking, URLs shown inline instead.
+            var t = go.AddComponent<Text>();
+            t.font       = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            t.fontSize   = 15;
+            t.color      = new Color(0.88f, 0.88f, 0.88f, 1f);
+            t.alignment  = TextAnchor.UpperLeft;
+            t.supportRichText    = true;
+            t.horizontalOverflow = HorizontalWrapMode.Wrap;
+            t.verticalOverflow   = VerticalWrapMode.Overflow;
+            t.text = FormatAnnouncementsPlain(raw);
+            return t;
+        }
+
+        // Sizes the scroll content to the laid-out text. Deferred by a frame because the
+        // Destroy()d ContentSizeFitter/LayoutElement are still alive this frame, and the
+        // text can't report a preferred height until the canvas has given it a width.
+        // Measured twice: the first pass establishes the width, the second measures
+        // against it.
+        private IEnumerator FitAnnouncementContent(ScrollRect scroll, RectTransform viewport,
+            RectTransform content, Component textComp)
+        {
+            for (int pass = 0; pass < 2; pass++)
+            {
+                yield return null;
+                if (scroll == null || content == null || textComp == null) yield break;
+
+                Canvas.ForceUpdateCanvases();
+
+                float measured = 0f;
+                var uiText = textComp as Text;
+                if (uiText != null)
+                {
+                    measured = uiText.preferredHeight;
+                }
+                else
+                {
+                    var v = GetTmpProperty(textComp, "preferredHeight");
+                    if (v is float) measured = (float)v;
+
+                    // preferredHeight measures against TMP's cached margin width, which
+                    // is only right once the graphic has been rebuilt at least once. If
+                    // it comes back empty, ask for an explicit measurement at our own
+                    // width rather than silently truncating the announcements.
+                    if (measured <= 0f)
+                        measured = MeasureTmpHeight(textComp, content.rect.width - AnnTextPad * 2f);
+                }
+
+                // Never shorter than the viewport: a content rect smaller than its
+                // viewport makes ScrollRect place it oddly and the scrollbar useless.
+                content.sizeDelta = new Vector2(0f,
+                    Mathf.Max(measured + AnnTextPad * 2f, viewport.rect.height));
+            }
+
+            scroll.verticalNormalizedPosition = 1f;   // start at the top
+        }
+
+        // tmp.GetPreferredValues(width, height).y — an explicit measurement at a width we
+        // choose, rather than whatever TMP last cached.
+        private static float MeasureTmpHeight(Component tmp, float width)
+        {
+            if (tmp == null || width <= 0f) return 0f;
+            try
+            {
+                foreach (var m in tmp.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public))
+                {
+                    if (m.Name != "GetPreferredValues") continue;
+                    var ps = m.GetParameters();
+                    if (ps.Length != 2 || ps[0].ParameterType != typeof(float) || ps[1].ParameterType != typeof(float))
+                        continue;
+                    var v = m.Invoke(tmp, new object[] { width, 32767f });
+                    if (v is Vector2) return ((Vector2)v).y;
+                    return 0f;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Announcement height measurement failed: {ex.Message}");
+            }
+            return 0f;
+        }
+
+        // Markdown-style link: [label](https://example.com)
+        private static readonly Regex AnnLinkRegex =
+            new Regex(@"\[([^\]\r\n]+)\]\(\s*([^)\s]+)\s*\)");
+
+        // Rewrites [label](url) into TMP's <link> markup. Everything else is passed
+        // through untouched, so the config author can also use <b>/<i>/<color> directly.
+        internal static string FormatAnnouncementsRich(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            return AnnLinkRegex.Replace(raw.Replace("\r\n", "\n").TrimEnd(), m =>
+            {
+                string label = m.Groups[1].Value;
+                string url   = m.Groups[2].Value;
+                // A link we would refuse to open shouldn't look clickable.
+                if (!IsOpenableUrl(url)) return label;
+                return "<link=\"" + url + "\"><color=#7FB3FF><u>" + label + "</u></color></link>";
+            });
+        }
+
+        // Legacy UnityEngine.UI.Text has no <link> support, so show the URL inline.
+        internal static string FormatAnnouncementsPlain(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            return AnnLinkRegex.Replace(raw.Replace("\r\n", "\n").TrimEnd(),
+                m => m.Groups[1].Value + " (" + m.Groups[2].Value + ")");
+        }
+
+        // client.yaml ships inside modpacks, so the announcement text is not necessarily
+        // written by the person sitting at the keyboard. Restrict what a click can launch
+        // to web pages - no file://, no custom scheme handlers.
+        private static bool IsOpenableUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return false;
+            return url.StartsWith("http://",  StringComparison.OrdinalIgnoreCase)
+                || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Opens the URL behind a <link=...> span when the player clicks it.
+        //
+        // The plugin deliberately doesn't reference Unity.TextMeshPro (see the reflection
+        // helpers below), so the hit test goes through TMP_TextUtilities.FindIntersectingLink
+        // by reflection as well.
+        internal class AnnouncementLinkClicker : MonoBehaviour, IPointerClickHandler
+        {
+            private Component _tmp;
+            private Canvas    _canvas;
+            private static MethodInfo _finder;
+            private static bool       _finderResolved;
+
+            internal void Init(Component tmp)
+            {
+                _tmp    = tmp;
+                _canvas = GetComponentInParent<Canvas>();
+            }
+
+            public void OnPointerClick(PointerEventData eventData)
+            {
+                // A release that ends a scroll drag is not a click on a link.
+                if (_tmp == null || eventData == null || eventData.dragging) return;
+
+                try
+                {
+                    var finder = ResolveFinder(_tmp.GetType());
+                    if (finder == null) return;
+
+                    Camera cam = (_canvas != null && _canvas.renderMode != RenderMode.ScreenSpaceOverlay)
+                        ? _canvas.worldCamera
+                        : null;
+
+                    var result = finder.Invoke(null, new object[] { _tmp, (Vector3)eventData.position, cam });
+                    if (!(result is int)) return;
+                    int index = (int)result;
+                    if (index < 0) return;
+
+                    string url = GetLinkId(_tmp, index);
+                    if (string.IsNullOrEmpty(url)) return;
+                    if (!IsOpenableUrl(url))
+                    {
+                        LogS?.LogWarning($"[ServerGuard.Client] Ignoring announcement link with an unsupported scheme: {url}");
+                        return;
+                    }
+
+                    LogS?.LogInfo($"[ServerGuard.Client] Opening announcement link: {url}");
+                    Application.OpenURL(url);
+                }
+                catch (Exception ex)
+                {
+                    LogS?.LogWarning($"[ServerGuard.Client] Announcement link click failed: {ex.Message}");
+                }
+            }
+
+            // TMP_TextUtilities.FindIntersectingLink(TMP_Text, Vector3, Camera).
+            // Matched by shape rather than by an exact parameter-type array, because we
+            // can't name the TMP_Text type at compile time.
+            private static MethodInfo ResolveFinder(Type tmpType)
+            {
+                if (_finderResolved) return _finder;
+                _finderResolved = true;
+
+                var utils = AppDomain.CurrentDomain.GetAssemblies()
+                    .Select(a => { try { return a.GetType("TMPro.TMP_TextUtilities"); } catch { return null; } })
+                    .FirstOrDefault(t => t != null);
+                if (utils == null)
+                {
+                    LogS?.LogWarning("[ServerGuard.Client] TMP_TextUtilities not found - announcement links won't be clickable.");
+                    return null;
+                }
+
+                foreach (var m in utils.GetMethods(BindingFlags.Static | BindingFlags.Public))
+                {
+                    if (m.Name != "FindIntersectingLink") continue;
+                    var ps = m.GetParameters();
+                    if (ps.Length != 3) continue;
+                    if (!ps[0].ParameterType.IsAssignableFrom(tmpType)) continue;
+                    if (ps[1].ParameterType != typeof(Vector3)) continue;
+                    if (ps[2].ParameterType != typeof(Camera)) continue;
+                    _finder = m;
+                    break;
+                }
+                if (_finder == null)
+                    LogS?.LogWarning("[ServerGuard.Client] FindIntersectingLink(TMP_Text, Vector3, Camera) not found - announcement links won't be clickable.");
+                return _finder;
+            }
+
+            // tmp.textInfo.linkInfo[index].GetLinkID()
+            private static string GetLinkId(Component tmp, int index)
+            {
+                var textInfo = GetTmpProperty(tmp, "textInfo")
+                    ?? tmp.GetType().GetField("m_textInfo",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?.GetValue(tmp);
+                if (textInfo == null) return null;
+
+                var arr = textInfo.GetType()
+                    .GetField("linkInfo", BindingFlags.Instance | BindingFlags.Public)
+                    ?.GetValue(textInfo) as Array;
+                if (arr == null || index >= arr.Length) return null;
+
+                var info = arr.GetValue(index);
+                var get  = info?.GetType().GetMethod("GetLinkID", BindingFlags.Instance | BindingFlags.Public);
+                return get?.Invoke(info, null) as string;
+            }
         }
 
         // ---- Helpers ----
@@ -2239,8 +3308,13 @@ namespace ValheimServerGuardClient
 
         // Creates a themed label and returns the text Component (TMP_Text or UI.Text)
         // so callers can update it later (e.g. the live player count).
+        //
+        // anchorBottom pins the label `bottomOffset` px above the panel's bottom edge
+        // instead of `topOffset` px below its top edge — used for the elements that sit
+        // under the announcements scroll box, which has to own the flexible middle.
         private Component CreateThemedLabelComponent(string name, Transform parent, Component tmpTemplate,
-            string text, float fontSize, bool bold, Color color, float topOffset, float height)
+            string text, float fontSize, bool bold, Color color, float topOffset, float height,
+            bool anchorBottom = false, float bottomOffset = 0f)
         {
             var go = tmpTemplate != null
                 ? Instantiate(tmpTemplate.gameObject, parent, false)
@@ -2257,10 +3331,20 @@ namespace ValheimServerGuardClient
             if (le != null) Destroy(le);
 
             var rt = go.GetComponent<RectTransform>() ?? go.AddComponent<RectTransform>();
-            rt.anchorMin = new Vector2(0.05f, 1f);
-            rt.anchorMax = new Vector2(0.95f, 1f);
-            rt.pivot     = new Vector2(0.5f, 1f);
-            rt.anchoredPosition = new Vector2(0f, topOffset);
+            if (anchorBottom)
+            {
+                rt.anchorMin = new Vector2(0.05f, 0f);
+                rt.anchorMax = new Vector2(0.95f, 0f);
+                rt.pivot     = new Vector2(0.5f, 0f);
+                rt.anchoredPosition = new Vector2(0f, bottomOffset);
+            }
+            else
+            {
+                rt.anchorMin = new Vector2(0.05f, 1f);
+                rt.anchorMax = new Vector2(0.95f, 1f);
+                rt.pivot     = new Vector2(0.5f, 1f);
+                rt.anchoredPosition = new Vector2(0f, topOffset);
+            }
             rt.sizeDelta = new Vector2(0f, height);
             rt.localScale = Vector3.one;
 
@@ -2375,6 +3459,15 @@ namespace ValheimServerGuardClient
             {
                 try { p.SetValue(tmp, val, null); } catch { }
             }
+        }
+
+        private static object GetTmpProperty(object tmp, string prop)
+        {
+            if (tmp == null) return null;
+            var p = tmp.GetType().GetProperty(prop,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p == null || !p.CanRead) return null;
+            try { return p.GetValue(tmp, null); } catch { return null; }
         }
 
         private static void SetTmpEnum(object tmp, string prop, string enumName)

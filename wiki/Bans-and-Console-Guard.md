@@ -1,7 +1,7 @@
 # Bans and Console Guard
 
 Two features added in **1.7.0**. Both are configured on the server; the console guard
-is enforced by the companion plugin, so every player needs the 1.7.0 client.
+is enforced on every player's client by ServerGuard's client half (since 2.0 the same mod as the server).
 
 ---
 
@@ -193,6 +193,10 @@ consoleGuardReportAttempts: true
 |---|---|---|
 | A cheat command | Public + admin Discord | Yes (`DevcommandAttempt`, default on) |
 | A restricted command, a bind, or anything under whitelist mode | Admin Discord only | No (`ConsoleCommandBlocked`, default off) |
+| A moderator's dev command outside `moderatorDevcommands` *(2.0)* | Admin Discord only | Never |
+
+Staff are the exception to all of this: owners are never gated, and moderators get the
+dev commands you list — see **[Privilege Tiers](Privilege-Tiers)**.
 
 The split matters: someone typing `bind` out of curiosity shouldn't be announced to
 your whole community as a cheater. Change either default under `countAsViolation` in

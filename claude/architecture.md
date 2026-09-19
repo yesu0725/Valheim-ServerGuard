@@ -5,20 +5,61 @@
 ```
 [Valheim Dedicated Server]                 [Player's Valheim Client]
   BepInEx/plugins/                           BepInEx/plugins/
-    Valheim-ServerGuard.dll                    Valheim-ServerGuard-Client.dll
-    (Plugin.cs — server)                       (ClientPlugin.cs — client)
+    Valheim-ServerGuard.dll                    Valheim-ServerGuard.dll   (the SAME file)
+    ServerGuardPlugin.Awake                    ServerGuardPlugin.Awake
+      headless → AddComponent<ServerPlugin>      GUI → AddComponent<ClientPlugin>
          |                                              |
          └──────── ZNet RPC ──────────────────────────┘
                  (named string RPCs over ZRpc)
 ```
 
-Both compile `Shared/Manifest.cs` as a linked source file (not a separate DLL).
+Since 2.0 there is one assembly and one `[BepInPlugin]` (`ServerGuardPlugin`, GUID
+`com.taeguk.valheim.serverguard`). `ServerPlugin` and `ClientPlugin` are plain
+`MonoBehaviour`s; the entry plugin attaches exactly one of them to its own GameObject
+(`Chainloader.ManagerObject`, `DontDestroyOnLoad`), so their `Awake` runs immediately
+inside the entry plugin's `Awake` and `StartCoroutine` / `OnDestroy` behave as they
+did when each was its own plugin.
+
+### Side selection
+
+```
+mode = BepInEx cfg  General.Mode  (auto | server | client; default auto)
+headless = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null
+runServer = mode == "server" || (mode != "client" && headless)
+```
+
+A dedicated server runs `-batchmode -nographics` and has no graphics device; a
+player's game always has one, *including* when hosting a listen server — so a host
+gets the client half, exactly as before the merge (the server half has always been
+for dedicated servers only). The two halves never coexist in one process.
+
+### Selective patching
+
+`Harmony.PatchAll()` is never called. Each half creates its own `Harmony` instance
+(`<GUID>.server` / `<GUID>.client`) and hands it to `ServerGuardPlugin.PatchNested`,
+which walks the nested types of that half (any depth) and runs
+`CreateClassProcessor(t).Patch()` on every type carrying a `HarmonyAttribute`.
+`Harmony.PatchAll(Type)` would not do — it processes only that one type and ignores
+nested classes. Consequence: **every patch class must be nested inside `ServerPlugin`
+or `ClientPlugin`**; a top-level one is applied by nobody. The server logs
+`Applied N server-side Harmony patch class(es)` (14 as of 2.0.0); the client logs the
+same for its side.
 
 ---
 
 ## BepInEx lifecycle
 
-### Server (`Plugin.cs`)
+### Entry (`ServerGuardPlugin.cs`)
+
+```
+Awake()
+  Instance / Log = Logger
+  Config.Bind("General", "Mode", "auto")
+  decide side (above)
+  gameObject.AddComponent<ServerPlugin>()  or  <ClientPlugin>()   ← their Awake runs now
+```
+
+### Server (`ServerPlugin.cs`)
 
 ```
 Awake()
@@ -33,7 +74,7 @@ Awake()
   LoadViolations()
   LoadMetrics()
   StartWatchers()             ← FileSystemWatcher hot-reload
-  _harmony.PatchAll()
+  PatchNested(_harmony, typeof(ServerPlugin))
   ReconfigureDiscordAndSummary()
   StartCoroutine(SpeedCheckLoop())
   StartCoroutine(BuildLogCleanupLoop())
@@ -48,7 +89,7 @@ Awake()
 ```
 Awake()
   EnsureConfig()             ← read/write client.yaml
-  _harmony.PatchAll()
+  PatchNested(_harmony, typeof(ClientPlugin))
   StartCoroutine(DeferredInit())
 
 DeferredInit()               ← runs 2s after Awake (lets all plugins load)
@@ -59,6 +100,28 @@ DeferredInit()               ← runs 2s after Awake (lets all plugins load)
 ```
 
 The 2-second delay in `DeferredInit` is intentional — `PluginInfos` is incomplete during `Awake` because BepInEx loads plugins alphabetically on the same thread.
+
+#### Quick Login panel (title screen)
+
+Separate from the lifecycle above — it is driven by a Harmony postfix, not `Awake`:
+
+```
+FejdStartup.SetupGui  [postfix]
+  BuildQuickLoginPanel(menu)          ← only if quickLoginEnabled && serverAddress set
+    parent = m_characterSelectScreen.parent   (persists across menu ↔ char-select)
+    logo → name → description                  (top-anchored, flow downward)
+    [Announcements header + BuildAnnouncementsScrollBox]   ← 1.8.0, only if text non-empty
+    player count                               (bottom-anchored when announcements present)
+    AddConnectButton  ← cloned vanilla menu button, for theme/font/sfx
+    StartCoroutine(RefreshPlayerCount)        ← A2S_INFO on gamePort+1, background thread
+```
+
+Every label is a clone of a vanilla menu-button `TextMeshProUGUI`, configured **by
+reflection** (`SetTmpProperty` / `SetTmpEnum` / `GetTmpProperty`) — the project
+deliberately does not reference `Unity.TextMeshPro`. The announcements box is a
+hand-built `ScrollRect` → viewport (`RectMask2D`) → content → text hierarchy; its
+content height is measured explicitly one frame later in `FitAnnouncementContent`
+rather than by `ContentSizeFitter` (see `known-errors.md`, ERROR 14 for why).
 
 ---
 
@@ -74,7 +137,8 @@ Server Patch_OnNewConnection (Postfix on ZNet.OnNewConnection)
   0. Ban check on the socket host name (SteamID64 on Steam) — disconnect and
      return before registering anything
   1. Register ALL RPC handlers for this peer
-  2. If owner/moderator → PostPlayerEvent(":crown:"/":shield:", pid, "joined as …"); return
+  2. If OWNER → PostPlayerEvent(":crown:", pid, "joined as owner"); return
+     (moderators attest like players since 2.0; their ":shield: joined as moderator" fires from OnManifestReceived)
   3. Issue challenge → peer.m_rpc.Invoke("ServerGuard_RequestManifest", challenge)
   4. Start AttestationTimeoutCoroutine (kicks if no reply in companionTimeoutSeconds)
 
@@ -140,9 +204,15 @@ BepInEx/config/ServerGuard/
 Client:
 ```
 BepInEx/config/ServerGuard/
-├── client.yaml                     ← sharedSecret
+├── client.yaml                     ← sharedSecret + Quick Login panel settings
+│                                     (incl. serverAnnouncements block, 1.8.0)
+├── <logo>.png / .jpg               ← optional; named by serverLogoPath
 └── mods_for_allowed_mods.yaml      ← first-run export snippet
 ```
+
+`client.yaml` is read once at `Awake` and is **not** hot-reloaded. It is only written
+when missing, plus a single append-migration for `serverAnnouncements` — see
+`settings-reference.md`, *Client config*.
 
 ---
 
@@ -159,7 +229,20 @@ BepInEx/config/ServerGuard/
 | `ZNet.instance.IsServer()` | Guard: only run server logic on the server |
 | `WearNTear.Damage(HitData)` | Track last attacker before destroy |
 | `WearNTear.Destroy()` | Log piece destruction |
-| `Player.PlacePiece(Piece, Vector3, ...)` | Log piece placement |
+| `Player.PlacePiece(Piece, Vector3, Quaternion, bool, bool)` | Log piece placement. Valheim 1.0 added the trailing `bool cheated`; the postfix binds `piece`/`pos` **by name**, so it still resolves. |
 | `Player.OnDeath` (protected) | Send death report |
-| `Chainloader.PluginInfos` | Build manifest list on client |
+| `Chainloader.PluginInfos` | Build manifest list on client (reports the one merged GUID) |
+| `SystemInfo.graphicsDeviceType` | Entry plugin: headless ⇒ dedicated server ⇒ server half |
+| `Terminal.IsCheatsEnabled`, `Terminal.ConsoleCommand.IsValid`, `Terminal.m_cheat` (public static) | Client: staff dev-command unlock — see `console-guard.md` |
+| `ZNet.RPC_RemoteCommand`, `ZNet.ListContainsId`, `ZNet.m_adminList` (reflection), `ZNet.RemotePrint` | Server: staff dev-command authorisation without `adminlist.txt` |
+| `RandEventSystem.RPC_ConsoleStartRandomEvent` / `RPC_ConsoleResetRandomEvent`, `StartRandomEvent`, `ResetRandomEvent` | Server: `randomevent` / `stopevent` for moderators on the list |
 | `BepInEx.Logging.Logger.Listeners` | Attach verbose Discord mirror |
+| `FejdStartup.SetupGui` (postfix) | Build the Quick Login panel once the vanilla menu exists |
+| `FejdStartup.m_characterSelectScreen`, `m_menuButtons`, `m_versionLabel` (reflection) | Parent + font/button templates for the panel |
+| `FejdStartup.m_queuedJoinServer`, `SetServerToJoin`, static `ServerPassword` (reflection) | Direct connect, skipping the IP/password dialogs |
+| `TMPro.TMP_TextUtilities.FindIntersectingLink` (reflection) | Which `<link>` was clicked in the announcements box |
+| `UnityEngine.ImageConversion.LoadImage` (reflection) | Decode the server logo PNG/JPG |
+
+Every string-named member above is verified against a new game build by the
+procedure in `build-and-release.md`, *Verifying against a new Valheim release*.
+Last verified: Valheim 1.0.7 (2026-09-09), all present.

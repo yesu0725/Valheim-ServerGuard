@@ -72,7 +72,7 @@ Valheim's Mono runtime does not ship `System.ValueTuple`. ANY use of the `(T1, T
 
 ### Fix
 - `Shared/Manifest.cs`: `ModsetFingerprint.ComputeStrict/Loose` signatures changed from `IEnumerable<(string,string)>` to `IEnumerable<KeyValuePair<string,string>>`
-- `Plugin.cs`: `CmdBuildAt` rewritten as imperative loop; `TryParseXZ` changed from `(float X, float Z)?` return to `out float x, out float z` parameters; `Distance2D` takes plain `float` args
+- `ServerPlugin.cs`: `CmdBuildAt` rewritten as imperative loop; `TryParseXZ` changed from `(float X, float Z)?` return to `out float x, out float z` parameters; `Distance2D` takes plain `float` args
 - Client: Any LINQ that used anonymous tuple projection was replaced with `new { }` anonymous objects or imperative loops
 
 ### Prevention
@@ -325,7 +325,7 @@ The title-screen Quick Login panel's live player count never resolves. It sits a
 No exception is logged — the query just silently yields nothing.
 
 ### Root cause
-Two independent problems in `RefreshPlayerCount` (`ServerGuard.Client/ClientPlugin.cs`):
+Two independent problems in `RefreshPlayerCount` (`ClientPlugin.cs`):
 
 1. **The A2S challenge was never answered.** Since Valve's December 2020 anti-reflection
    update — which Valheim inherits through the Steam game-server API — a bare `A2S_INFO`
@@ -356,3 +356,93 @@ Split the query into `QueryA2SInfo` / `BuildA2SInfoRequest` / `ParseA2SInfo` and
 ### Prevention
 Any future Steam/Source query (`A2S_PLAYER`, `A2S_RULES`) needs the same challenge handshake.
 Never treat a short reply as a failed query without first checking for `0x41`.
+
+---
+
+## ERROR 14 — Cloned TMP label won't wrap / scroll content sizes to one line
+
+### Symptom
+A label cloned from a vanilla menu button renders as a single unwrapped line, or a
+`ScrollRect` whose content is driven by a `ContentSizeFitter` sizes itself to one line
+of text on the first frame and never grows. Seen while building the 1.8.0 announcements
+box on the Quick Login panel.
+
+### Root cause
+The vanilla menu-button label carries its own `ContentSizeFitter` and `LayoutElement`,
+which auto-size it to one line and defeat word wrap. The code `Destroy()`s them — but
+`Destroy()` is deferred to end of frame, so **both components are still alive and still
+participating in layout for the rest of the frame they were "destroyed" in**. Any layout
+group or `ContentSizeFitter` you attach in that same frame measures against the stale
+one-line constraint.
+
+### Fix
+`CreateAnnouncementText` disables the two components (`enabled = false`) *and* destroys
+them, and `FitAnnouncementContent` does not use a `ContentSizeFitter` at all: it yields a
+frame, calls `Canvas.ForceUpdateCanvases()`, reads TMP `preferredHeight` by reflection,
+and sets the content `sizeDelta` explicitly — twice (first pass establishes the width,
+second measures against it), falling back to `GetPreferredValues(width, 32767)` if the
+property reads 0. Content height is floored at the viewport height, because a content
+rect shorter than its viewport makes `ScrollRect` position it oddly.
+
+### Prevention
+Treat any component you `Destroy()` on a cloned UI object as present until next frame.
+Either disable it immediately as well, or defer whatever depends on its absence.
+
+---
+
+## ERROR 15 — Game-update check misses the plugin-load section of `LogOutput.log`
+
+### Symptom
+After booting the dedicated server to verify a new Valheim build, the captured log has
+no `Loading [Valheim ServerGuard …]` line and no ServerGuard output at all — the plugin
+looks like it silently failed to load, even though it loaded fine.
+
+### Root cause
+Capture was done by recording the log's byte length before launch and reading from that
+offset afterwards, on the assumption BepInEx appends. **BepInEx truncates
+`BepInEx\LogOutput.log` at the start of every run.** Seeking to the old length skips
+exactly the first N bytes of the *new* log, which is where the BepInEx banner and every
+`Loading [...]` line live.
+
+### Fix
+Read the whole file after the process exits. The log at that point is complete for the
+run that just finished.
+
+### Prevention
+Never capture that log by offset. If you need "only this run", the truncation already
+gives you that — the file *is* only this run. See `build-and-release.md`,
+*Verifying against a new Valheim release*.
+
+---
+
+## ERROR 16 — `MissingMethodException: ConsoleCommand..ctor(...)` on Valheim 1.0
+
+### Symptom
+On a Valheim 1.0 server the log shows, during `Terminal.InitTerminal`:
+```
+MissingMethodException: Method not found: void .ConsoleCommand..ctor(string,string,Terminal/ConsoleEvent,bool,bool,bool,bool,bool,Terminal/ConsoleOptionsFetcher,bool,bool,bool)
+  (wrapper dynamic-method) Terminal.DMD<Terminal::InitTerminal>()
+```
+It is tempting to attribute it to ServerGuard, which patches `Terminal`.
+
+### Root cause
+Valheim 1.0 changed the `Terminal.ConsoleCommand` constructor from 12 to 13 parameters
+(added `onlyAdmin`; the full list is `command, description, action, isCheat, isNetwork,
+onlyServer, isSecret, allowInDevBuild, hideBehindDevCommands, optionsFetcher,
+alwaysRefreshTabOptions, remoteCommand, onlyAdmin`) and added a `HideBehindDevCommands`
+field. Any mod compiled against the old ctor that **registers its own console commands**
+now throws. The `DMD<Terminal::InitTerminal>` frame is a MonoMod dynamic method — i.e. the
+throwing code is a *patch* of `InitTerminal`, and the mod on this server that patches it
+is Server Devcommands 1.109.
+
+### Fix
+Nothing in ServerGuard — it never constructs a `ConsoleCommand`. The console guard reads
+`ConsoleCommand.IsCheat` out of `Terminal.commands` at call time, and that field is
+unchanged (`ReadBoolMember` probes `IsCheat` first; the `m_isCheat` spelling in its
+fallback list has never existed on any build). The affected third-party mod needs an
+update from its author.
+
+### Prevention
+When a log error mentions a type ServerGuard patches, attribute by **stack frame**, not
+by type name, before reporting it as ours. Anything named `DMD<Type::Method>` belongs to
+whichever mod patched that method — check the plugin list in the same log.

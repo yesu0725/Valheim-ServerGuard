@@ -2,9 +2,34 @@
 
 Lock your Valheim dedicated server to a specific list of mods. Vanilla and wrong-modpack players are automatically kicked.
 
-It works because every player runs a small companion plugin that tells the server exactly which mods they have loaded — signed with a shared password so it can't be faked. The server compares the list to your allowlist and decides whether to let them in.
+It works because the same mod runs on every player's game and tells the server exactly which mods they have loaded — signed with a shared password so it can't be faked. The server compares the list to your allowlist and decides whether to let them in.
 
-Beyond the mod allowlist, it also includes anti-cheat gates, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
+Beyond the mod allowlist, it also includes anti-cheat gates, dev commands for staff, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
+
+### New in 2.0.0
+
+- **One mod instead of two.** The server plugin and the client companion are now a single `Valheim-ServerGuard.dll`. Install the same file on the dedicated server and on every player's game; it works out which side it is on when it loads (a headless dedicated server runs the server half, a normal game runs the client half). The separate `Valheim_ServerGuard_Client` package is retired — uninstall it from your profiles, it must not run next to 2.0.
+  - Existing servers keep working: an `allowed_mods.yaml` that still lists the old `com.taeguk.valheim.serverguard.client` GUID under `required_mods` is read as the new `com.taeguk.valheim.serverguard` GUID (with a log line asking you to update it). If you had the old client DLL hash-pinned, re-pin against the 2.0 DLL.
+  - Config files are unchanged: `BepInEx/config/ServerGuard/conf/*.yaml` on the server, `BepInEx/config/ServerGuard/client.yaml` on each player.
+- **Cheat-taint detection.** Valheim 1.0 quietly marks everything that came out of a cheat — `spawn`ed items, anything crafted from them, pieces built with `nocost`, creatures hit while in god/fly mode — and saves the mark in the character file. ServerGuard now reads it: players carrying flagged items are reported to the admin channel (`cheatTaintPolicy: log` by default; `strip` removes them, `violation` also records a strike), cheat-flagged builds are recorded in the build log and confirmed against the world state by the server, and debug-fly is detected server-side. Gear spawned in single-player and brought over is caught on arrival. Three new rules — `CheatedItem`, `CheatedBuild`, `DebugFly` — all informational until you turn them on in `countAsViolation`. Every player sees a one-time notice on their first login after launching the game explaining that detection is on and what the consequence is.
+- **Speed check default** raised from 15 to 70 m/s — the old default flagged modded mounts; 70 only catches teleport-style movement.
+- **Dev commands for staff.** Valheim refuses every cheat command on a dedicated-server client, whoever types it. ServerGuard now lifts that for your staff:
+  - **Owners** (`owners.yaml`) get **every** dev command, exactly as in single-player — `devcommands`, then `fly`, `god`, `spawn`, `goto`, `skiptime`, `setworldmodifier`, and so on. Owners are also treated as vanilla admins by the server, so nothing needs to be added to `adminlist.txt`.
+  - **Moderators** (`moderators.yaml`) get only the commands you list in `moderatorDevcommands` (default: `goto`, `pos`, `removedrops`, `stopevent`, `find`). `fly`, `debugmode`, `spawn`, `itemset`, `nocost`, `noplacementcost` and `location` can never be given to a moderator. Anything else is refused on their client and posted to the admin Discord channel — no strike, they are staff. Moderators get a chat welcome on every login listing what they have and reminding them to moderate responsibly.
+  - **Moderators now go through the mod check** like everyone else (only owners skip it), with a new `moderator_allowed_mods:` list in `allowed_mods.yaml` for staff-only tooling.
+  - **Staff see map coordinates:** on the large map, owners and moderators see the world X/Z under the cursor next to the biome name.
+  - Both are switches in `settings.yaml` (`enableOwnerDevcommands`, `enableModeratorDevcommands`) and hot-reload, so promoting or demoting someone takes effect while they are online. Every command that runs server-side (`skiptime`, `sleep`, `randomevent`, ...) is logged and posted to the admin channel with who ran it. Ordinary players are gated exactly as before. If you were running *Server Devcommands* for this, you no longer need it.
+
+### Valheim 1.0 compatibility (1.8.1)
+
+**ServerGuard works on Valheim 1.0.** Verified against **1.0.7** (network version 39, Unity 6000.0.75) on BepInEx 5.4.23.5: every Valheim method the mod patches and every field it reads still exists with the same signature, so 1.0 needed no code changes. 1.8.1 is a version-number-only release carrying this note — if you are already on 1.8.0, nothing is broken and you only need it to keep both plugins matched.
+
+One thing worth knowing if you run a modpack: Valheim 1.0 changed the console-command constructor, which breaks *other* mods that register console commands (Server Devcommands 1.109 throws an error on startup). ServerGuard itself is unaffected.
+
+### New in 1.8.0
+
+- **Announcements on the Quick Login panel** — a scrollable box under the server description, headed **Announcements**, for anything you want players to read before they join: event times, rules, wipe policy, patch notes. Write it in the companion's `client.yaml` as a YAML block (`serverAnnouncements: |`) and it appears on the title screen. There's no length limit — the box scrolls with the wheel, by dragging, or with its scrollbar, and the panel grows taller when announcements are present.
+- **Clickable links in announcements** — `[Discord](https://discord.gg/...)` renders as a blue underlined link that opens in the player's browser. Only `http://` and `https://` are opened; anything else is shown as plain text, since `client.yaml` is often shipped inside a modpack rather than written by the player. TextMeshPro styling (`<b>`, `<i>`, `<color=#ffcc00>`) works too. Upgrading clients get the new key appended to their existing `client.yaml`, with usage notes, on first start.
 
 ### New in 1.7.0
 
@@ -41,12 +66,14 @@ Beyond the mod allowlist, it also includes anti-cheat gates, in-game `sg` admin 
 
 ## What you need
 
-You'll be installing **two files**:
+You'll be installing **one file, in two places**:
 
-- **`Valheim-ServerGuard.dll`** → goes on your **server** (you, the host)
-- **`Valheim-ServerGuard-Client.dll`** → goes on **every player's** Valheim install (you and your friends)
+- **`Valheim-ServerGuard.dll`** → on your **server** (you, the host)
+- **the same `Valheim-ServerGuard.dll`** → on **every player's** Valheim install (you and your friends)
 
-Players who don't install the client file get kicked when they try to join. That's the whole point.
+The mod detects which side it is on: a dedicated server runs the server half, a player's game runs the client half. Players who don't install it get kicked when they try to join. That's the whole point.
+
+> Upgrading from 1.x: the old `Valheim_ServerGuard_Client` package must be **removed** from every player's profile. The merged mod replaces it.
 
 ---
 
@@ -65,7 +92,7 @@ Players who don't install the client file get kicked when they try to join. That
 
 ### Step 2 — Each player (including you, on your gaming PC)
 
-1. Copy `Valheim-ServerGuard-Client.dll` into the player's `BepInEx/plugins/` folder. With r2modman, this means dragging it into the active profile.
+1. Install the same `Valheim_ServerGuard` mod into the player's profile (r2modman / Gale / Thunderstore), or copy `Valheim-ServerGuard.dll` into their `BepInEx/plugins/` folder.
 2. Launch Valheim **once**. Wait until the main menu appears, then close the game.
 3. Open `BepInEx/config/ServerGuard/client.yaml` and paste the password the server gave you:
    ```yaml
@@ -74,7 +101,7 @@ Players who don't install the client file get kicked when they try to join. That
 
 ### Step 3 — Build the allowlist (one player does this once)
 
-1. Have one trusted player (with the full modpack installed) launch Valheim once. The companion plugin writes a file at:
+1. Have one trusted player (with the full modpack installed) launch Valheim once. ServerGuard writes a file at:
    ```
    BepInEx/config/ServerGuard/mods_for_allowed_mods.yaml
    ```
@@ -108,8 +135,8 @@ Stop reading here unless something doesn't work or you want to change defaults.
 
 ```
 1. Player connects.
-2. Server sends a one-time random "challenge" to the player's companion plugin.
-3. Companion replies with: a list of every mod loaded, the challenge, a timestamp,
+2. Server sends a one-time random "challenge" to the ServerGuard running on the player's game.
+3. The client replies with: a list of every mod loaded, the challenge, a timestamp,
    and a fingerprint (HMAC) computed using the shared password.
 4. Server verifies:
      - the fingerprint matches (so the list wasn't tampered with),
@@ -119,8 +146,8 @@ Stop reading here unless something doesn't work or you want to change defaults.
      - no banned mods are present,
      - all required mods are present.
 5. If anything fails, the player is kicked with a clear reason.
-6. If the companion plugin doesn't reply within 10 seconds, the player is kicked
-   for not having the companion plugin installed (vanilla clients fall here).
+6. If the client doesn't reply within 10 seconds, the player is kicked for not
+   having ServerGuard installed (vanilla clients fall here).
 ```
 
 ## All configuration files
@@ -147,7 +174,7 @@ On every player's PC, only one file matters: `BepInEx/config/ServerGuard/client.
 | `kickMessage` | (built-in) | Message shown when a player is kicked. The specific reason is appended automatically. |
 | `banReason` | (built-in) | Reason recorded when an auto-ban triggers. |
 | `characterLimit` | `1` | Maximum number of distinct character names a single Steam ID can use on this server. |
-| `requireCompanion` | `true` | If `true`, players without the client plugin are kicked on timeout. Set to `false` to allow vanilla connections. |
+| `requireCompanion` | `true` | If `true`, players whose game isn't running ServerGuard are kicked on timeout. Set to `false` to allow vanilla connections. |
 | `companionTimeoutSeconds` | `10` | How long the server waits for the manifest to arrive before declaring no-companion. |
 | `requireHmac` | `true` | If `true`, every manifest must be signed with the shared password. Strongly recommended. |
 | `sharedSecret` | (auto-generated) | The shared password. Auto-created on first launch. Must match `client.yaml` on every player. |
@@ -164,7 +191,7 @@ Three sections. Each entry is either `GUID` or `GUID|hash`.
 
 ```yaml
 required_mods:
-  - com.taeguk.valheim.serverguard.client    # the companion itself - leave this in
+  - com.taeguk.valheim.serverguard    # ServerGuard itself - leave this in
   # - com.azu.anticheat                       # require AzuAntiCheat too, etc.
 
 allowed_mods:
@@ -176,7 +203,7 @@ banned_mods:
   - com.example.flycheat                                       # always kicked if present
 ```
 
-**GUIDs** are the strings inside `[BepInPlugin("...")]` in each mod's source code. They never change between versions, so they're the safest choice. The companion plugin's first-run export gives you GUIDs automatically — just paste them in.
+**GUIDs** are the strings inside `[BepInPlugin("...")]` in each mod's source code. They never change between versions, so they're the safest choice. The client's first-run export gives you GUIDs automatically — just paste them in.
 
 **Hash pinning** (the `|hash` part) locks the mod to a specific DLL. Useful if you want to forbid newer or older versions. Dropping the hash means any version with that GUID is accepted.
 
@@ -208,7 +235,7 @@ To find your Steam ID, paste your profile URL into https://steamid.io and copy t
 sharedSecret: "<paste the value from the server's settings.yaml>"
 ```
 
-That's it. The companion reads this once at startup. If you change the password on the server, every player must update their `client.yaml`.
+That's it. The client half reads this once at startup. If you change the password on the server, every player must update their `client.yaml`.
 
 ## Refreshing the mod list
 
@@ -228,19 +255,19 @@ What you'll see in `BepInEx/LogOutput.log`.
 [ServerGuard] <steamid> attested OK (29 mods).
 ```
 
-### Player has the companion but a mod isn't on the allowlist
+### Player has ServerGuard but a mod isn't on the allowlist
 ```
 [ServerGuard] <steamid> REJECTED: DisallowedMod - Unapproved mod: <mod-name>
 [ServerGuard] Disconnected <steamid>. Reason: ... (Unapproved mod: <mod-name>)
 ```
 Fix: add the mod to `allowed_mods.yaml`, or remove it from the player's modpack.
 
-### Player is missing the companion / didn't install it
+### Player is missing ServerGuard / didn't install it
 ```
 [ServerGuard] <steamid> did not deliver a manifest within 10s.
-[ServerGuard] Disconnected <steamid>. Reason: ... (Missing required companion plugin: ServerGuard.Client)
+[ServerGuard] Disconnected <steamid>. Reason: ... (ServerGuard is not installed on your client)
 ```
-Fix: have the player install `Valheim-ServerGuard-Client.dll` and set their `client.yaml`.
+Fix: have the player install `Valheim-ServerGuard.dll` and set their `client.yaml`.
 
 ### Wrong password
 ```
@@ -292,24 +319,25 @@ If you previously used heuristic detection (`ignore_mods.yaml`, `mod_patterns.ya
 1. Stop the server.
 2. Replace `Valheim-ServerGuard.dll` with the new one.
 3. Start the server. The old files are auto-renamed `ignore_mods.yaml.legacy` / `mod_patterns.yaml.legacy`. A fresh `allowed_mods.yaml` is created. The new `sharedSecret` is auto-generated.
-4. Have one trusted player install `Valheim-ServerGuard-Client.dll`, copy the password into their `client.yaml`, launch the game once, and use their `mods_for_allowed_mods.yaml` to populate the server's `allowed_mods.yaml`.
-5. Distribute the client DLL + password to all other players.
+4. Have one trusted player install `Valheim-ServerGuard.dll`, copy the password into their `client.yaml`, launch the game once, and use their `mods_for_allowed_mods.yaml` to populate the server's `allowed_mods.yaml`.
+5. Distribute the DLL + password to all other players.
 
 The old YAML files (now `.legacy`) are kept for reference. You can delete them when you're ready.
 
 ## Building from source
 
-See [BUILD.md](BUILD.md) for instructions. Both the server DLL and client DLL build from `dotnet build -c Release` after pointing `VALHEIM_PATH` at your Valheim install.
+See [BUILD.md](BUILD.md) for instructions. The single DLL builds from `dotnet build -c Release` after pointing `VALHEIM_PATH` at your Valheim install.
 
 ## Architecture map (for code readers)
 
 | File | Role |
 |---|---|
-| [Plugin.cs](Plugin.cs) | Server plugin. Patches `ZNet.OnNewConnection` (challenge issue + manifest receiver registration) and `ZNet.RPC_PeerInfo` (character-limit enforcement). |
-| [ServerGuard.Client/ClientPlugin.cs](ServerGuard.Client/ClientPlugin.cs) | Client companion. Patches `ZNet.OnNewConnection` (registers the manifest reply handler). Builds the manifest from `Chainloader.PluginInfos` and writes `mods_for_allowed_mods.yaml` on first run. |
-| [Shared/Manifest.cs](Shared/Manifest.cs) | Shared DTO (used by both): the `ModManifest` shape, the canonical-string format used as input to HMAC, and the HMAC-SHA256 helpers. |
+| [ServerGuardPlugin.cs](ServerGuardPlugin.cs) | The BepInEx entry point. Decides at load whether this process is a dedicated server or a player's game and attaches the matching half. |
+| [ServerPlugin.cs](ServerPlugin.cs) | Server half. Patches `ZNet.OnNewConnection` (challenge issue + manifest receiver registration), `ZNet.RPC_PeerInfo` (character-limit enforcement), `ZNet.RPC_RemoteCommand` / `ZNet.ListContainsId` (staff dev commands). |
+| [ClientPlugin.cs](ClientPlugin.cs) | Client half. Patches `ZNet.OnNewConnection` (registers the manifest reply handler), the console guard, and `Terminal.IsCheatsEnabled` / `ConsoleCommand.IsValid` (staff dev commands). Builds the manifest from `Chainloader.PluginInfos` and writes `mods_for_allowed_mods.yaml` on first run. |
+| [Shared/Manifest.cs](Shared/Manifest.cs) | Shared DTO (used by both halves): the `ModManifest` shape, the canonical-string format used as input to HMAC, and the HMAC-SHA256 helpers. |
 
 ---
 
-**Version:** 1.7.0
+**Version:** 2.0.0
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

@@ -8,7 +8,7 @@ Look at the kick message — it tells you what's wrong:
 
 | Kick reason | Cause | Fix |
 |---|---|---|
-| "Missing required companion plugin" | You don't have the client mod installed. | Install **TaegukGaming-Valheim_ServerGuard_Client** via your mod manager. |
+| "ServerGuard is not installed on your client" (pre-2.0: "Missing required companion plugin") | You don't have the mod installed on your game. | Install **TaegukGaming-Valheim_ServerGuard** — the same package the server runs — via your mod manager. If you still have the old `Valheim_ServerGuard_Client`, remove it. |
 | "wrong password" | Your `client.yaml` has the wrong `sharedSecret`. | Get the password from the server host and paste it exactly. |
 | "Required mod missing: …" | The server requires a mod you don't have. | Install the mod listed. |
 | "had a mod that isn't allowed (…)" | You have a mod the server doesn't allow. | Remove the mod, or ask the host to add it to `allowed_mods.yaml`. |

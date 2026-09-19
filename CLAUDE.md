@@ -9,22 +9,26 @@ Read this first, then follow links to sub-files for deep detail.
 
 | Item | Value |
 |---|---|
-| **Current version** | 1.7.0 |
-| **Server GUID** | `com.taeguk.valheim.serverguard` |
-| **Client GUID** | `com.taeguk.valheim.serverguard.client` |
+| **Current version** | 2.0.0 |
+| **GUID** | `com.taeguk.valheim.serverguard` (one plugin, one DLL, both sides — since 2.0) |
+| **Legacy client GUID** | `com.taeguk.valheim.serverguard.client` (pre-2.0 companion package; still accepted in `allowed_mods.yaml`) |
 | **Target framework** | net462 (Mono, .NET Framework 4.6.2) |
-| **BepInEx** | 5.x |
+| **BepInEx** | 5.x (5.4.23.5 verified on Valheim 1.0.7) |
+| **Game verified against** | Valheim **1.0.7** (network version 39, Unity 6000.0.75), 2026-09-09 |
 | **GitHub** | https://github.com/yesu0725/Valheim-ServerGuard |
 
 ---
 
 ## What this mod does
 
-A two-part BepInEx mod for Valheim dedicated servers:
+A single BepInEx mod (`Valheim-ServerGuard.dll`) installed on **both** the dedicated server and every player's client. One entry plugin picks the half to run at load:
 
-- **Server plugin** (`Plugin.cs`) — runs on the dedicated server. Enforces rules, handles attestation, logs to Discord, exposes `sg` admin console commands.
-- **Client plugin** (`ClientPlugin.cs`) — runs on the player's Valheim client. Signs the mod manifest, blocks devcommands, reports suspicious activity, sends build/death events.
-- **Shared library** (`Shared/Manifest.cs`) — compiled into both. Contains `ModManifest`, `ModManifestEntry`, `ModsetFingerprint`.
+- **Entry point** (`ServerGuardPlugin.cs`) — the only `[BepInPlugin]`. Headless process (no graphics device) → attaches `ServerPlugin`; otherwise → attaches `ClientPlugin`. Overridable via `General.Mode` in the BepInEx `.cfg`. Owns `PatchNested`, which applies only the patch classes nested inside the chosen half.
+- **Server half** (`ServerPlugin.cs`, `MonoBehaviour`) — runs on the dedicated server. Enforces rules, handles attestation, logs to Discord, exposes `sg` admin console commands, authorises staff dev commands server-side.
+- **Client half** (`ClientPlugin.cs`, `MonoBehaviour`) — runs on the player's Valheim client. Signs the mod manifest, gates the console, unlocks dev commands for staff per the server's grant, reports suspicious activity, sends build/death events, draws the Quick Login panel.
+- **Shared library** (`Shared/Manifest.cs`) — `ModManifest`, `ModManifestEntry`, `ModsetFingerprint`.
+
+The two halves never run in the same process. "Companion" in older comments and docs means the client half.
 
 ---
 
@@ -47,17 +51,15 @@ Valheim-ServerGuard/
 │   ├── build-and-release.md
 │   ├── known-errors.md
 │   └── IMPLEMENTATION_SUMMARY.md
-├── Plugin.cs                          ← server plugin (~4100 lines)
-├── ServerGuard.Client/
-│   └── ClientPlugin.cs                ← client plugin (~1340 lines)
+├── ServerGuardPlugin.cs               ← BepInEx entry point: picks server or client half
+├── ServerPlugin.cs                    ← server half (~6200 lines; was Plugin.cs)
+├── ClientPlugin.cs                    ← client half (~3400 lines; was ServerGuard.Client/ClientPlugin.cs)
 ├── Shared/
 │   └── Manifest.cs                    ← shared DTO + crypto
-├── Valheim-ServerGuard.csproj
-├── ServerGuard.Client/Valheim-ServerGuard-Client.csproj
+├── Valheim-ServerGuard.csproj         ← the one project; builds the one DLL
 ├── wiki/                              ← GitHub Wiki pages (not in Thunderstore zip)
 └── Thunderstore files/
-    ├── Valheim-ServerGuard (server)/
-    └── Valheim-ServerGuard (client)/
+    └── Valheim-ServerGuard/           ← the one package (server + client)
 ```
 
 ---
@@ -76,9 +78,13 @@ Valheim-ServerGuard/
 
 5. **RPC handlers MUST be registered before the admin early-return** — otherwise admins can't use `sg` commands. See `Patch_OnNewConnection`.
 
-6. **Valheim's `Console` type needs `global::Console`** — `using System;` is in scope in both plugins, so a bare `Console` binds to `System.Console`. Valheim's `Console` sits in the global namespace.
+6. **Valheim's `Console` type needs `global::Console`** — `using System;` is in scope in both halves, so a bare `Console` binds to `System.Console`. Valheim's `Console` sits in the global namespace.
 
 7. **Don't pick a Valheim collection field by "first one of the right interface"** — `Terminal` has three static dictionaries and `m_testList` is declared before `commands`. Match on the generic argument types instead. See `ResolveTerminalCommands` in `ClientPlugin.cs`.
+
+8. **Never call `Harmony.PatchAll()` in either half** — it sweeps the whole assembly and applies the *other* half's patches too. Put every patch class inside `ServerPlugin` or `ClientPlugin` (nested, any depth) and let `ServerGuardPlugin.PatchNested` apply it. A top-level patch class would be applied by nobody.
+
+9. **`ServerPlugin` and `ClientPlugin` are plain `MonoBehaviour`s, not `BaseUnityPlugin`** — there is no `Logger`/`Config`/`Info` on them. Log through the static `LogS` (assigned from `ServerGuardPlugin.Log`); the version is `ServerGuardPlugin.VERSION`.
 
 ---
 
@@ -86,13 +92,13 @@ Valheim-ServerGuard/
 
 | File | When to read |
 |---|---|
-| [`claude/architecture.md`](claude/architecture.md) | Understanding how the two plugins communicate, BepInEx/Harmony lifecycle |
+| [`claude/architecture.md`](claude/architecture.md) | How the entry plugin picks a half, how the two halves communicate, BepInEx/Harmony lifecycle |
 | [`claude/mono-constraints.md`](claude/mono-constraints.md) | Before writing any new code — list of things that will crash at runtime |
 | [`claude/harmony-patterns.md`](claude/harmony-patterns.md) | Before adding or modifying any Harmony patch |
 | [`claude/rpc-protocol.md`](claude/rpc-protocol.md) | Adding a new server↔client message, payload format |
 | [`claude/features-and-rules.md`](claude/features-and-rules.md) | All anti-cheat rules, their constants, defaults, and enable flags |
 | [`claude/ban-layer.md`](claude/ban-layer.md) | The SteamID denylist — where it hooks the handshake, `bans.yaml`, how it relates to `banlist.txt` |
-| [`claude/console-guard.md`](claude/console-guard.md) | Console command gating, key-bind purging, and the per-command risk assessment |
+| [`claude/console-guard.md`](claude/console-guard.md) | Console command gating, key-bind purging, staff dev commands, and the per-command risk assessment |
 | [`claude/privilege-tiers.md`](claude/privilege-tiers.md) | Owner / moderator / player tiers, and every site the owner bypass is enforced |
 | [`claude/discord-routing.md`](claude/discord-routing.md) | Adding a new Discord post or changing what channel something routes to |
 | [`claude/settings-reference.md`](claude/settings-reference.md) | Adding a new setting, understanding all current settings |

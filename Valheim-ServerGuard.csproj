@@ -4,8 +4,8 @@
     <TargetFramework>net462</TargetFramework>
     <AssemblyName>Valheim-ServerGuard</AssemblyName>
     <RootNamespace>ValheimServerGuard</RootNamespace>
-    <Version>1.7.0</Version>
-    <Description>Valheim Server Guard - Anti-cheat and security mod for Valheim servers</Description>
+    <Version>2.0.0</Version>
+    <Description>Valheim ServerGuard - anti-cheat, mod allowlist and admin tools for Valheim. One DLL for both the dedicated server and the client.</Description>
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -19,16 +19,15 @@
     <ValheimManaged Condition="'$(ValheimManaged)' == '' AND Exists('C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\valheim_server_Data\Managed')">C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\valheim_server_Data\Managed</ValheimManaged>
     <ValheimManaged Condition="'$(ValheimManaged)' == '' AND Exists('C:\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed')">C:\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed</ValheimManaged>
 
-    <BepInExCore Condition="'$(VALHEIM_PATH)' != '' AND Exists('$(VALHEIM_PATH)\BepInEx\core')">$(VALHEIM_PATH)\BepInEx\core</BepInExCore>
+    <!-- BEPINEX_CORE overrides the BepInEx core folder independently of VALHEIM_PATH
+         (useful when the game install has no BepInEx and a mod-manager profile does). -->
+    <BepInExCore Condition="'$(BEPINEX_CORE)' != '' AND Exists('$(BEPINEX_CORE)')">$(BEPINEX_CORE)</BepInExCore>
+    <BepInExCore Condition="'$(BepInExCore)' == '' AND '$(VALHEIM_PATH)' != '' AND Exists('$(VALHEIM_PATH)\BepInEx\core')">$(VALHEIM_PATH)\BepInEx\core</BepInExCore>
     <BepInExCore Condition="'$(BepInExCore)' == '' AND Exists('C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\core')">C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\core</BepInExCore>
     <BepInExCore Condition="'$(BepInExCore)' == '' AND Exists('C:\Program Files (x86)\Steam\steamapps\common\Valheim\BepInEx\core')">C:\Program Files (x86)\Steam\steamapps\common\Valheim\BepInEx\core</BepInExCore>
+    <!-- Last resort on the dev machine: the Gale test profile ships its own BepInEx core. -->
+    <BepInExCore Condition="'$(BepInExCore)' == '' AND Exists('$(APPDATA)\com.kesomannen.gale\valheim\profiles\HB Test\BepInEx\core')">$(APPDATA)\com.kesomannen.gale\valheim\profiles\HB Test\BepInEx\core</BepInExCore>
   </PropertyGroup>
-
-  <ItemGroup>
-    <!-- The client subproject has its own csproj; keep its sources out of the server build. -->
-    <Compile Remove="ServerGuard.Client\**\*.cs" />
-    <None Remove="ServerGuard.Client\**\*" />
-  </ItemGroup>
 
   <ItemGroup>
     <!-- Pulled from nuget.org -->
@@ -64,30 +63,74 @@
       <HintPath>$(ValheimManaged)\assembly_utils.dll</HintPath>
       <Private>False</Private>
     </Reference>
+
+    <!-- UI assemblies: only the client half (Quick Login panel) touches these, but the
+         merged DLL is compiled once so they are referenced unconditionally. They ship
+         in both the client and the dedicated-server Managed folders. -->
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(ValheimManaged)\UnityEngine.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(ValheimManaged)\UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(ValheimManaged)\UnityEngine.UIModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
   </ItemGroup>
 
   <!--
-    Post-build: copy the freshly-built server DLL into the local dedicated server's
-    BepInEx plugins folder for fast iteration. The Condition guards make it a silent
-    no-op on any machine that doesn't have that exact path - safe to commit.
-    Override the destination with the SERVERGUARD_TEST_SERVER_DIR env var if needed.
+    Post-build: copy the freshly-built DLL into the local test installs for fast
+    iteration. ONE DLL now serves both sides, so it goes to both the dedicated server
+    and the Gale "HB Test" client profile. The Condition guards make each copy a
+    silent no-op on any machine that doesn't have that exact path - safe to commit.
+    Override the destinations with SERVERGUARD_TEST_SERVER_DIR / SERVERGUARD_TEST_CLIENT_DIR.
 
-    Destination is the Thunderstore-style mod folder, NOT the plugins root. BepInEx
-    scans plugins/ recursively, so a copy in both places is loaded twice and the
-    duplicate GUID makes one of them fail.
+    Destinations are the Thunderstore-style mod folder (TaegukGaming-Valheim_ServerGuard),
+    NOT the plugins root. BepInEx scans plugins/ recursively, so a copy in both places is
+    loaded twice and the duplicate GUID makes one of them fail.
   -->
-  <Target Name="CopyToTestServer" AfterTargets="Build">
+  <Target Name="CopyToTestInstalls" AfterTargets="Build">
     <PropertyGroup>
       <_ServerGuardTestServerDir Condition="'$(SERVERGUARD_TEST_SERVER_DIR)' != ''">$(SERVERGUARD_TEST_SERVER_DIR)</_ServerGuardTestServerDir>
       <_ServerGuardTestServerDir Condition="'$(_ServerGuardTestServerDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Valheim dedicated server\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard</_ServerGuardTestServerDir>
+      <_ServerGuardTestClientDir Condition="'$(SERVERGUARD_TEST_CLIENT_DIR)' != ''">$(SERVERGUARD_TEST_CLIENT_DIR)</_ServerGuardTestClientDir>
+      <_ServerGuardTestClientDir Condition="'$(_ServerGuardTestClientDir)' == ''">C:\Users\yesu0725\AppData\Roaming\com.kesomannen.gale\valheim\profiles\HB Test\BepInEx\plugins\TaegukGaming-Valheim_ServerGuard</_ServerGuardTestClientDir>
+      <!-- Pre-2.0 client package folder in the same profile. If it still exists it holds
+           the old standalone companion DLL, which would run alongside the merged one. -->
+      <_ServerGuardLegacyClientDir>$(_ServerGuardTestClientDir)\..\TaegukGaming-Valheim_ServerGuard_Client</_ServerGuardLegacyClientDir>
     </PropertyGroup>
+
     <Copy
       SourceFiles="$(OutputPath)$(AssemblyName).dll"
       DestinationFolder="$(_ServerGuardTestServerDir)"
       Condition="Exists('$(_ServerGuardTestServerDir)')"
       SkipUnchangedFiles="false" />
-    <Message Importance="high" Text="[ServerGuard] Server DLL copied to: $(_ServerGuardTestServerDir)" Condition="Exists('$(_ServerGuardTestServerDir)')" />
-    <Message Importance="high" Text="[ServerGuard] Skipped server-DLL copy (path missing): $(_ServerGuardTestServerDir)" Condition="!Exists('$(_ServerGuardTestServerDir)')" />
+    <Message Importance="high" Text="[ServerGuard] DLL copied to test server: $(_ServerGuardTestServerDir)" Condition="Exists('$(_ServerGuardTestServerDir)')" />
+    <Message Importance="high" Text="[ServerGuard] Skipped test-server copy (path missing): $(_ServerGuardTestServerDir)" Condition="!Exists('$(_ServerGuardTestServerDir)')" />
+
+    <!-- The Gale "HB Test" profile is THE client test target: every build goes there and
+         nowhere else (no other Gale profile). Create the mod folder if the profile exists
+         but the folder doesn't, so a fresh profile still receives the DLL. -->
+    <MakeDir Directories="$(_ServerGuardTestClientDir)" Condition="Exists('$(_ServerGuardTestClientDir)\..')" />
+    <Copy
+      SourceFiles="$(OutputPath)$(AssemblyName).dll"
+      DestinationFolder="$(_ServerGuardTestClientDir)"
+      Condition="Exists('$(_ServerGuardTestClientDir)')"
+      SkipUnchangedFiles="false" />
+    <Message Importance="high" Text="[ServerGuard] DLL copied to test client: $(_ServerGuardTestClientDir)" Condition="Exists('$(_ServerGuardTestClientDir)')" />
+    <Message Importance="high" Text="[ServerGuard] Skipped test-client copy (path missing): $(_ServerGuardTestClientDir)" Condition="!Exists('$(_ServerGuardTestClientDir)')" />
+
+    <!-- Guard against duplicate loads: a stray loose DLL at the plugins root, or the
+         pre-2.0 companion package still installed next to the merged mod. -->
+    <Warning
+      Text="[ServerGuard] Stray copy found at the client plugins root ($(_ServerGuardTestClientDir)\..\Valheim-ServerGuard.dll). BepInEx scans recursively, so it loads twice and one instance fails on the duplicate GUID. Delete the loose file."
+      Condition="Exists('$(_ServerGuardTestClientDir)\..\Valheim-ServerGuard.dll')" />
+    <Warning
+      Text="[ServerGuard] Pre-2.0 client companion still installed at $(_ServerGuardLegacyClientDir). Uninstall Valheim_ServerGuard_Client from the profile - the merged mod replaces it."
+      Condition="Exists('$(_ServerGuardLegacyClientDir)\Valheim-ServerGuard-Client.dll')" />
   </Target>
 
 </Project>

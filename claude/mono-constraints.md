@@ -49,7 +49,7 @@ IEnumerable<KeyValuePair<string,string>> entries  // ModsetFingerprint API uses 
 
 ### Where this was already fixed
 - `Shared/Manifest.cs` — `ModsetFingerprint.ComputeStrict/Loose` use `IEnumerable<KeyValuePair<string,string>>` not `IEnumerable<(string key, string hash)>`
-- `Plugin.cs` — `CmdBuildAt` rewritten as imperative loop; `TryParseXZ(s, s, out float x, out float z)`; `Distance2D(float, float, float, float)` plain floats
+- `ServerPlugin.cs` — `CmdBuildAt` rewritten as imperative loop; `TryParseXZ(s, s, out float x, out float z)`; `Distance2D(float, float, float, float)` plain floats
 
 ---
 
@@ -123,7 +123,7 @@ method?.Invoke(consoleInstance, new object[] { text });
 
 The `ResolveConsoleInstance()` method in `ClientPlugin.cs` is the canonical pattern.
 
-Also: `GetPeerPlatformId(object znetPeer)` in `Plugin.cs` accesses `m_platformUserID` via reflection rather than directly, for the same reason.
+Also: `GetPeerPlatformId(object znetPeer)` in `ServerPlugin.cs` accesses `m_platformUserID` via reflection rather than directly, for the same reason.
 
 ---
 

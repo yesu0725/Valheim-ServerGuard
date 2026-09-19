@@ -73,7 +73,7 @@ See **[Discord Integration](Discord-Integration)** for details.
 |---|---|---|
 | `enableDevcommandGate` | `true` | Companion blocks console cheats; server logs the attempts. |
 | `enableSpeedCheck` | `true` | Server polls each peer's position and flags impossibly fast movement. |
-| `speedCheckMaxMetersPerSecond` | `15.0` | Threshold. Vanilla sprint ~5, longship ~9, raise for modded mounts. |
+| `speedCheckMaxMetersPerSecond` | `70.0` | Threshold. Vanilla sprint ~5, longship ~9; the default only catches teleport-style movement — lower it for a vanilla-ish server. |
 | `speedCheckSampleSeconds` | `1.0` | Poll interval. |
 | `speedCheckConsecutiveStrikes` | `3` | Over-threshold samples in a row needed to flag. |
 | `speedCheckTeleportToleranceMeters` | `60.0` | Single big jumps (portal travel) reset the strike counter instead of incrementing. |
@@ -189,8 +189,33 @@ Controls what players can run in the F5 console, and what happens to their key b
 | `consoleAllowedCommands` | `[]` | The permitted set when `consoleGuardMode: whitelist`. |
 | `consoleGuardReportAttempts` | `true` | Log/post/count blocked attempts. |
 
-Enforced by the companion plugin, so every player needs the 1.7.0 client. Full detail
+Enforced on the client side of ServerGuard (every player runs it). Full detail
 and the per-command reasoning: **[Bans and Console Guard](Bans-and-Console-Guard)**.
+
+## Staff dev commands (2.0)
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enableOwnerDevcommands` | `true` | Owners can use every dev command on this server and count as vanilla admins. |
+| `enableModeratorDevcommands` | `true` | Moderators can use the commands in `moderatorDevcommands`. |
+| `moderatorDevcommands` | `goto pos removedrops stopevent find` | The moderator list. `devcommands` is always allowed. `fly`, `debugmode`, `spawn`, `itemset`, `nocost`, `noplacementcost` and `location` are refused for moderators even if listed. |
+
+Players get nothing from these — the console guard applies to them as before. Full
+explanation on **[Privilege Tiers](Privilege-Tiers)**.
+
+## Cheat taint detection (2.0)
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enableCheatTaintDetection` | `true` | Report items and builds the game itself marked as cheat-made. |
+| `cheatTaintPolicy` | `log` | `log` posts to the admin channel; `strip` also removes the items from the player; `violation` also records a `CheatedItem` strike. |
+| `cheatTaintExemptModerators` | `false` | Moderators are reported too unless this is on. Owners are always exempt. |
+| `cheatTaintFlagUsedCheats` | `true` | Also report (once per session) characters carrying the game's permanent "used dev commands" mark. |
+| `cheatTaintIgnoredItems` | `[]` | Prefab names to ignore. Valheim auto-flags any item over 10000 total damage — list modded weapons here. |
+| `enableDebugFlyCheck` | `true` | Flag players whose character reports debug fly (rule `DebugFly`, server-side). |
+
+The three rules (`CheatedItem`, `CheatedBuild`, `DebugFly`) default to informational
+in `countAsViolation`. Details on **[Anti-Cheat Features](Anti-Cheat-Features)**.
 
 ## Raid alerts
 

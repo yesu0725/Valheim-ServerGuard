@@ -135,7 +135,7 @@ private static readonly ConditionalWeakTable<WearNTear, LastHitBox> _lastHit
 
 - Key = `WearNTear` instance. When the GameObject is destroyed, the key's GC reference drops and the entry is automatically removed.
 - No manual cleanup needed. No instance-ID collisions.
-- Used in both server (`Plugin.cs`) and client (`ClientPlugin.cs`) — separate tables, separate classes.
+- Used in both server (`ServerPlugin.cs`) and client (`ClientPlugin.cs`) — separate tables, separate classes.
 
 ---
 
@@ -143,7 +143,7 @@ private static readonly ConditionalWeakTable<WearNTear, LastHitBox> _lastHit
 
 Almost every patch starts with guards:
 ```csharp
-if (Plugin.Instance == null) return;         // plugin not yet initialized
+if (ServerPlugin.Instance == null) return;         // plugin not yet initialized
 if (ZNet.instance == null) return;           // ZNet not up yet
 if (!ZNet.instance.IsServer()) return;       // server-only logic
 if (!IsActiveMultiplayerClient()) return;   // client-only logic
@@ -160,6 +160,31 @@ return ZNet.instance != null
 
 ---
 
-## PatchAll vs manual Harmony.Patch
+## PatchNested — never PatchAll (2.0)
 
-All patches are inner classes annotated with `[HarmonyPatch]` attributes, so `_harmony.PatchAll()` in `Awake()` picks them all up. No `Harmony.Patch(...)` calls needed anywhere. The GUID for the server harmony instance is `"com.taeguk.valheim.serverguard"` and for the client it is the GUID constant.
+Since 2.0 both halves live in **one assembly**, so `_harmony.PatchAll()` would apply the server's patches on a client and vice versa. Neither half calls it. Instead:
+
+```csharp
+_harmony = new Harmony(ServerGuardPlugin.GUID + ".server");   // ".client" in ClientPlugin
+ServerGuardPlugin.PatchNested(_harmony, typeof(ServerPlugin));
+```
+
+`PatchNested` walks `outer.GetNestedTypes(AccessTools.all)` recursively and calls `harmony.CreateClassProcessor(t).Patch()` on every type carrying a `HarmonyAttribute`. (`Harmony.PatchAll(Type)` is *not* a substitute — it processes only that one type and ignores its nested classes.)
+
+Rules that follow:
+- **Every patch class must be nested inside `ServerPlugin` or `ClientPlugin`** (any depth). A top-level `[HarmonyPatch]` class is applied by nobody, silently.
+- A patch that must guard on side (`ZNet.instance.IsServer()` / `IsActiveMultiplayerClient()`) still should — the nesting decides *whether it is applied*, the guard decides *whether it acts* (e.g. a listen-server host runs the client half with `IsServer() == true`).
+- The server logs `Applied N server-side Harmony patch class(es)` at boot — 14 as of 2.0.0. If a new patch class doesn't bump that number, it isn't nested where you think it is.
+- No `Harmony.Patch(...)` calls anywhere; `[HarmonyPatch]` + `TargetMethod()` (see `Patch_SetRandomEvent`) covers the private-method case.
+
+`Plugin.Instance` in the guard snippet above is `ServerPlugin.Instance` since 2.0.
+
+## String-named Valheim members added in 2.0 (verify on each game update)
+
+| Member | Used by |
+|---|---|
+| `ZNet.RPC_RemoteCommand`, `ZNet.ListContainsId`, `ZNet.m_adminList` | staff dev commands (server) |
+| `RandEventSystem.RPC_ConsoleStartRandomEvent` / `RPC_ConsoleResetRandomEvent` | staff dev commands (server) |
+| `ZDOMan.m_objectsByID` (reflection, `Dictionary<ZDOID, ZDO>`) | `SweepCheatedBuildChecks` |
+| `Player.PlacePiece` 5th argument `bool cheated` (via `__args[4]`) | `Patch_PlacePiece_Report` |
+| `ZDOVars.s_cheated`, `s_creator`, `s_debugFly`; `ItemData.m_cheated`; `PlayerProfile.m_usedCheats` / `s_bypassCheatChecks` | cheat taint (direct references — a rename is a compile error, not a silent miss) |
