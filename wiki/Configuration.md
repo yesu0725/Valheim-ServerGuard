@@ -236,7 +236,7 @@ The title-screen one-click login panel is configured on each **client** in `clie
 | `conf/bans.yaml` | ServerGuard ban list. See [Bans and Console Guard](Bans-and-Console-Guard). |
 | `conf/allowed_mods.yaml` | Mod allowlist. |
 | `modset_fingerprint.txt` | Current modset hash (publish this to your community). |
-| `registrations.yaml` | SteamID → character names mapping. |
-| `violations.yaml` | Current per-player violation strikes. |
+| `registrations.yaml` | SteamID → character names mapping. Hot-reloaded; or use `sg unregister`. |
+| `violations.yaml` | Current per-player violation strikes. Hot-reloaded; or use `sg pardon`. |
 | `metrics.yaml` | Aggregate counters. |
 | `build_log/YYYY-MM-DD.csv` | Daily build/destroy events. |

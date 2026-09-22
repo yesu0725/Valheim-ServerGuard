@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.2
+
+### New
+- **`sg unregister <steamid> [character]`.** Forgets one registered character name, or every name for that SteamID when no character is given, so the player can register fresh ones. Use it with `sg pardon` and `sg unban` to fully reset someone who tripped the character limit.
+
+### Fixed
+- **`registrations.yaml` and `violations.yaml` are now hot-reloaded**, like the rest of `conf/`. They used to be read once at boot, so edits made while the server was running were ignored and then overwritten by the next strike or registration. In practice this meant `sg unban` on a player over `characterLimit` did not stick: the server still held their old names and strikes in memory and re-banned them on the next login. `sg reload` now re-reads these two files too, and `sg help` describes it accurately.
+
 ## 2.0.1
 
 ### New

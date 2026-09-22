@@ -39,7 +39,7 @@ Curated moderation events. Use a private channel that only moderators can see.
 
 | Event | Example |
 |---|---|
-| Server boot | `🚀 ServerGuard online v2.0.1  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
+| Server boot | `🚀 ServerGuard online v2.0.2  enforce=ON  requireHmac=ON  req/allow/ban=1/29/0  modset=8ce8906e` |
 | Staff dev command run server-side *(2.0)* | `🔧 **Erik (765…)** (owner) ran server command \`skiptime 1800\`` |
 | Cheat-flagged items reported *(2.0)* | `🧪 **Erik (765…)** is carrying **3** cheat-flagged item(s): SwordIron, Wood x64` |
 | Debug fly detected *(2.0)* | `🕊️ Erik (765…) is using debug fly` (public channel) |

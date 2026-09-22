@@ -187,7 +187,12 @@ internal class ServerPlugin : MonoBehaviour
     };
 
     // File watchers (hot-reload)
-    private FileSystemWatcher _watchSettings, _watchAdmins, _watchOwners, _watchAllowed, _watchBans;
+    private FileSystemWatcher _watchSettings, _watchAdmins, _watchOwners, _watchAllowed, _watchBans,
+                              _watchRegistrations, _watchViolations;
+    // Last text we wrote to registrations.yaml / violations.yaml. The watchers compare
+    // the on-disk text against this so our own saves don't trigger a pointless reload
+    // (these two files are written on every strike / registration, unlike bans.yaml).
+    private string _lastWrittenRegistrations, _lastWrittenViolations;
     private readonly Dictionary<string, DateTime> _lastSeenWrite = new();
 
     // -------- Raid event tracking --------
@@ -2387,13 +2392,39 @@ internal class ServerPlugin : MonoBehaviour
     private void SaveRegistrations()
 	{
 		var doc = new RegistrationsDoc { registrations = _registrations };
-		File.WriteAllText(RegistrationsYaml, _yamlOut.Serialize(doc));
+		var text = _yamlOut.Serialize(doc);
+		_lastWrittenRegistrations = text;
+		File.WriteAllText(RegistrationsYaml, text);
 	}
 
     private void SaveViolations()
     {
         var doc = new ViolationsDoc { violations = _violations };
-        File.WriteAllText(ViolationsYaml, _yamlOut.Serialize(doc));
+        var text = _yamlOut.Serialize(doc);
+        _lastWrittenViolations = text;
+        File.WriteAllText(ViolationsYaml, text);
+    }
+
+    // Watcher callbacks for the two files ServerGuard itself writes. Skip the reload
+    // when the file still holds exactly what we last saved - the change event was our
+    // own write echoing back, and reloading would just race the next strike.
+    private void ReloadRegistrationsIfExternallyEdited()
+    {
+        if (FileMatches(RegistrationsYaml, _lastWrittenRegistrations)) return;
+        LoadRegistrations();
+    }
+
+    private void ReloadViolationsIfExternallyEdited()
+    {
+        if (FileMatches(ViolationsYaml, _lastWrittenViolations)) return;
+        LoadViolations();
+    }
+
+    private static bool FileMatches(string path, string expected)
+    {
+        if (expected == null) return false;
+        try { return string.Equals(File.ReadAllText(path), expected, StringComparison.Ordinal); }
+        catch { return false; }
     }
 
     private void SaveMetrics()
@@ -4672,8 +4703,8 @@ internal class ServerPlugin : MonoBehaviour
             // that have side effects (mutating commands) - skip read-only queries to
             // keep the channel readable.
             var firstToken = (command ?? "").TrimStart().Split(' ').FirstOrDefault()?.ToLowerInvariant() ?? "";
-            var mutating = firstToken == "reload" || firstToken == "pardon" || firstToken == "kick"
-                        || firstToken == "ban"    || firstToken == "unban";
+            var mutating = firstToken == "reload" || firstToken == "pardon" || firstToken == "unregister"
+                        || firstToken == "kick"   || firstToken == "ban"    || firstToken == "unban";
             if (mutating)
             {
                 PostAdminEvent($":hammer_and_wrench: **{FormatPlayer(senderSteamId)}** ran `sg {command}`");
@@ -4720,6 +4751,7 @@ internal class ServerPlugin : MonoBehaviour
             case "whois":      return CmdWhois(args);
             case "violations": return CmdViolations(args);
             case "pardon":     return CmdPardon(args);
+            case "unregister": return CmdUnregister(args);
             case "kick":       return CmdKick(args, callerSteamId);
             case "ban":        return CmdBan(args, callerSteamId);
             case "unban":      return CmdUnban(args);
@@ -4738,11 +4770,12 @@ internal class ServerPlugin : MonoBehaviour
         sb.AppendLine("[ServerGuard] commands (type in the F5 console):");
         sb.AppendLine("  sg status                                - quick health check");
         sb.AppendLine("  sg selftest                              - run the boot-time smoke tests on demand");
-        sb.AppendLine("  sg reload                                - reload settings/admins/allowed_mods");
+        sb.AppendLine("  sg reload                                - reload every conf/*.yaml from disk");
         sb.AppendLine("  sg modset                                - show modset fingerprint");
         sb.AppendLine("  sg whois <steamid|name>                  - player info + recent violations");
         sb.AppendLine("  sg violations [<n>]                      - top N players by violation count");
         sb.AppendLine("  sg pardon <steamid>                      - clear a player's violations");
+        sb.AppendLine("  sg unregister <steamid> [character]      - forget a registered character (or all of them)");
         sb.AppendLine("  sg kick <steamid> [reason]               - kick a player");
         sb.AppendLine("  sg ban <steamid> [for <N>d|h] [reason]   - ban a SteamID (blocked at connect)");
         sb.AppendLine("  sg unban <steamid>                       - lift a ServerGuard ban");
@@ -4814,7 +4847,9 @@ internal class ServerPlugin : MonoBehaviour
             LoadAdmins();
             LoadBans();
             LoadAllowedMods();
-            return "[ServerGuard] reloaded settings.yaml, owners.yaml, moderators.yaml, bans.yaml, allowed_mods.yaml.";
+            LoadRegistrations();
+            LoadViolations();
+            return "[ServerGuard] reloaded settings.yaml, owners.yaml, moderators.yaml, bans.yaml, allowed_mods.yaml, registrations.yaml, violations.yaml.";
         }
         catch (Exception ex)
         {
@@ -4955,6 +4990,46 @@ internal class ServerPlugin : MonoBehaviour
         _violations.Remove(steamId);
         SaveViolations();
         return $"Cleared {total} violation entries for {FormatPlayer(steamId)}.";
+    }
+
+    // sg unregister <steamid|name> [character]
+    // Drops one registered character name (or every name when none is given) so the
+    // player can register fresh ones. Pair with `sg pardon` + `sg unban` to fully
+    // reset someone who tripped CharacterNameLimitExceeded.
+    private string CmdUnregister(string[] args)
+    {
+        if (args.Length == 0) return "Usage: sg unregister <steamid> [character]";
+        var resolved = ResolvePlayerQuery(args[0]);
+        if (resolved.Count == 0) return $"No SteamID matched `{args[0]}`.";
+        if (resolved.Count > 1) return $"Ambiguous - {resolved.Count} players match. Pass an exact SteamID.";
+
+        var steamId = resolved[0];
+        if (!_registrations.TryGetValue(steamId, out var names) || names == null || names.Count == 0)
+        {
+            return $"{FormatPlayer(steamId)} has no registered characters.";
+        }
+
+        if (args.Length == 1)
+        {
+            var removed = string.Join(", ", names);
+            _registrations.Remove(steamId);
+            SaveRegistrations();
+            return $"Forgot {names.Count} character(s) for {FormatPlayer(steamId)}: {removed}.";
+        }
+
+        var charName = string.Join(" ", args.Skip(1)).Trim();
+        var idx = names.FindIndex(n => string.Equals(n, charName, StringComparison.OrdinalIgnoreCase));
+        if (idx < 0)
+        {
+            return $"{FormatPlayer(steamId)} has no character named '{charName}'. Registered: {string.Join(", ", names)}.";
+        }
+
+        var actual = names[idx];
+        names.RemoveAt(idx);
+        if (names.Count == 0) _registrations.Remove(steamId);
+        SaveRegistrations();
+        int limit = Math.Max(1, _settings.CharacterLimit);
+        return $"Forgot character '{actual}' for {FormatPlayer(steamId)} ({names.Count}/{limit} slots used).";
     }
 
     private string CmdKick(string[] args, string callerSteamId)
@@ -5754,6 +5829,8 @@ internal class ServerPlugin : MonoBehaviour
         _watchOwners   = MakeWatcher(OwnersYaml,       () => LoadOwners());
         _watchAllowed  = MakeWatcher(AllowedModsYaml,  () => LoadAllowedMods());
         _watchBans     = MakeWatcher(BansYaml,         () => LoadBans());
+        _watchRegistrations = MakeWatcher(RegistrationsYaml, ReloadRegistrationsIfExternallyEdited);
+        _watchViolations    = MakeWatcher(ViolationsYaml,    ReloadViolationsIfExternallyEdited);
     }
 
     private void StopWatchers()
@@ -5763,6 +5840,8 @@ internal class ServerPlugin : MonoBehaviour
         try { _watchOwners?.Dispose(); } catch { }
         try { _watchAllowed?.Dispose(); } catch { }
         try { _watchBans?.Dispose(); } catch { }
+        try { _watchRegistrations?.Dispose(); } catch { }
+        try { _watchViolations?.Dispose(); } catch { }
     }
 
     private FileSystemWatcher MakeWatcher(string filePath, Action reloadAction)

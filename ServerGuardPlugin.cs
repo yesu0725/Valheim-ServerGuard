@@ -28,7 +28,7 @@ namespace ValheimServerGuard
     {
         public const string GUID    = "com.taeguk.valheim.serverguard";
         public const string NAME    = "Valheim ServerGuard";
-        public const string VERSION = "2.0.1";
+        public const string VERSION = "2.0.2";
 
         // Pre-2.0 GUID of the separate client companion package. Still recognised by
         // the server's allowed_mods.yaml parser so existing `required_mods:` entries keep

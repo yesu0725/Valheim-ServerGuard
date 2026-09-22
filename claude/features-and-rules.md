@@ -266,3 +266,5 @@ Event fires
 ```
 
 Pardon: `sg pardon <steamid>` — removes all violations for that SteamID from `_violations` and `violations.yaml`.
+
+Unregister: `sg unregister <steamid> [character]` — removes one (or every) registered character name from `_registrations` and `registrations.yaml`. Needed to fully reset a `CharacterNameLimitExceeded` offender: `sg unban` only lifts the ban, and the in-memory registrations would otherwise strike them again on the next login. Both files are also hot-reloaded (2.0.2), so hand-edits on a running server are picked up too — before 2.0.2 they were read once at boot and the next save overwrote any edit.

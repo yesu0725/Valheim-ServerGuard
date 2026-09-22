@@ -32,7 +32,7 @@ You'll get back a list of every available command.
 | `sg help` | Print this command list. |
 | `sg status` | Quick health check — enforcement state, allowlist counts, modset fingerprint, peer count, violators on file. |
 | `sg selftest` | Re-run the boot smoke tests. |
-| `sg reload` | Reload `settings.yaml`, `moderators.yaml`, `allowed_mods.yaml` immediately. |
+| `sg reload` | Re-read every `conf/*.yaml` from disk: `settings`, `owners`, `moderators`, `bans`, `allowed_mods`, `registrations`, `violations`. |
 | `sg modset` | Print the full + short modset fingerprints for sharing. |
 
 ### Players
@@ -42,6 +42,7 @@ You'll get back a list of every available command.
 | `sg whois <steamid\|name>` | Show player info: registered character names, online status, admin status, per-rule violations. Accepts SteamID literal or character-name substring. |
 | `sg violations [<n>]` | Top N players by violation count (default 10). |
 | `sg pardon <steamid>` | Clear a player's recorded violation strikes. |
+| `sg unregister <steamid> [character]` | Forget one registered character name, or all of them when no name is given, so the player can register fresh ones. |
 | `sg kick <steamid> [reason]` | Kick a connected player. The reason is shown to them on the disconnect screen. |
 
 ### Bans

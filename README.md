@@ -6,6 +6,11 @@ It works because the same mod runs on every player's game and tells the server e
 
 Beyond the mod allowlist, it also includes anti-cheat gates, dev commands for staff, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
 
+### New in 2.0.2
+
+- **`sg unregister <steamid> [character]`** forgets one registered character name, or all of them, so a player can register fresh ones. Previously the only way to reset someone who had hit `characterLimit` was to stop the server and edit `registrations.yaml`.
+- **`registrations.yaml` and `violations.yaml` now hot-reload**, like the other `conf/*.yaml` files. Before, both were read once at boot and the next strike or registration silently overwrote any edit you made while the server was running — which is why `sg unban` alone appeared not to work for players over the character limit: their names and strikes were still in memory and the next login struck them again. `sg reload` now re-reads these two files as well.
+
 ### New in 2.0.1
 
 - **Cheat-check bypass key.** The console command `yesiuseddevcommandsbutiwantmyachievementsanyway` sets a key on the character after which Valheim marks *nothing* that character does as cheated — items spawned in single-player then arrive unmarked, and cheat-taint detection cannot see them. ServerGuard reports the key once per session (`cheatTaintBypassPolicy: log`, the default); set it to `kick` and the player is disconnected with a message explaining why, until they log in with a character that has never run the command. No strike, nothing written to the character, owners exempt.
@@ -343,5 +348,5 @@ See [BUILD.md](BUILD.md) for instructions. The single DLL builds from `dotnet bu
 
 ---
 
-**Version:** 2.0.1
+**Version:** 2.0.2
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

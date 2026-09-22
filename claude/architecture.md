@@ -193,8 +193,8 @@ BepInEx/config/ServerGuard/
 │   ├── owners.yaml                 ← OWNER SteamIDs — exempt from every rule (hot-reload)
 │   ├── bans.yaml                   ← SteamID denylist (hot-reload)
 │   ├── allowed_mods.yaml           ← mod allowlist (hot-reload)
-│   ├── registrations.yaml          ← SteamID → char name map (auto-saved)
-│   ├── violations.yaml             ← per-player violation counts (auto-saved)
+│   ├── registrations.yaml          ← SteamID → char name map (auto-saved, hot-reload)
+│   ├── violations.yaml             ← per-player violation counts (auto-saved, hot-reload)
 │   ├── metrics.yaml                ← detection counters (auto-saved)
 │   └── modset_fingerprint.txt      ← computed on every allowed_mods reload
 └── build_log/

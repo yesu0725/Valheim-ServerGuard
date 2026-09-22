@@ -60,6 +60,7 @@ A SteamID tried to register more distinct character names than `characterLimit` 
 
 - **Default:** Counted.
 - **Setting:** `characterLimit: 1` (raise for free-character servers).
+- **Resetting a player:** the registered names live in `registrations.yaml` and the strikes in `violations.yaml`, and both are kept in memory while the server runs. To let someone start over, run `sg unregister <steamid>` (or `sg unregister <steamid> <character>` for one name), `sg pardon <steamid>`, and `sg unban <steamid>` if they were auto-banned. Hand-editing the two files also works — they are hot-reloaded — but `sg unban` alone is not enough: the next login still counts as a strike against the old names.
 
 ### DevcommandAttempt
 
