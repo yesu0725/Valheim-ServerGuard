@@ -113,6 +113,14 @@ still marked**. ServerGuard reads all of this.
   records a strike. The character's permanent "used dev commands" mark and the
   `bypasscheatchecks` key (which switches the game's marking off) are each reported once
   per session.
+- **Bypass key** — the console command `yesiuseddevcommandsbutiwantmyachievementsanyway`
+  sets the `bypasscheatchecks` key on the character, after which the game marks
+  *nothing* that character does — so items spawned in single-player arrive unmarked and
+  every rule above is blind for them. `cheatTaintBypassPolicy` decides what to do:
+  `log` (default) posts to the admin channel once per session; `kick` also disconnects
+  the player with a message explaining why. The key is saved in the character file, so a
+  kicked player is refused until they log in with a character that has never run the
+  command. Nothing is written to the character and no strike is recorded.
 - **CheatedBuild** — a placed piece was marked. The client says so in its build report,
   the build log gets a `cheated` column, and the server checks the piece itself in the
   world a few seconds later so a lying client is contradicted by the world state.

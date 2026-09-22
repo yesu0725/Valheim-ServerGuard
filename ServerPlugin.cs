@@ -439,7 +439,17 @@ internal class ServerPlugin : MonoBehaviour
         // CheatedBuild and DebugFly always go through AddViolation, so countAsViolation
         // decides whether they are informational or strikes.
         //
-        // Owners are exempt from all three. Moderators are NOT exempt by default - they
+        // cheatTaintBypassPolicy: what to do with a character carrying the
+        // `bypasscheatchecks` unique key (set by the console command
+        // `yesiuseddevcommandsbutiwantmyachievementsanyway`). With the key set, the game
+        // stops marking ANYTHING that character does as cheated - items spawned in
+        // single-player arrive unflagged - so every rule above is blind for them.
+        //   "log"  - admin-channel post once per session (DEFAULT)
+        //   "kick" - as log, and the player is disconnected. The key lives in the
+        //            character file, so they are refused until they use a character
+        //            without it. Nothing is written to the character; no strike.
+        //
+        // Owners are exempt from all of it. Moderators are NOT exempt by default - they
         // can never be granted spawn/nocost/fly/debugmode (ModeratorReservedCommands),
         // so a flagged moderator is always worth a look.
         //
@@ -448,6 +458,7 @@ internal class ServerPlugin : MonoBehaviour
         // modpack has such weapons, list them here rather than turning the feature off.
         public bool   EnableCheatTaintDetection  { get; set; } = true;
         public string CheatTaintPolicy           { get; set; } = "log";
+        public string CheatTaintBypassPolicy     { get; set; } = "log";
         public bool   CheatTaintExemptModerators { get; set; } = false;
         public bool   CheatTaintFlagUsedCheats   { get; set; } = true;   // also report the character's permanent "used cheats" mark
         public List<string> CheatTaintIgnoredItems { get; set; } = new List<string>();
@@ -690,6 +701,7 @@ internal class ServerPlugin : MonoBehaviour
         public long cheat_taint_reports   { get; set; } = 0;   // 2.0: CheatedItem reports with a changed item set
         public long cheat_taint_builds    { get; set; } = 0;   // 2.0: CheatedBuild confirmations
         public long debug_fly_detections  { get; set; } = 0;   // 2.0: DebugFly flags
+        public long cheat_taint_bypass_kicks { get; set; } = 0; // 2.0: cheatTaintBypassPolicy=kick disconnects
         public long total_players_checked { get; set; } = 0;
         public long total_mods_detected { get; set; } = 0;
         public long phase1_rpc_detections { get; set; } = 0;
@@ -1242,6 +1254,12 @@ internal class ServerPlugin : MonoBehaviour
             sb.AppendLine("#   cheatTaintPolicy        - 'log' (default) admin-channel post only;");
             sb.AppendLine("#                             'strip' also removes the flagged items from the player;");
             sb.AppendLine("#                             'violation' also records a CheatedItem strike.");
+            sb.AppendLine("#   cheatTaintBypassPolicy  - a character carrying the 'bypasscheatchecks' key (from the");
+            sb.AppendLine("#                             console command yesiuseddevcommandsbutiwantmyachievementsanyway)");
+            sb.AppendLine("#                             is never marked by the game again, so the rules above cannot");
+            sb.AppendLine("#                             see it. 'log' (default) admin-channel post once per session;");
+            sb.AppendLine("#                             'kick' also disconnects them - the key is in the character");
+            sb.AppendLine("#                             file, so they are refused until they switch character.");
             sb.AppendLine("#   cheatTaintExemptModerators - false (default): moderators are reported too.");
             sb.AppendLine("#   cheatTaintFlagUsedCheats - also report characters carrying the permanent 'used");
             sb.AppendLine("#                             dev commands' mark (once per session).");
@@ -4763,7 +4781,7 @@ internal class ServerPlugin : MonoBehaviour
         sb.AppendLine($"  Staff      {_owners.Count} owner(s)  {_admins.Count} moderator(s)");
         sb.AppendLine($"  DevCmds    owners={(_settings.EnableOwnerDevcommands ? "ALL" : "off")}  "
                       + $"moderators={(_settings.EnableModeratorDevcommands ? ModeratorDevcommandSet().Count + " command(s)" : "off")}");
-        sb.AppendLine($"  CheatTaint {(_settings.EnableCheatTaintDetection ? "ON policy=" + NormalizedCheatTaintPolicy() : "off")}"
+        sb.AppendLine($"  CheatTaint {(_settings.EnableCheatTaintDetection ? "ON policy=" + NormalizedCheatTaintPolicy() + " bypass=" + NormalizedCheatTaintBypassPolicy() : "off")}"
                       + $"  debugFly={(_settings.EnableDebugFlyCheck ? "ON" : "off")}"
                       + (_settings.CheatTaintExemptModerators ? "  (moderators exempt)" : ""));
         return sb.ToString().TrimEnd();
@@ -5832,11 +5850,18 @@ internal class ServerPlugin : MonoBehaviour
     //   TickDebugFly           - DebugFly (player ZDO, server-observed)
 
     private static readonly string[] VALID_TAINT_POLICIES = { "log", "strip", "violation" };
+    private static readonly string[] VALID_TAINT_BYPASS_POLICIES = { "log", "kick" };
 
     private string NormalizedCheatTaintPolicy()
     {
         var p = (_settings?.CheatTaintPolicy ?? "log").Trim().ToLowerInvariant();
         return VALID_TAINT_POLICIES.Contains(p) ? p : "log";
+    }
+
+    private string NormalizedCheatTaintBypassPolicy()
+    {
+        var p = (_settings?.CheatTaintBypassPolicy ?? "log").Trim().ToLowerInvariant();
+        return VALID_TAINT_BYPASS_POLICIES.Contains(p) ? p : "log";
     }
 
     private HashSet<string> CheatTaintIgnoredSet()
@@ -5917,12 +5942,31 @@ internal class ServerPlugin : MonoBehaviour
             var roleTag = role == "player" ? "" : $" ({role})";
 
             // The bypass key means every flagging site in the game is switched off for
-            // this character - the rest of this report is blind. Say so, once.
-            if (bypass && !st.BypassReported)
+            // this character - the rest of this report is blind. Say so, once - or, under
+            // cheatTaintBypassPolicy=kick, remove them. The kick is not gated on
+            // BypassReported: the disconnect clears this peer's state, and a reconnect
+            // with the same character must be refused again.
+            if (bypass)
             {
-                st.BypassReported = true;
-                LogS.LogWarning($"[ServerGuard] {who} carries the bypasscheatchecks key - the game will not mark cheats for this character.");
-                PostAdminEvent($":warning: **{who}**{roleTag} has the `bypasscheatchecks` key set — Valheim will not mark anything this character does as cheated");
+                var bypassPolicy = NormalizedCheatTaintBypassPolicy();
+                if (bypassPolicy == "kick")
+                {
+                    LogS.LogWarning($"[ServerGuard] {who} carries the bypasscheatchecks key - disconnecting (cheatTaintBypassPolicy=kick).");
+                    if (!st.BypassReported)
+                    {
+                        st.BypassReported = true;
+                        PostAdminEvent($":no_entry_sign: **{who}**{roleTag} has the `bypasscheatchecks` key set — Valheim will not mark anything this character does as cheated. Kicked (`cheatTaintBypassPolicy: kick`); they need a character without the key.");
+                    }
+                    if (_settings.EnableMetrics) { _metrics.cheat_taint_bypass_kicks++; SaveMetrics(); }
+                    TryKick(peer, $"{_settings.KickMessage} (This character has the bypasscheatchecks key set - use a character that has not run yesiuseddevcommandsbutiwantmyachievementsanyway)");
+                    return;
+                }
+                if (!st.BypassReported)
+                {
+                    st.BypassReported = true;
+                    LogS.LogWarning($"[ServerGuard] {who} carries the bypasscheatchecks key - the game will not mark cheats for this character.");
+                    PostAdminEvent($":warning: **{who}**{roleTag} has the `bypasscheatchecks` key set — Valheim will not mark anything this character does as cheated");
+                }
             }
 
             if (usedCheats && _settings.CheatTaintFlagUsedCheats && !st.UsedCheatsReported)

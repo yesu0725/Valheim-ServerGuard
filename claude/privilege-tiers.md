@@ -63,7 +63,7 @@ short-circuits:
 | Site | Behaviour for an owner |
 |---|---|
 | `AddViolation` | Returns immediately. No strike, no Discord post, no auto-ban progress. **This is the choke point every rule funnels through**, which is what makes "exempt from every rule" true by construction rather than by enumeration. |
-| `TryKick` | Refuses. Covers `sg kick`, the attestation timeout, the character-limit kick, policy failures, and the ban sweep. |
+| `TryKick` | Refuses. Covers `sg kick`, the attestation timeout, the character-limit kick, policy failures, the ban sweep, and the `cheatTaintBypassPolicy: kick` disconnect. |
 | `IsBannedId` | Returns false before the list lookup — a hand-edited `bans.yaml`, or an auto-ban written before the ID was promoted, cannot lock the owner out. |
 | `AddBan` | Refuses to write the entry at all, so the file stays honest. |
 | `CmdBan` | Explicit "is an owner and cannot be banned" reply. |

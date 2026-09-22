@@ -209,6 +209,7 @@ explanation on **[Privilege Tiers](Privilege-Tiers)**.
 |---|---|---|
 | `enableCheatTaintDetection` | `true` | Report items and builds the game itself marked as cheat-made. |
 | `cheatTaintPolicy` | `log` | `log` posts to the admin channel; `strip` also removes the items from the player; `violation` also records a `CheatedItem` strike. |
+| `cheatTaintBypassPolicy` | `log` | What to do with a character carrying the `bypasscheatchecks` key (set by `yesiuseddevcommandsbutiwantmyachievementsanyway`) — the game then marks nothing that character does, so cheat-taint detection cannot see it. `log` posts to the admin channel once per session; `kick` also disconnects the player. The key lives in the character file, so they are refused until they use a character without it. No strike. |
 | `cheatTaintExemptModerators` | `false` | Moderators are reported too unless this is on. Owners are always exempt. |
 | `cheatTaintFlagUsedCheats` | `true` | Also report (once per session) characters carrying the game's permanent "used dev commands" mark. |
 | `cheatTaintIgnoredItems` | `[]` | Prefab names to ignore. Valheim auto-flags any item over 10000 total damage — list modded weapons here. |

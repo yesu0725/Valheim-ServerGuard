@@ -201,6 +201,7 @@ Full detail — including the per-command risk assessment — in `claude/console
 |---|---|---|---|
 | `EnableCheatTaintDetection` | `enableCheatTaintDetection` | bool | `true` |
 | `CheatTaintPolicy` | `cheatTaintPolicy` | string | `"log"` (`log` / `strip` / `violation`) |
+| `CheatTaintBypassPolicy` | `cheatTaintBypassPolicy` | string | `"log"` (`log` / `kick`) |
 | `CheatTaintExemptModerators` | `cheatTaintExemptModerators` | bool | `false` |
 | `CheatTaintFlagUsedCheats` | `cheatTaintFlagUsedCheats` | bool | `true` |
 | `CheatTaintIgnoredItems` | `cheatTaintIgnoredItems` | `List<string>` | `[]` |
@@ -212,6 +213,15 @@ rules it feeds (`CheatedItem`, `CheatedBuild`, `DebugFly`) all default to
 taint family*. `cheatTaintIgnoredItems` exists because Valheim auto-flags any item with
 more than 10000 total damage — list modded weapons there instead of disabling the
 feature.
+
+`cheatTaintBypassPolicy` (normalised by `NormalizedCheatTaintBypassPolicy`, unknown →
+`log`) governs a character carrying the `bypasscheatchecks` unique key — the game then
+marks nothing that character does, so all three rules are blind for it. `log` posts once
+per session; `kick` also calls `TryKick` on every report that carries the flag (the
+disconnect clears the peer's dedup state, so a reconnect with the same character is
+refused again). Not a rule: no `AddViolation`, no strike. Owners are exempt via
+`CheatTaintExempt` and `TryKick` both; moderators only via `cheatTaintExemptModerators`.
+Metric: `cheat_taint_bypass_kicks`.
 
 ---
 

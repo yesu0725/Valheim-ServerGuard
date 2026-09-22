@@ -175,9 +175,10 @@ honest game used dishonestly (single-player spawns brought over, staff hand-outs
 server cheats) and sits behind attestation like every other client-reported rule.
 
 **CheatedItem**
-- **Settings:** `enableCheatTaintDetection` (true), `cheatTaintPolicy` (`log` | `strip` | `violation`, default `log`), `cheatTaintIgnoredItems` ([]), `cheatTaintFlagUsedCheats` (true), `cheatTaintExemptModerators` (false)
+- **Settings:** `enableCheatTaintDetection` (true), `cheatTaintPolicy` (`log` | `strip` | `violation`, default `log`), `cheatTaintBypassPolicy` (`log` | `kick`, default `log`), `cheatTaintIgnoredItems` ([]), `cheatTaintFlagUsedCheats` (true), `cheatTaintExemptModerators` (false)
 - **Trigger:** `ServerGuard_CheatState` from the client: `usedCheats|bypass|count|prefab:stack,...`. Sent 15 s after spawn, then within 10 s of the flagged set changing and at least every 60 s.
 - **Server:** `OnCheatStateReceived`. Drops ignored prefabs, dedups per peer on the sorted item signature (`_cheatTaintState`). `log` → admin post on change; `strip` → admin post + `ServerGuard_StripCheated` (re-sent on every report while anything remains); `violation` → strip + `AddViolation`. The `bypasscheatchecks` key and `m_usedCheats` are each posted once per session. Owners exempt; moderators only via the setting.
+- **Bypass key:** `cheatTaintBypassPolicy`. The `bypasscheatchecks` unique key (from `yesiuseddevcommandsbutiwantmyachievementsanyway`) switches every vanilla flagging site off for that character, so the whole family is blind to it — including gear spawned in single-player and carried over. `log` (default) posts `:warning:` once per session. `kick` posts `:no_entry_sign:` once, then `TryKick`s on **every** report carrying the flag and returns before the item logic — the key is in the character file, so the player is refused until they switch character. Not a violation; nothing is written to the character. Metric `cheat_taint_bypass_kicks`.
 - **countAsViolation default:** `false`
 
 **CheatedBuild**
@@ -193,7 +194,7 @@ server cheats) and sits behind attestation like every other client-reported rule
 - **Output:** public `:dove:` player event + `AddViolation(RULE_DEBUG_FLY)`.
 - **countAsViolation default:** `false`
 
-Metrics: `cheat_taint_reports`, `cheat_taint_builds`, `debug_fly_detections`.
+Metrics: `cheat_taint_reports`, `cheat_taint_builds`, `debug_fly_detections`, `cheat_taint_bypass_kicks`.
 
 ---
 
