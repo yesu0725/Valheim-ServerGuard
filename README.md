@@ -6,12 +6,16 @@ It works because the same mod runs on every player's game and tells the server e
 
 Beyond the mod allowlist, it also includes anti-cheat gates, dev commands for staff, in-game `sg` admin commands, two-channel Discord logging, and build/death forensics.
 
+### New in 2.0.1
+
+- **Cheat-check bypass key.** The console command `yesiuseddevcommandsbutiwantmyachievementsanyway` sets a key on the character after which Valheim marks *nothing* that character does as cheated — items spawned in single-player then arrive unmarked, and cheat-taint detection cannot see them. ServerGuard reports the key once per session (`cheatTaintBypassPolicy: log`, the default); set it to `kick` and the player is disconnected with a message explaining why, until they log in with a character that has never run the command. No strike, nothing written to the character, owners exempt.
+
 ### New in 2.0.0
 
 - **One mod instead of two.** The server plugin and the client companion are now a single `Valheim-ServerGuard.dll`. Install the same file on the dedicated server and on every player's game; it works out which side it is on when it loads (a headless dedicated server runs the server half, a normal game runs the client half). The separate `Valheim_ServerGuard_Client` package is retired — uninstall it from your profiles, it must not run next to 2.0.
   - Existing servers keep working: an `allowed_mods.yaml` that still lists the old `com.taeguk.valheim.serverguard.client` GUID under `required_mods` is read as the new `com.taeguk.valheim.serverguard` GUID (with a log line asking you to update it). If you had the old client DLL hash-pinned, re-pin against the 2.0 DLL.
   - Config files are unchanged: `BepInEx/config/ServerGuard/conf/*.yaml` on the server, `BepInEx/config/ServerGuard/client.yaml` on each player.
-- **Cheat-taint detection.** Valheim 1.0 quietly marks everything that came out of a cheat — `spawn`ed items, anything crafted from them, pieces built with `nocost`, creatures hit while in god/fly mode — and saves the mark in the character file. ServerGuard now reads it: players carrying flagged items are reported to the admin channel (`cheatTaintPolicy: log` by default; `strip` removes them, `violation` also records a strike), cheat-flagged builds are recorded in the build log and confirmed against the world state by the server, and debug-fly is detected server-side. Gear spawned in single-player and brought over is caught on arrival. Three new rules — `CheatedItem`, `CheatedBuild`, `DebugFly` — all informational until you turn them on in `countAsViolation`. Every player sees a one-time notice on their first login after launching the game explaining that detection is on and what the consequence is. One console command, `yesiuseddevcommandsbutiwantmyachievementsanyway`, switches the game's marking off for that character for good — `cheatTaintBypassPolicy` decides whether such a character is just reported (`log`) or refused entry (`kick`) until they switch to a clean one.
+- **Cheat-taint detection.** Valheim 1.0 quietly marks everything that came out of a cheat — `spawn`ed items, anything crafted from them, pieces built with `nocost`, creatures hit while in god/fly mode — and saves the mark in the character file. ServerGuard now reads it: players carrying flagged items are reported to the admin channel (`cheatTaintPolicy: log` by default; `strip` removes them, `violation` also records a strike), cheat-flagged builds are recorded in the build log and confirmed against the world state by the server, and debug-fly is detected server-side. Gear spawned in single-player and brought over is caught on arrival. Three new rules — `CheatedItem`, `CheatedBuild`, `DebugFly` — all informational until you turn them on in `countAsViolation`. Every player sees a one-time notice on their first login after launching the game explaining that detection is on and what the consequence is.
 - **Speed check default** raised from 15 to 70 m/s — the old default flagged modded mounts; 70 only catches teleport-style movement.
 - **Dev commands for staff.** Valheim refuses every cheat command on a dedicated-server client, whoever types it. ServerGuard now lifts that for your staff:
   - **Owners** (`owners.yaml`) get **every** dev command, exactly as in single-player — `devcommands`, then `fly`, `god`, `spawn`, `goto`, `skiptime`, `setworldmodifier`, and so on. Owners are also treated as vanilla admins by the server, so nothing needs to be added to `adminlist.txt`.
@@ -339,5 +343,5 @@ See [BUILD.md](BUILD.md) for instructions. The single DLL builds from `dotnet bu
 
 ---
 
-**Version:** 2.0.0
+**Version:** 2.0.1
 **Repository:** https://github.com/yesu0725/Valheim-ServerGuard

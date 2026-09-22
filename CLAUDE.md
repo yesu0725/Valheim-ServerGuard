@@ -9,7 +9,7 @@ Read this first, then follow links to sub-files for deep detail.
 
 | Item | Value |
 |---|---|
-| **Current version** | 2.0.0 |
+| **Current version** | 2.0.1 |
 | **GUID** | `com.taeguk.valheim.serverguard` (one plugin, one DLL, both sides — since 2.0) |
 | **Legacy client GUID** | `com.taeguk.valheim.serverguard.client` (pre-2.0 companion package; still accepted in `allowed_mods.yaml`) |
 | **Target framework** | net462 (Mono, .NET Framework 4.6.2) |

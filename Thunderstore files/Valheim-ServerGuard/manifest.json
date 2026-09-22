@@ -1,7 +1,7 @@
 {
   "name": "Valheim_ServerGuard",
   "description": "Anti-cheat, mod allowlist, staff dev commands and admin tools for Valheim. One mod for both server and client: locks players to your modpack, gives owners/moderators dev commands, Discord logging, raid alerts, build forensics.",
-  "version_number": "2.0.0",
+  "version_number": "2.0.1",
   "website_url": "https://github.com/yesu0725/Valheim-ServerGuard",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2333",

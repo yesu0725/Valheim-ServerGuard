@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.1
+
+### New
+- **Cheat-check bypass key.** The console command `yesiuseddevcommandsbutiwantmyachievementsanyway` sets a key on the character after which Valheim marks *nothing* that character does as cheated — items spawned in single-player then arrive on your server unmarked, and cheat-taint detection cannot see them. ServerGuard already reported the key once per session; a new setting, `cheatTaintBypassPolicy`, decides what happens next: `log` (the default) keeps the admin-channel post, `kick` also disconnects the player with a message explaining why, until they log in with a character that has never run the command. No strike, nothing is written to their character, owners are exempt. The setting is appended to an existing `settings.yaml` on first boot, with comments; `sg status` shows it on the `CheatTaint` line.
+
 ## 2.0.0
 
 **One mod for both sides, and dev commands for your staff.** This is a breaking packaging change — read the upgrade note.
@@ -19,7 +24,6 @@
 - **Map coordinates for staff.** Owners and moderators see the world X/Z under the cursor on the large map, next to the biome name.
 - **Speed check default** raised from 15 to 70 m/s. The old default flagged modded mounts and skills; 70 only catches teleport-style movement. Existing servers keep whatever they have set.
 - **Cheat-taint detection.** Valheim 1.0 marks everything that came out of a cheat — `spawn`ed items, anything crafted from them, pieces built with `nocost`, creatures hit while in god/fly mode — and keeps the mark in the character file, so it survives a trip through single-player. ServerGuard now uses it: players carrying flagged items are reported to your admin channel (`cheatTaintPolicy: log`, the default), or have them removed (`strip`), or get a strike as well (`violation`). Cheat-flagged builds go into the build log with a new `cheated` column and are double-checked by the server against the piece itself. Debug fly is detected server-side. Owners are exempt; moderators are reported unless you say otherwise. Everything is informational by default — three new rules, `CheatedItem`, `CheatedBuild` and `DebugFly`, all start with `countAsViolation: false`. If your modpack has weapons over 10000 damage, add them to `cheatTaintIgnoredItems` (the game auto-flags those).
-- **Cheat-check bypass key.** The console command `yesiuseddevcommandsbutiwantmyachievementsanyway` sets a key on the character after which Valheim marks *nothing* that character does as cheated — items spawned in single-player then arrive on your server unmarked, and cheat-taint detection cannot see them. ServerGuard reports the key once per session (`cheatTaintBypassPolicy: log`, the default); set it to `kick` and the player is disconnected with a message explaining why, until they log in with a character that has never run the command. No strike, and nothing is written to their character.
 - Every dev command that runs on the server (`skiptime`, `sleep`, `randomevent`, world modifiers, ...) is logged with who ran it and posted to the admin channel. Staff see a short `[ServerGuard]` acknowledgement in their console; on connecting they get one line telling them what they have been granted.
 - All three settings hot-reload, and so do `owners.yaml` / `moderators.yaml`, so promoting or demoting someone takes effect while they are online.
 - `sg status` shows a `DevCmds` line. The new settings are appended to an existing `settings.yaml` on first boot, with comments.

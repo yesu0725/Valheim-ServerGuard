@@ -47,6 +47,6 @@ This mod is **free to use as is**. Voluntary support is appreciated.
 
 ---
 
-**Version:** 2.0.0
+**Version:** 2.0.1
 **Source / issues / wiki:** https://github.com/yesu0725/Valheim-ServerGuard
 **Required on every client:** this same mod. The old `Valheim_ServerGuard_Client` package is retired.

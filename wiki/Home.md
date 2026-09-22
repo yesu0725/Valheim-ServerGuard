@@ -28,7 +28,7 @@ A toolkit for running a curated-modpack server: keep the wrong people out, catch
 
 ## Versioning
 
-Current version: **2.0.0**. Since 2.0 there is one package for both sides, so keep the server and your modpack on the same version. Pre-2.0 servers and clients used two packages (`Valheim_ServerGuard` + `Valheim_ServerGuard_Client`); see [Installation](Installation) for the upgrade note.
+Current version: **2.0.1**. Since 2.0 there is one package for both sides, so keep the server and your modpack on the same version. Pre-2.0 servers and clients used two packages (`Valheim_ServerGuard` + `Valheim_ServerGuard_Client`); see [Installation](Installation) for the upgrade note.
 
 **Valheim 1.0:** ServerGuard is verified against Valheim 1.0.7 on BepInEx 5.4.23.5.
 
