@@ -1,0 +1,33 @@
+<!-- Unity-free tests for ServerGuard.
+
+     Compiles the SAME Shared/*.cs files the plugin does (linked, not copied) and runs
+     them on a plain .NET runtime, so no Valheim install is needed. Only files free of
+     Unity/BepInEx/Valheim types can be listed here.
+
+     How to run it is in BUILD.md ("Unity-free tests"). Exit code 0 = every test passed.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <RootNamespace>ValheimServerGuard.Tests</RootNamespace>
+    <!-- The plugin targets net462; the plugin build is what keeps these shared
+         files inside that surface. A green run here does not replace it. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="../../Shared/CustomsProtocol.cs" Link="Shared/CustomsProtocol.cs" />
+    <Compile Include="../../Shared/CustomsLedger.cs" Link="Shared/CustomsLedger.cs" />
+    <Compile Include="*.cs" />
+  </ItemGroup>
+
+</Project>

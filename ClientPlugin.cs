@@ -1666,6 +1666,15 @@ namespace ValheimServerGuard
                         catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] ConsolePolicy handler error: {ex.Message}"); }
                     });
 
+                    // Customs: a server running it asks for inventory declarations once
+                    // this client has attested. A fresh connection starts from nothing.
+                    ClientPlugin.Instance?.CustomsReset();
+                    peer.m_rpc.Register<string>(CustomsWire.RequestRpc, (rpc, payload) =>
+                    {
+                        try { ClientPlugin.Instance?.OnCustomsRequest(payload); }
+                        catch (Exception ex) { ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Customs request handler error: {ex.Message}"); }
+                    });
+
                     ClientPlugin.LogS.LogInfo("[ServerGuard.Client] Registered manifest request handler on server peer.");
                 }
                 catch (Exception ex)
@@ -2143,11 +2152,18 @@ namespace ValheimServerGuard
         [HarmonyPatch(typeof(ZNet), "Shutdown")]
         public static class Patch_ZNet_Shutdown_ResetPolicy
         {
+            // Customs departure report: it has to leave before the connection closes.
+            public static void Prefix()
+            {
+                ClientPlugin.Instance?.CustomsSendLogout();
+            }
+
             public static void Postfix()
             {
                 try
                 {
                     if (ClientPlugin.Instance != null) ClientPlugin.Instance._serverRpc = null;
+                    ClientPlugin.Instance?.CustomsReset();
                     ResetConsolePolicy();
                 }
                 catch (Exception ex)
@@ -2565,6 +2581,267 @@ namespace ValheimServerGuard
             catch (Exception ex)
             {
                 LogS?.LogWarning($"[ServerGuard.Client] OnStripCheatedReceived error: {ex.Message}");
+            }
+        }
+
+        // ====================== Customs: inventory declarations ======================
+        //
+        // A dedicated server cannot read this player's inventory, so a server running
+        // Customs asks this client to declare it (ServerGuard_CustomsRequest) and to keep
+        // the declaration current. The server judges the first declaration against the
+        // character's last trusted baseline; later reports keep that baseline current
+        // while the player is online. Every report is a full snapshot, never a diff, so a
+        // lost report costs nothing but a moment of staleness.
+        //
+        //   declare     answers a request. On arrival it is what the character brought
+        //               in, merged from two captures around the first Player.OnSpawned:
+        //                 - BEFORE it: the inventory as loaded from the character file.
+        //                   OnSpawned applies the character's inventory-row count and
+        //                   drops anything outside the grid into the world, where it
+        //                   could be picked up again later as an in-session "gain";
+        //                 - AFTER it (last postfix): whatever other mods moved into the
+        //                   inventory from their own OnSpawned patches. Work a mod
+        //                   defers to a later frame is not part of the arrival.
+        //   change      the inventory has differed from the last report for a while
+        //   checkpoint  every checkpoint interval regardless, so a crash loses little
+        //   logout      best effort, from the ZNet.Shutdown prefix, flushed at once
+        //
+        // What is read: Player.GetInventory().GetAllItems() - the whole grid, including
+        // equipped items and any extra rows. A mod that adds rows or slots to that same
+        // Inventory - the approach AzuExtendedPlayerInventory takes - is covered with no
+        // mod-specific code; that has not been verified against a live AzuEPI install.
+        // Not covered: items a mod keeps in a container of its own (such as the retired
+        // EquipmentAndQuickSlots mod installed by itself). A container ITEM (a backpack)
+        // is seen through its custom-data hash if the mod keeps the contents there.
+
+        private const float CustomsPollSeconds = 2f;
+
+        private string _customsNonce = "";          // "" = the server has not asked, or said stop
+        private long   _customsSequence;            // per connection; never reset while connected
+        private int    _customsCheckpointSeconds = 120;
+        private int    _customsDebounceSeconds   = 5;
+        private int    _customsMaxRecords        = CustomsLimits.DefaultRecords;
+        private bool   _customsAnswered;            // the current request has had its declaration
+        private bool   _customsArrivalSent;         // the spawn captures have been declared
+        private bool   _customsSpawnSeen;           // first spawn of this connection captured
+        private List<CustomsItem> _customsLoaded;   // before Player.OnSpawned
+        private List<CustomsItem> _customsSpawned;  // after it
+        private string _customsLastSignature = "";
+        private float  _customsLastSentAt;
+        private float  _customsPendingSince = -1f;
+        private bool   _customsSizeWarned;
+        private Coroutine _customsLoop;
+
+        // New connection, or the old one is gone: nothing carries over between servers.
+        internal void CustomsReset()
+        {
+            _customsNonce         = "";
+            _customsSequence      = 0;
+            _customsAnswered      = false;
+            _customsArrivalSent   = false;
+            _customsSpawnSeen     = false;
+            _customsLoaded        = null;
+            _customsSpawned       = null;
+            _customsLastSignature = "";
+            _customsLastSentAt    = 0f;
+            _customsPendingSince  = -1f;
+            _customsSizeWarned    = false;
+        }
+
+        internal void OnCustomsRequest(string payload)
+        {
+            CustomsWire.Request request;
+            if (!CustomsWire.TryParseRequest(payload, out request))
+            {
+                LogS?.LogWarning("[ServerGuard.Client] Customs: could not read the server's request - no declaration sent.");
+                return;
+            }
+            _customsCheckpointSeconds = request.CheckpointSeconds;
+            _customsDebounceSeconds   = request.DebounceSeconds;
+            _customsMaxRecords        = request.MaxRecords;
+
+            if (request.Stop)
+            {
+                if (_customsNonce.Length > 0) LogS?.LogInfo("[ServerGuard.Client] Customs: the server stopped asking for inventory declarations.");
+                _customsNonce = "";
+                return;
+            }
+            if (request.Nonce == _customsNonce) return;   // same request, new timing only
+
+            _customsNonce    = request.Nonce;
+            _customsAnswered = false;
+            LogS?.LogInfo($"[ServerGuard.Client] Customs: the server asked for inventory declarations "
+                + $"(checkpoint {_customsCheckpointSeconds}s, changes after {_customsDebounceSeconds}s).");
+            CustomsTryDeclare();
+            if (_customsLoop == null) _customsLoop = StartCoroutine(CustomsLoop());
+        }
+
+        private IEnumerator CustomsLoop()
+        {
+            while (_customsNonce.Length > 0 && IsActiveMultiplayerClient())
+            {
+                yield return new WaitForSeconds(CustomsPollSeconds);
+                try { CustomsTick(); }
+                catch (Exception ex) { LogS?.LogWarning($"[ServerGuard.Client] Customs tick error: {ex.Message}"); }
+            }
+            _customsLoop = null;
+        }
+
+        private void CustomsTick()
+        {
+            if (_customsNonce.Length == 0 || _serverRpc == null) return;
+            if (!_customsAnswered) { CustomsTryDeclare(); return; }
+
+            var items = CustomsCollect();
+            if (items == null) return;                       // no character right now (dead, loading)
+            var now = Time.realtimeSinceStartup;
+            if (CustomsItems.Signature(items) != _customsLastSignature)
+            {
+                // Throttled rather than sent per change: emptying a chest changes the
+                // inventory many times a second, and only the settled state matters.
+                if (_customsPendingSince < 0f) _customsPendingSince = now;
+                if (now - _customsPendingSince >= _customsDebounceSeconds) CustomsSend(CustomsReportKind.Change, items);
+                return;
+            }
+            _customsPendingSince = -1f;
+            if (now - _customsLastSentAt >= _customsCheckpointSeconds) CustomsSend(CustomsReportKind.Checkpoint, items);
+        }
+
+        // Answers the current request as soon as there is something to declare: the
+        // spawn captures if this connection's arrival has not been declared yet,
+        // otherwise (Customs switched on mid-session) the inventory as it is now.
+        private void CustomsTryDeclare()
+        {
+            if (_customsNonce.Length == 0 || _customsAnswered || _serverRpc == null) return;
+            bool arrival = !_customsArrivalSent && _customsSpawned != null;
+            var items = arrival ? CustomsItems.MaxMerge(_customsLoaded, _customsSpawned) : CustomsCollect();
+            if (items == null) return;                       // still loading: declared at spawn
+            if (!CustomsSend(CustomsReportKind.Declare, items)) return;
+
+            _customsAnswered = true;
+            if (arrival)
+            {
+                _customsArrivalSent = true;
+                _customsLoaded = null;
+                _customsSpawned = null;
+            }
+            LogS?.LogInfo($"[ServerGuard.Client] Customs: declared {CustomsItems.Total(items)} item(s) in {items.Count} stack(s).");
+        }
+
+        private bool CustomsSend(CustomsReportKind kind, List<CustomsItem> items)
+        {
+            if (_serverRpc == null || _customsNonce.Length == 0) return false;
+            var profile = Game.instance != null ? Game.instance.GetPlayerProfile() : null;
+            if (profile == null) return false;
+
+            if (items.Count > _customsMaxRecords && !_customsSizeWarned)
+            {
+                _customsSizeWarned = true;
+                LogS?.LogWarning($"[ServerGuard.Client] Customs: this inventory has {items.Count} distinct stacks but the server "
+                    + $"accepts {_customsMaxRecords} - ask the server admin to raise customsMaxItemRecords.");
+            }
+
+            var report = new CustomsReport
+            {
+                Nonce         = _customsNonce,
+                Sequence      = ++_customsSequence,
+                Kind          = kind,
+                CharacterId   = profile.GetPlayerID().ToString(System.Globalization.CultureInfo.InvariantCulture),
+                CharacterName = CustomsItems.Clean(profile.GetName(), CustomsLimits.MaxNameLength),
+                Items         = items,
+            };
+            try
+            {
+                _serverRpc.Invoke(CustomsWire.ReportRpc, CustomsWire.WriteReport(report));
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Customs: report not sent: {ex.Message}");
+                return false;
+            }
+            _customsLastSignature = CustomsItems.Signature(items);
+            _customsLastSentAt    = Time.realtimeSinceStartup;
+            _customsPendingSince  = -1f;
+            return true;
+        }
+
+        // The local player's inventory as customs records, cleaned and clamped to what
+        // the server accepts (CustomsItems.ForReport), so an honest declaration is
+        // always a valid one.
+        private static List<CustomsItem> CustomsCollect()
+        {
+            var inventory = Player.m_localPlayer != null ? Player.m_localPlayer.GetInventory() : null;
+            if (inventory == null) return null;
+
+            var items = new List<CustomsItem>();
+            foreach (var item in inventory.GetAllItems())
+            {
+                if (item == null) continue;
+                items.Add(new CustomsItem(
+                    item.m_dropPrefab != null ? item.m_dropPrefab.name : item.m_shared?.m_name,
+                    item.m_quality, item.m_variant, item.m_worldLevel,
+                    item.m_crafterID, item.m_crafterName,
+                    CustomsItems.HashCustomData(item.m_customData),
+                    item.m_stack));
+            }
+            return CustomsItems.ForReport(items);
+        }
+
+        // From the ZNet.Shutdown prefix, while the connection is still up. Nothing will
+        // pump the send queue after this, so the report is flushed by hand. Best effort:
+        // a crash or a pulled cable skips it, which is what checkpoints are for.
+        internal void CustomsSendLogout()
+        {
+            try
+            {
+                if (_customsNonce.Length == 0 || !_customsAnswered || _serverRpc == null) return;
+                var items = CustomsCollect();
+                if (items == null || !CustomsSend(CustomsReportKind.Logout, items)) return;
+                _serverRpc.GetSocket()?.Flush();
+                LogS?.LogInfo("[ServerGuard.Client] Customs: departure report sent.");
+            }
+            catch (Exception ex)
+            {
+                LogS?.LogWarning($"[ServerGuard.Client] Customs: departure report failed: {ex.Message}");
+            }
+        }
+
+        // The two arrival captures around the first Player.OnSpawned of a connection. The
+        // prefix runs first and the postfix last, so the captures bracket every other
+        // mod's spawn-time work. Respawns after death are not arrivals and are skipped.
+        [HarmonyPatch(typeof(Player), nameof(Player.OnSpawned))]
+        public static class Patch_Player_OnSpawned_Customs
+        {
+            [HarmonyPriority(Priority.First)]
+            public static void Prefix(Player __instance)
+            {
+                try
+                {
+                    var self = ClientPlugin.Instance;
+                    if (self == null || self._customsSpawnSeen || __instance != Player.m_localPlayer || !IsActiveMultiplayerClient()) return;
+                    self._customsLoaded = CustomsCollect();
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Customs spawn capture failed: {ex.Message}");
+                }
+            }
+
+            [HarmonyPriority(Priority.Last)]
+            public static void Postfix(Player __instance)
+            {
+                try
+                {
+                    var self = ClientPlugin.Instance;
+                    if (self == null || self._customsSpawnSeen || __instance != Player.m_localPlayer || !IsActiveMultiplayerClient()) return;
+                    self._customsSpawned   = CustomsCollect();
+                    self._customsSpawnSeen = true;
+                    self.CustomsTryDeclare();
+                }
+                catch (Exception ex)
+                {
+                    ClientPlugin.LogS?.LogWarning($"[ServerGuard.Client] Customs spawn capture failed: {ex.Message}");
+                }
             }
         }
 

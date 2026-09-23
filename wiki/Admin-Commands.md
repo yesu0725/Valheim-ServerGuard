@@ -78,6 +78,18 @@ sg unban 76561198000000000
 sg bans 50
 ```
 
+### Customs
+
+| Command | What it does |
+|---|---|
+| `sg customs [status]` | Mode, store health, pending approvals and live sessions. |
+| `sg customs inspect <steamid\|name>` | A player's live declaration and stored baselines. |
+| `sg customs approve <steamid\|name>` | Admit their next arrival Customs would refuse, once (expires after 24h). |
+| `sg customs unapprove <steamid\|name>` | Withdraw a pending approval. |
+| `sg customs reset <steamid\|name> [characterId]` | Forget stored baselines. Only while the player is offline. |
+
+See **[Customs](Customs)**.
+
 ### Build / destroy heatmap queries
 
 | Command | What it does |

@@ -10,6 +10,7 @@ A Valheim mod that locks a dedicated server to a specific modpack, provides anti
 - **[Discord Integration](Discord-Integration)** — public + admin channels, raid alerts, shouts, and the daily summary.
 - **[Admin Commands](Admin-Commands)** — full `sg` console reference.
 - **[Anti-Cheat Features](Anti-Cheat-Features)** — every rule, how it works, how to tune it, and the violations system.
+- **[Customs](Customs)** — optional inventory baseline: catch characters that come back carrying items they did not get on your server.
 - **[Bans and Console Guard](Bans-and-Console-Guard)** — instant SteamID bans, console command gating, and key-bind removal.
 - **[Privilege Tiers](Privilege-Tiers)** — owner vs moderator vs player, what each one bypasses, and which dev commands each tier gets.
 - **[Forensic Logs](Forensic-Logs)** — death log + build/destroy heatmap CSVs.

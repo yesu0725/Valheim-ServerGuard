@@ -218,6 +218,22 @@ explanation on **[Privilege Tiers](Privilege-Tiers)**.
 The three rules (`CheatedItem`, `CheatedBuild`, `DebugFly`) default to informational
 in `countAsViolation`. Details on **[Anti-Cheat Features](Anti-Cheat-Features)**.
 
+## Customs (inventory baseline)
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enableCustoms` | `false` | Check what each character carries on arrival against what it last left with. |
+| `customsMode` | `dryrun` | `dryrun` logs; `enforce` disconnects. Unknown values mean `dryrun`. |
+| `customsNewCharacters` | `fresh` | Enforce, character with no baseline yet: `fresh` (empty inventory only), `any`, or `approve`. |
+| `customsExemptModerators` | `false` | Skip moderators. Owners are never inspected. |
+| `customsIgnoredItems` | `[]` | Prefab names never counted. |
+| `customsArrivalTimeoutSeconds` | `60` | Time a declaration may take after the character enters the world. |
+| `customsCheckpointSeconds` | `120` | Periodic full re-send from clients. |
+| `customsDebounceSeconds` | `5` | Delay before an inventory change is reported. |
+| `customsMaxItemRecords` | `256` | Distinct stacks one declaration may hold. |
+
+Start with `dryrun`. Everything else, including rollout, is on **[Customs](Customs)**.
+
 ## Raid alerts
 
 Raid / random-event start, pause, resume, and end are posted to the **public** Discord channel automatically (no setting to enable — it follows `discordWebhookUrl`). Events are named with their in-game title (e.g. "The Horde Is Attacking") rather than the internal code name.
@@ -240,3 +256,4 @@ The title-screen one-click login panel is configured on each **client** in `clie
 | `violations.yaml` | Current per-player violation strikes. Hot-reloaded; or use `sg pardon`. |
 | `metrics.yaml` | Aggregate counters. |
 | `build_log/YYYY-MM-DD.csv` | Daily build/destroy events. |
+| `customs/` | Customs baselines, one file per character, plus pending approvals. Only created once Customs is on. See [Customs](Customs). |
