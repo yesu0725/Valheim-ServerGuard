@@ -162,6 +162,8 @@ internal class ServerPlugin : MonoBehaviour
     private const string RULE_CHEATED_ITEM            = "CheatedItem";
     private const string RULE_CHEATED_BUILD           = "CheatedBuild";
     private const string RULE_DEBUG_FLY               = "DebugFly";
+    // Customs: an arrival carried items its baseline does not account for.
+    private const string RULE_UNDECLARED_ITEMS        = "UndeclaredItems";
 
     // All rule keys, used to seed default countAsViolation map and validate user input.
     private static readonly string[] ALL_RULES = new[]
@@ -184,6 +186,7 @@ internal class ServerPlugin : MonoBehaviour
         RULE_CHEATED_ITEM,
         RULE_CHEATED_BUILD,
         RULE_DEBUG_FLY,
+        RULE_UNDECLARED_ITEMS,
     };
 
     // File watchers (hot-reload)
@@ -319,6 +322,10 @@ internal class ServerPlugin : MonoBehaviour
             ["CheatedItem"]                   = false,
             ["CheatedBuild"]                  = false,
             ["DebugFly"]                      = false,
+
+            // Customs. The refusal is already a disconnect, so a strike on top would
+            // punish the same arrival twice; opt in once dry run has shown it is clean.
+            ["UndeclaredItems"]               = false,
         };
 
         // --- Devcommands gate (#5) ---
@@ -585,6 +592,33 @@ internal class ServerPlugin : MonoBehaviour
             "goto", "pos", "removedrops", "stopevent", "find",
         };
 
+        // --- Customs: inventory baseline (off by default) ---
+        // Remembers what each character was carrying when it was last trusted on this
+        // server, and checks what it carries when it comes back. Anything extra was
+        // obtained somewhere else - a single-player world, another server, a restored
+        // character backup - which no other rule can see: those items carry no cheat
+        // mark. A dedicated server cannot read a player's inventory, so the ServerGuard
+        // client declares it after attestation and keeps the record current while the
+        // player is online (see "Customs" further down this file).
+        //
+        // dryrun logs what enforce would refuse and keeps learning; enforce disconnects.
+        // An unrecognised mode means dryrun, and `enforce: false` above keeps Customs in
+        // dryrun too. customsNewCharacters decides, in enforce, what happens to a
+        // character with no baseline yet: fresh (only with an empty inventory), any, or
+        // approve (never without `sg customs approve`).
+        //
+        // Owners are never inspected (they are exempt from every rule and never attest).
+        // Moderators are, unless customsExemptModerators.
+        public bool   EnableCustoms                { get; set; } = false;
+        public string CustomsMode                  { get; set; } = "dryrun";
+        public string CustomsNewCharacters         { get; set; } = "fresh";
+        public bool   CustomsExemptModerators      { get; set; } = false;
+        public List<string> CustomsIgnoredItems    { get; set; } = new List<string>();
+        public int    CustomsArrivalTimeoutSeconds { get; set; } = 60;
+        public int    CustomsCheckpointSeconds     { get; set; } = 120;
+        public int    CustomsDebounceSeconds       { get; set; } = 5;
+        public int    CustomsMaxItemRecords        { get; set; } = 256;
+
         // Deprecated (kept so old YAML loads without errors). v1.4+ uses two webhooks instead.
         public bool DiscordPublicMode { get; set; } = true;
 
@@ -707,6 +741,10 @@ internal class ServerPlugin : MonoBehaviour
         public long cheat_taint_builds    { get; set; } = 0;   // 2.0: CheatedBuild confirmations
         public long debug_fly_detections  { get; set; } = 0;   // 2.0: DebugFly flags
         public long cheat_taint_bypass_kicks { get; set; } = 0; // 2.0: cheatTaintBypassPolicy=kick disconnects
+        public long customs_arrivals      { get; set; } = 0;   // Customs: arrival declarations judged
+        public long customs_flagged       { get; set; } = 0;   // Customs: arrivals enforce refuses (or would, in dryrun)
+        public long customs_refused       { get; set; } = 0;   // Customs: enforce disconnects
+        public long customs_unusable      { get; set; } = 0;   // Customs: missing or malformed declarations
         public long total_players_checked { get; set; } = 0;
         public long total_mods_detected { get; set; } = 0;
         public long phase1_rpc_detections { get; set; } = 0;
@@ -778,6 +816,7 @@ internal class ServerPlugin : MonoBehaviour
         LoadRegistrations();
         LoadViolations();
         LoadMetrics();
+        CustomsInit();
 
         // Start file watchers for hot-reload
         StartWatchers();
@@ -1001,6 +1040,15 @@ internal class ServerPlugin : MonoBehaviour
 		catch (Exception ex)
 		{
 			LogS?.LogWarning($"[ServerGuard] StopWatchers failed: {ex.Message}");
+		}
+
+		try
+		{
+			CustomsShutdown();
+		}
+		catch (Exception ex)
+		{
+			LogS?.LogWarning($"[ServerGuard] Customs flush on shutdown failed: {ex.Message}");
 		}
 
 		try
@@ -1289,6 +1337,33 @@ internal class ServerPlugin : MonoBehaviour
             sb.AppendLine("#                             `debugmode` also unlocks the debug hotkeys (Z fly, B free");
             sb.AppendLine("#                             build, K/L, Ctrl+click map teleport) - list it deliberately.");
             sb.AppendLine("#");
+            sb.AppendLine("# Customs (inventory baseline, off by default):");
+            sb.AppendLine("#   enableCustoms           - remember what each character carried when it last left this");
+            sb.AppendLine("#                             server and check what it carries when it comes back. Anything");
+            sb.AppendLine("#                             extra was obtained elsewhere (single-player, another server,");
+            sb.AppendLine("#                             a restored character backup).");
+            sb.AppendLine("#   customsMode             - 'dryrun' (default): log what would be refused, keep learning.");
+            sb.AppendLine("#                             'enforce': disconnect. Anything else means dryrun, and");
+            sb.AppendLine("#                             enforce: false keeps Customs in dryrun as well.");
+            sb.AppendLine("#                             RUN DRYRUN FIRST: until a character has a baseline, enforce");
+            sb.AppendLine("#                             treats it as a new character.");
+            sb.AppendLine("#   customsNewCharacters    - enforce only, for characters with no baseline yet:");
+            sb.AppendLine("#                             'fresh' (default) admit only with an empty inventory;");
+            sb.AppendLine("#                             'any' admit and record whatever the first arrival carries;");
+            sb.AppendLine("#                             'approve' never without `sg customs approve`.");
+            sb.AppendLine("#   customsExemptModerators - true = moderators are not inspected. Owners never are.");
+            sb.AppendLine("#   customsIgnoredItems     - prefab names never counted (e.g. items a mod hands out at login).");
+            sb.AppendLine("#   customsArrivalTimeoutSeconds");
+            sb.AppendLine("#                           - how long after entering the world a declaration may take");
+            sb.AppendLine("#                             before it counts as missing (enforce: disconnect).");
+            sb.AppendLine("#   customsCheckpointSeconds / customsDebounceSeconds");
+            sb.AppendLine("#                           - how often clients re-send their inventory, and how long a");
+            sb.AppendLine("#                             change waits before it is reported.");
+            sb.AppendLine("#   customsMaxItemRecords   - distinct stacks one declaration may hold. Raise it for very");
+            sb.AppendLine("#                             large modded inventories.");
+            sb.AppendLine("#   Needs the ServerGuard client (requireCompanion: true). It checks where inventories");
+            sb.AppendLine("#   came from; it is not proof against a modified client. Wiki page: Customs.");
+            sb.AppendLine("#");
             sb.AppendLine(_yamlOutFull.Serialize(defaults));
             File.WriteAllText(SettingsYaml, sb.ToString());
         }
@@ -1497,6 +1572,8 @@ internal class ServerPlugin : MonoBehaviour
                 BroadcastConsolePolicy();
                 // A newly-enabled ban layer should act on anyone already online.
                 SweepBannedPeers();
+                // Customs mode / scope / timing changes apply to players already online.
+                CustomsRequestReconcile();
             }
         }
         catch (Exception ex)
@@ -1764,6 +1841,8 @@ internal class ServerPlugin : MonoBehaviour
                 // to the list has to be re-pushed or a promoted/demoted player keeps the
                 // console rights they had at connect time.
                 BroadcastConsolePolicy();
+                // customsExemptModerators follows the tier.
+                CustomsRequestReconcile();
             }
         }
         catch (Exception ex)
@@ -1940,6 +2019,8 @@ internal class ServerPlugin : MonoBehaviour
                 // The console policy carries the recipient's tier, so a change here has
                 // to be re-pushed or a newly-promoted owner keeps their old rights.
                 BroadcastConsolePolicy();
+                // Owners are never inspected by Customs.
+                CustomsRequestReconcile();
             }
         }
         catch (Exception ex)
@@ -2721,6 +2802,7 @@ internal class ServerPlugin : MonoBehaviour
             case RULE_CHEATED_ITEM:         return string.IsNullOrEmpty(detail) ? "carried cheat-spawned items" : $"carried cheat-spawned items ({detail})";
             case RULE_CHEATED_BUILD:        return string.IsNullOrEmpty(detail) ? "built with cheats" : $"built with cheats ({detail})";
             case RULE_DEBUG_FLY:            return "used debug fly";
+            case RULE_UNDECLARED_ITEMS:     return string.IsNullOrEmpty(detail) ? "arrived carrying items from outside this server" : $"arrived carrying items from outside this server ({detail})";
             default:                        return "policy violation";
         }
     }
@@ -2912,6 +2994,21 @@ internal class ServerPlugin : MonoBehaviour
         // 7. Admin list non-empty (warning if empty - sg commands won't be usable).
         Add("Admins configured", _admins.Count > 0,
             _admins.Count > 0 ? $"{_admins.Count} moderator SteamID(s) in moderators.yaml" : "moderators.yaml is empty - sg commands will be unusable");
+
+        // 8. Customs store writable - only listed while Customs is on.
+        if (CustomsModeNow() != CustomsMode.Disabled)
+        {
+            try
+            {
+                Directory.CreateDirectory(CustomsDir);
+                var probe = Path.Combine(CustomsDir, ".selftest_probe");
+                File.WriteAllText(probe, "ok");
+                File.Delete(probe);
+                Add("Customs store writable", _customsStore == null || _customsStore.ConsecutiveFailures == 0,
+                    _customsStore != null && _customsStore.ConsecutiveFailures > 0 ? $"writes failing: {_customsStore.LastError}" : CustomsDir);
+            }
+            catch (Exception ex) { Add("Customs store writable", false, ex.Message); }
+        }
 
         return results;
     }
@@ -3725,6 +3822,13 @@ internal class ServerPlugin : MonoBehaviour
                     ServerPlugin.Instance.OnAdminCommandReceived(peer, command);
                 });
 
+                // Customs: the client's inventory declarations. Registered for every peer
+                // like the rest; reports from a peer Customs never asked are ignored.
+                peer.m_rpc.Register<string>(CustomsWire.ReportRpc, (rpc, payload) =>
+                {
+                    ServerPlugin.Instance.OnCustomsReport(peer, payload);
+                });
+
                 // Arrival-shout policy. Pushed to EVERY peer (admins included, hence
                 // before the early-return below) so the companion knows whether to
                 // swallow the first-spawn "I have arrived!" shout.
@@ -3789,6 +3893,10 @@ internal class ServerPlugin : MonoBehaviour
                 if (peer == null) return;
                 if (!ZNet.instance || !ZNet.instance.IsServer()) return;
                 if (ServerPlugin.Instance == null) return;
+
+                // Customs first: a Customs refusal is one of OUR kicks, and its session
+                // must be closed out even though the rest of this hook stops below.
+                ServerPlugin.Instance.CustomsOnDisconnect(peer);
 
                 // Suppress if we initiated this disconnect ourselves.
                 bool suppress;
@@ -4210,6 +4318,10 @@ internal class ServerPlugin : MonoBehaviour
             LogS.LogInfo($"[ServerGuard] {who} attested OK ({manifest.Mods?.Count ?? 0} mods, {fpStatus}).");
             if (IsModerator(steamId)) PostPlayerEvent(":shield:", steamId, "joined as moderator");
             else                      PostPlayerEvent(":white_check_mark:", steamId, "joined");
+
+            // Customs starts only here: everything it trusts rests on this client
+            // having just passed attestation.
+            CustomsOnAttested(peer, steamId);
         }
         catch (Exception ex)
         {
@@ -4704,7 +4816,8 @@ internal class ServerPlugin : MonoBehaviour
             // keep the channel readable.
             var firstToken = (command ?? "").TrimStart().Split(' ').FirstOrDefault()?.ToLowerInvariant() ?? "";
             var mutating = firstToken == "reload" || firstToken == "pardon" || firstToken == "unregister"
-                        || firstToken == "kick"   || firstToken == "ban"    || firstToken == "unban";
+                        || firstToken == "kick"   || firstToken == "ban"    || firstToken == "unban"
+                        || (firstToken == "customs" && CustomsCommandMutates(command));
             if (mutating)
             {
                 PostAdminEvent($":hammer_and_wrench: **{FormatPlayer(senderSteamId)}** ran `sg {command}`");
@@ -4760,6 +4873,7 @@ internal class ServerPlugin : MonoBehaviour
             case "destroyed":  return CmdBuild(args, actionFilter: "destroy", label: "destroy");
             case "placed":     return CmdBuild(args, actionFilter: "place",   label: "placement");
             case "selftest":   return CmdSelfTest();
+            case "customs":    return CmdCustoms(args, callerSteamId);
             default:           return $"Unknown command `{cmd}`. Try `sg help`.";
         }
     }
@@ -4786,6 +4900,11 @@ internal class ServerPlugin : MonoBehaviour
         sb.AppendLine("  sg destroyed at <x> <z> [radius] [days]  - DESTROYS only, near coords");
         sb.AppendLine("  sg destroyed by <steamid|name> [days]    - DESTROYS only, by a player");
         sb.AppendLine("  sg destroyed today [<n>]                 - last N DESTROYS today");
+        sb.AppendLine("  sg customs [status]                      - inventory customs: mode, live sessions, store health");
+        sb.AppendLine("  sg customs inspect <steamid|name>        - a player's live declaration and stored baselines");
+        sb.AppendLine("  sg customs approve <steamid|name>        - admit their next arrival once, whatever it carries (24h)");
+        sb.AppendLine("  sg customs unapprove <steamid|name>      - withdraw a pending approval");
+        sb.AppendLine("  sg customs reset <steamid|name> [charid] - forget stored baselines (player must be offline)");
         return sb.ToString().TrimEnd();
     }
 
@@ -4817,6 +4936,7 @@ internal class ServerPlugin : MonoBehaviour
         sb.AppendLine($"  CheatTaint {(_settings.EnableCheatTaintDetection ? "ON policy=" + NormalizedCheatTaintPolicy() + " bypass=" + NormalizedCheatTaintBypassPolicy() : "off")}"
                       + $"  debugFly={(_settings.EnableDebugFlyCheck ? "ON" : "off")}"
                       + (_settings.CheatTaintExemptModerators ? "  (moderators exempt)" : ""));
+        sb.AppendLine($"  Customs    {CustomsStatusLine()}");
         return sb.ToString().TrimEnd();
     }
 
@@ -6266,6 +6386,669 @@ internal class ServerPlugin : MonoBehaviour
         {
             LogS.LogWarning($"[ServerGuard] DebugFly check error: {ex.Message}");
         }
+    }
+
+    // ==================== Customs: inventory baseline ====================
+    //
+    // Checks what a character carries when it arrives against what it carried when it
+    // was last trusted here. A dedicated server cannot see a remote inventory, so the
+    // attested client half declares it (Shared/CustomsProtocol.cs). Every decision -
+    // screening a report, the verdict, what may be written - lives in
+    // Shared/CustomsLedger.cs, where the tests reach it; this section is the shell:
+    // peers, RPCs, kicks, posts and the tick.
+    //
+    //   CustomsOnAttested   a manifest passed: open a session and send the request
+    //   OnCustomsReport     every report: screen it, then declare / record / refuse
+    //   CustomsTick         1 s main-thread tick: declaration deadlines, disk writes,
+    //                       and hot-reload changes (reloads run on a watcher thread,
+    //                       so they only raise a flag)
+    //   CustomsOnDisconnect put the departure record on disk, drop the session
+    //
+    // Trust: this raises the bar behind attestation and the pinned modset; it is not
+    // proof against a doctored client, which can declare anything. What it guarantees
+    // is that silence, garbage, replays and refused sessions never get through in
+    // enforce and never write a baseline.
+
+    private static readonly string CustomsDir = Path.Combine(RootDir, "customs");
+
+    private CustomsBaselineStore _customsStore;
+    private CustomsApprovals _customsApprovals;
+    // Every Customs entry point takes this lock. They run on the main thread in normal
+    // operation, but a kick from a hot reload (the ban sweep) reaches CustomsOnDisconnect
+    // from a file-watcher thread.
+    private readonly object _customsLock = new object();
+    // Keyed by the connection object, not m_uid: the manifest is the first thing a
+    // client sends, so attestation completes before RPC_PeerInfo assigns the uid.
+    private readonly Dictionary<ZNetPeer, CustomsSession> _customsSessions = new Dictionary<ZNetPeer, CustomsSession>();
+    // Peers that passed attestation on their current connection, so Customs can start
+    // for them when it is switched on mid-session. Owners never attest, so never appear.
+    private readonly HashSet<ZNetPeer> _customsAttested = new HashSet<ZNetPeer>();
+    private volatile bool _customsReconcilePending;
+    private string _customsPushedTiming = "";
+    private bool _customsWriteAlarm;
+    private DateTime _customsUnjudgedAlarmUtc = DateTime.MinValue;
+
+    private CustomsMode CustomsModeNow()
+    {
+        var s = _settings;
+        return s == null ? CustomsMode.Disabled : CustomsPolicy.Resolve(s.EnableCustoms, s.CustomsMode, s.Enforce);
+    }
+
+    private bool CustomsInspects(string pid)
+    {
+        return CustomsPolicy.Inspects(CustomsModeNow(), pid, IsOwner(pid), IsModerator(pid),
+            _settings != null && _settings.CustomsExemptModerators);
+    }
+
+    private CustomsLimits CustomsLimitsNow()
+    {
+        return new CustomsLimits(_settings?.CustomsMaxItemRecords ?? 0);
+    }
+
+    private HashSet<string> CustomsIgnored()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in _settings?.CustomsIgnoredItems ?? new List<string>())
+        {
+            var v = (s ?? "").Trim();
+            if (v.Length > 0) set.Add(v);
+        }
+        return set;
+    }
+
+    private string CustomsTimingKey()
+    {
+        var s = _settings;
+        if (s == null) return "";
+        return CustomsWire.ClampCheckpoint(s.CustomsCheckpointSeconds) + "|" + CustomsWire.ClampDebounce(s.CustomsDebounceSeconds)
+             + "|" + CustomsLimitsNow().MaxRecords;
+    }
+
+    // Awake. Touches nothing on disk: the customs folder is created by the first
+    // baseline written, so a server that never enables Customs never gets one.
+    private void CustomsInit()
+    {
+        _customsStore = new CustomsBaselineStore(CustomsDir);
+        _customsApprovals = new CustomsApprovals(Path.Combine(CustomsDir, "approvals.json"));
+        _customsApprovals.Load(DateTime.UtcNow);
+        if (_customsApprovals.LastError.Length > 0)
+            LogS.LogWarning($"[ServerGuard] Customs approvals.json could not be read ({_customsApprovals.LastError}) - starting with no approvals.");
+        _customsPushedTiming = CustomsTimingKey();
+        StartCoroutine(CustomsLoop());
+
+        var mode = CustomsModeNow();
+        if (mode == CustomsMode.Disabled) return;
+        LogS.LogInfo($"[ServerGuard] Customs {CustomsPolicy.Name(mode)}  "
+            + $"newCharacters={CustomsPolicy.Name(CustomsPolicy.ParseNewCharacters(_settings.CustomsNewCharacters))}  "
+            + $"moderators={(_settings.CustomsExemptModerators ? "exempt" : "inspected")}  store={CustomsDir}");
+        CustomsWarnIfWeakened();
+    }
+
+    private void CustomsWarnIfWeakened()
+    {
+        if (!_settings.RequireCompanion)
+            LogS.LogWarning("[ServerGuard] Customs is on but requireCompanion is off: players without ServerGuard on their client are never inspected.");
+        if (!_settings.Enforce && string.Equals((_settings.CustomsMode ?? "").Trim(), "enforce", StringComparison.OrdinalIgnoreCase))
+            LogS.LogWarning("[ServerGuard] customsMode is enforce but enforce is false: Customs runs as dryrun.");
+    }
+
+    // From LoadSettings / LoadAdmins / LoadOwners, which may run on a watcher thread.
+    private void CustomsRequestReconcile()
+    {
+        _customsReconcilePending = true;
+    }
+
+    internal void CustomsOnAttested(ZNetPeer peer, string pid)
+    {
+        if (peer == null) return;
+        lock (_customsLock)
+        {
+            _customsAttested.Add(peer);
+            if (CustomsInspects(pid)) CustomsStart(peer, pid, true);
+            else if (CustomsModeNow() != CustomsMode.Disabled && !IsValidSteamId(pid))
+                LogS.LogWarning($"[ServerGuard] Customs cannot inspect {FormatPlayer(pid)}: no SteamID64 to keep a baseline under.");
+        }
+    }
+
+    // judgesArrival: false when Customs starts for a player who is already in the
+    // world - part of what they carry was earned this session, so it is recorded as
+    // their baseline without a verdict.
+    private void CustomsStart(ZNetPeer peer, string pid, bool judgesArrival)
+    {
+        var session = new CustomsSession(pid, GenerateChallenge(), judgesArrival, DateTime.UtcNow);
+        _customsSessions[peer] = session;
+        CustomsSendRequest(peer, session.Nonce);
+        LogS.LogInfo($"[ServerGuard] Customs: asked {FormatPlayer(pid)} to declare their inventory"
+            + (judgesArrival ? "." : " (they were already online: recorded, not judged)."));
+    }
+
+    // A null nonce tells the client to stop reporting.
+    private void CustomsSendRequest(ZNetPeer peer, string nonce)
+    {
+        try
+        {
+            var s = _settings;
+            peer?.m_rpc?.Invoke(CustomsWire.RequestRpc, nonce == null
+                ? CustomsWire.BuildStop()
+                : CustomsWire.BuildRequest(nonce, s.CustomsCheckpointSeconds, s.CustomsDebounceSeconds, CustomsLimitsNow().MaxRecords));
+        }
+        catch (Exception ex)
+        {
+            LogS.LogWarning($"[ServerGuard] Customs request send failed: {ex.Message}");
+        }
+    }
+
+    internal void OnCustomsReport(ZNetPeer peer, string payload)
+    {
+        // Before RPC_PeerInfo there is no character name to hold a report to, and no
+        // honest client can have a character in the world to report on.
+        if (peer == null || !peer.IsReady()) return;
+        lock (_customsLock)
+        {
+            // No session: Customs is off, never asked this peer, or has let it go.
+            CustomsSession session;
+            if (!_customsSessions.TryGetValue(peer, out session)) return;
+            try
+            {
+                var mode = CustomsModeNow();
+                if (mode == CustomsMode.Disabled) return;
+                var now = DateTime.UtcNow;
+
+                // The SteamID is the session's, taken from this peer when it attested.
+                var screen = session.Screen(payload, CustomsLimitsNow(), peer.m_playerName, now);
+                if (screen.Outcome == CustomsScreen.Dropped) return;   // counted on the session
+                if (screen.Outcome == CustomsScreen.Rejected)
+                {
+                    CustomsUnusable(peer, session, mode, screen.Problem + (screen.Detail.Length > 0 ? " (" + screen.Detail + ")" : ""));
+                    return;
+                }
+
+                if (session.Phase == CustomsPhase.Declaring)
+                {
+                    var judgement = CustomsEngine.Declare(session, screen.Report, _customsStore, mode,
+                        CustomsPolicy.ParseNewCharacters(_settings.CustomsNewCharacters), CustomsIgnored(), _customsApprovals, now);
+                    CustomsAfterDeclaration(peer, session, judgement);
+                    return;
+                }
+
+                CustomsEngine.Record(session, screen.Report, _customsStore, now);
+                // The player is on the way out, and a server shutdown may come next.
+                if (screen.Report.Kind == CustomsReportKind.Logout) CustomsFlushOne(session);
+            }
+            catch (Exception ex)
+            {
+                LogS.LogError($"[ServerGuard] Customs report error for {FormatPlayer(session.SteamId)}: {ex}");
+            }
+        }
+    }
+
+    private void CustomsAfterDeclaration(ZNetPeer peer, CustomsSession session, CustomsJudgement j)
+    {
+        var who = FormatPlayer(session.SteamId);
+        // The declared name: goes into admin posts, so reduced to plain text.
+        var character = session.CharacterName.Length > 0 ? CustomsItems.SafeName(session.CharacterName) : session.CharacterId;
+
+        if (j.StoreNote.Length > 0)
+        {
+            LogS.LogWarning($"[ServerGuard] Customs baseline of {who} (character {session.CharacterId}): {j.StoreNote}");
+            PostAdminEvent($":floppy_disk: Customs baseline of **{who}**: {j.StoreNote}");
+        }
+        if (session.JudgesArrival && _settings.EnableMetrics) { _metrics.customs_arrivals++; SaveMetrics(); }
+
+        var line = $"[ServerGuard] Customs: {who} as '{character}' - {CustomsVerdictText(j)} "
+                 + $"(carrying {CustomsItems.Total(session.LastItems)} item(s)"
+                 + (j.Delta.Count > 0 ? $"; {CustomsFindingText(j)}" : "") + ").";
+
+        switch (j.Verdict)
+        {
+            case CustomsVerdict.Cleared:
+            case CustomsVerdict.Established:
+            case CustomsVerdict.Enrolled:
+                LogS.LogInfo(line);
+                break;
+            case CustomsVerdict.Unjudged:
+                LogS.LogWarning(line);
+                // A disk problem hits every arrival at once: one alarm per ten minutes.
+                if (DateTime.UtcNow - _customsUnjudgedAlarmUtc > TimeSpan.FromMinutes(10))
+                {
+                    _customsUnjudgedAlarmUtc = DateTime.UtcNow;
+                    PostAdminEvent($":rotating_light: Customs could not read the baseline of **{who}** - admitted without a check, and "
+                        + "nothing is recorded for a character whose baseline is unreadable. Check the customs folder (see the server log).");
+                }
+                break;
+            case CustomsVerdict.Flagged:
+                LogS.LogWarning(line);
+                if (_settings.EnableMetrics) { _metrics.customs_flagged++; SaveMetrics(); }
+                // Characters with no baseline yet are what a dry run is there to learn,
+                // so they stay in the log; undeclared items are the signal worth a post.
+                if (j.Finding == CustomsFinding.UndeclaredItems)
+                    PostAdminEvent($":passport_control: **Customs (dry run)** — **{who}** as `{character}` would be refused: {CustomsFindingText(j)}");
+                break;
+            case CustomsVerdict.Approved:
+                LogS.LogWarning(line);
+                PostAdminEvent($":passport_control: **{who}** as `{character}` admitted on an operator approval (now spent): {CustomsFindingText(j)}");
+                if (_customsApprovals.LastError.Length > 0)
+                    LogS.LogWarning($"[ServerGuard] Customs: approvals.json could not be updated ({_customsApprovals.LastError}) - "
+                        + $"until it is written again, a restart would bring back the spent approval for {who}.");
+                break;
+            case CustomsVerdict.Refused:
+                LogS.LogWarning(line);
+                if (_settings.EnableMetrics) { _metrics.customs_flagged++; SaveMetrics(); }
+                CustomsRefuse(peer, session, j.Finding, CustomsFindingText(j));
+                return;
+        }
+
+        // One live writer per character: a reconnect supersedes the old connection the
+        // server has not noticed is gone yet.
+        if (CustomsEngine.Supersede(_customsSessions.Values, session) > 0)
+            LogS.LogInfo($"[ServerGuard] Customs: an older connection of {who} as '{character}' was superseded.");
+    }
+
+    // The session is already closed; nothing it sent is on its way to the disk.
+    private void CustomsRefuse(ZNetPeer peer, CustomsSession session, CustomsFinding finding, string detail)
+    {
+        var pid = session.SteamId;
+        if (_settings.EnableMetrics) { _metrics.customs_refused++; SaveMetrics(); }
+        if (finding == CustomsFinding.UndeclaredItems)
+            AddViolation(pid, RULE_UNDECLARED_ITEMS, CustomsItems.Summarize(session.Judgement?.Delta, 6));
+        var publicReason = finding == CustomsFinding.UndeclaredItems ? FriendlyReason(RULE_UNDECLARED_ITEMS)
+                         : finding == CustomsFinding.UnknownCharacter ? "character not cleared by customs"
+                         : "customs check failed";
+        PostPlayerEvent(":door:", pid, "was kicked", publicReason);
+        TryKick(peer, $"{_settings.KickMessage} (Customs: {detail})");
+    }
+
+    // A malformed / out-of-bounds / mismatched report, or a declaration that never came.
+    private void CustomsUnusable(ZNetPeer peer, CustomsSession session, CustomsMode mode, string reason)
+    {
+        var who = FormatPlayer(session.SteamId);
+        bool wasTrusted = session.Phase == CustomsPhase.Admitted;
+        switch (CustomsEngine.Unusable(session, mode, reason))
+        {
+            case CustomsFallback.Refuse:
+                if (_settings.EnableMetrics) { _metrics.customs_unusable++; SaveMetrics(); }
+                LogS.LogWarning($"[ServerGuard] Customs: unusable inventory declaration from {who}: {reason}. Refusing.");
+                CustomsRefuse(peer, session, CustomsFinding.None, "unusable inventory declaration: " + reason);
+                break;
+            case CustomsFallback.Log:
+                if (session.Warned) break;
+                session.Warned = true;
+                if (_settings.EnableMetrics) { _metrics.customs_unusable++; SaveMetrics(); }
+                LogS.LogWarning($"[ServerGuard] Customs (dry run): {who} - {reason}. Enforce would disconnect them"
+                    + (wasTrusted ? "; their baseline stays at the last good report." : "."));
+                PostAdminEvent($":passport_control: **Customs (dry run)** — **{who}**: {reason}. Enforce would disconnect them.");
+                break;
+        }
+    }
+
+    private IEnumerator CustomsLoop()
+    {
+        while (true)
+        {
+            yield return new WaitForSeconds(1f);
+            try
+            {
+                lock (_customsLock) CustomsTick(DateTime.UtcNow);
+            }
+            catch (Exception ex)
+            {
+                LogS.LogWarning($"[ServerGuard] Customs tick error: {ex.Message}");
+            }
+        }
+    }
+
+    private void CustomsTick(DateTime now)
+    {
+        if (_customsReconcilePending)
+        {
+            _customsReconcilePending = false;
+            CustomsReconcile();
+        }
+
+        if (_customsSessions.Count > 0 && ZNet.instance != null)
+        {
+            var mode = CustomsModeNow();
+            var peers = ZNet.instance.GetPeers();
+            foreach (var entry in _customsSessions.ToList())
+            {
+                var peer = entry.Key;
+                var session = entry.Value;
+                // Connections normally leave through the ZNet.Disconnect hook; this only
+                // catches one that went away some other way.
+                if (!peers.Contains(peer)) { CustomsOnDisconnect(peer); continue; }
+                if (mode == CustomsMode.Disabled || session.Phase != CustomsPhase.Declaring) continue;
+                session.ArmDeadline(now, _settings.CustomsArrivalTimeoutSeconds, peer.m_characterID != ZDOID.None);
+                if (session.IsOverdue(now) && !(session.Warned && mode != CustomsMode.Enforce))
+                    CustomsUnusable(peer, session, mode, session.DeadlineWithoutCharacter
+                        ? $"no inventory declaration, and no character in the world {CustomsSession.LoadingAllowance.TotalMinutes:F0} minutes after attesting"
+                        : $"no inventory declaration within {Math.Max(5, _settings.CustomsArrivalTimeoutSeconds)}s of entering the world "
+                          + "(a ServerGuard client without Customs never sends one)");
+            }
+        }
+
+        // Also while disabled: baselines accepted before a switch-off still belong on disk.
+        if (_customsStore != null && _customsStore.QueuedCount > 0)
+        {
+            _customsStore.Flush(now, false);
+            CustomsWriteHealth();
+        }
+    }
+
+    // After settings.yaml, moderators.yaml or owners.yaml changed:
+    //   * switched on, or a player came into scope: start a session for them - their
+    //     current inventory is recorded, not judged (there is no arrival to judge)
+    //   * switched off, or a player left scope: stop their client reporting
+    //   * report cadence changed: re-send the request with the same nonce
+    // A dryrun <-> enforce switch needs nothing here: each arrival is judged by the
+    // mode in force when its declaration comes in.
+    private void CustomsReconcile()
+    {
+        if (ZNet.instance == null) return;
+        var timing = CustomsTimingKey();
+        bool timingChanged = !string.Equals(timing, _customsPushedTiming, StringComparison.Ordinal);
+        _customsPushedTiming = timing;
+
+        var peers = ZNet.instance.GetPeers();
+        foreach (var peer in _customsAttested.ToList())
+        {
+            if (!peers.Contains(peer)) { CustomsOnDisconnect(peer); continue; }
+            var pid = GetPeerPlatformId(peer);
+            CustomsSession session;
+            bool has = _customsSessions.TryGetValue(peer, out session);
+            switch (CustomsPolicy.Reconcile(has, CustomsInspects(pid)))
+            {
+                case CustomsReconcileAction.Enrol:
+                    CustomsStart(peer, pid, false);
+                    break;
+                case CustomsReconcileAction.Release:
+                    _customsSessions.Remove(peer);
+                    CustomsSendRequest(peer, null);
+                    CustomsFlushOne(session);
+                    LogS.LogInfo($"[ServerGuard] Customs: no longer inspecting {FormatPlayer(pid)}.");
+                    break;
+                default:
+                    if (has && timingChanged && session.Phase != CustomsPhase.Closed) CustomsSendRequest(peer, session.Nonce);
+                    break;
+            }
+        }
+        if (CustomsModeNow() != CustomsMode.Disabled) CustomsWarnIfWeakened();
+    }
+
+    internal void CustomsOnDisconnect(ZNetPeer peer)
+    {
+        if (peer == null) return;
+        lock (_customsLock)
+        {
+            _customsAttested.Remove(peer);
+            CustomsSession session;
+            if (!_customsSessions.TryGetValue(peer, out session)) return;
+            _customsSessions.Remove(peer);
+            // The last accepted report is the departure record: get it onto the disk now.
+            // Nothing new is written here - a refused session never queued anything.
+            CustomsFlushOne(session);
+        }
+    }
+
+    private void CustomsShutdown()
+    {
+        lock (_customsLock)
+        {
+            if (_customsStore == null || _customsStore.QueuedCount == 0) return;
+            var written = _customsStore.Flush(DateTime.UtcNow, true);
+            if (_customsStore.QueuedCount > 0)
+                LogS.LogError($"[ServerGuard] Customs: {_customsStore.QueuedCount} baseline(s) could not be written on shutdown ({_customsStore.LastError}).");
+            else
+                LogS.LogInfo($"[ServerGuard] Customs: wrote {written} baseline(s) on shutdown.");
+        }
+    }
+
+    private void CustomsFlushOne(CustomsSession session)
+    {
+        if (_customsStore == null || session == null || session.CharacterId.Length == 0) return;
+        _customsStore.FlushOne(session.SteamId, session.CharacterId, DateTime.UtcNow);
+        CustomsWriteHealth();
+    }
+
+    // One alarm when writes keep failing, one note when they recover.
+    private void CustomsWriteHealth()
+    {
+        var failures = _customsStore.ConsecutiveFailures;
+        if (failures >= 5 && !_customsWriteAlarm)
+        {
+            _customsWriteAlarm = true;
+            LogS.LogError($"[ServerGuard] Customs baselines cannot be written ({_customsStore.LastError}); "
+                + $"{_customsStore.QueuedCount} held in memory until the disk recovers - a restart loses them.");
+            PostAdminEvent($":floppy_disk: :rotating_light: **Customs baselines cannot be written** — `{_customsStore.LastError}`. "
+                + $"{_customsStore.QueuedCount} held in memory until the disk recovers; a restart loses them.");
+        }
+        else if (failures == 0 && _customsWriteAlarm)
+        {
+            _customsWriteAlarm = false;
+            LogS.LogInfo("[ServerGuard] Customs baselines are being written again.");
+            PostAdminEvent(":floppy_disk: Customs baselines are being written again.");
+        }
+    }
+
+    private static string CustomsVerdictText(CustomsJudgement j)
+    {
+        switch (j == null ? CustomsVerdict.Cleared : j.Verdict)
+        {
+            case CustomsVerdict.Cleared:     return "cleared";
+            case CustomsVerdict.Established: return "baseline established";
+            case CustomsVerdict.Flagged:     return "flagged (dry run: enforce would refuse)";
+            case CustomsVerdict.Approved:    return "admitted on an operator approval";
+            case CustomsVerdict.Refused:     return "refused";
+            case CustomsVerdict.Enrolled:    return "recorded mid-session, not judged";
+            default:                         return "admitted unjudged (baseline unreadable)";
+        }
+    }
+
+    private static string CustomsFindingText(CustomsJudgement j)
+    {
+        var total = CustomsItems.Total(j.Delta);
+        var list  = CustomsItems.Summarize(j.Delta, 8);
+        switch (j.Finding)
+        {
+            case CustomsFinding.UndeclaredItems:
+                return $"{total} item(s) its baseline does not account for: {list}";
+            case CustomsFinding.UnknownCharacter:
+                return total == 0 ? "the character has no baseline on this server"
+                                  : $"the character has no baseline on this server and arrived carrying {total} item(s): {list}";
+            default:
+                return total == 0 ? "" : $"{total} item(s) differ from the stored baseline: {list}";
+        }
+    }
+
+    private static bool CustomsCommandMutates(string command)
+    {
+        var tokens = (command ?? "").Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length < 2) return false;
+        var sub = tokens[1].ToLowerInvariant();
+        return sub == "approve" || sub == "unapprove" || sub == "reset";
+    }
+
+    private string CustomsStatusLine()
+    {
+        var mode = CustomsModeNow();
+        if (mode == CustomsMode.Disabled) return "off";
+        lock (_customsLock)
+        {
+            return $"{CustomsPolicy.Name(mode)}  newCharacters={CustomsPolicy.Name(CustomsPolicy.ParseNewCharacters(_settings.CustomsNewCharacters))}"
+                 + $"  sessions={_customsSessions.Count}"
+                 + (_customsStore.QueuedCount > 0 ? $"  unsaved={_customsStore.QueuedCount}" : "")
+                 + (_customsStore.ConsecutiveFailures > 0 ? "  WRITES FAILING" : "")
+                 + "  (sg customs for detail)";
+        }
+    }
+
+    // sg customs [status] | inspect | approve | unapprove | reset
+    private string CmdCustoms(string[] args, string callerSteamId)
+    {
+        var sub = args.Length > 0 ? args[0].ToLowerInvariant() : "status";
+        var rest = args.Skip(1).ToArray();
+        lock (_customsLock)
+        {
+            try
+            {
+                switch (sub)
+                {
+                    case "status":    return CmdCustomsStatus();
+                    case "inspect":   return CmdCustomsInspect(rest);
+                    case "approve":   return CmdCustomsApprove(rest, callerSteamId);
+                    case "unapprove": return CmdCustomsUnapprove(rest);
+                    case "reset":     return CmdCustomsReset(rest, callerSteamId);
+                    default:          return "Usage: sg customs [status] | inspect <player> | approve <player> | unapprove <player> | reset <player> [characterId]";
+                }
+            }
+            catch (Exception ex)
+            {
+                return $"Customs command failed: {ex.Message}";
+            }
+        }
+    }
+
+    private bool CustomsResolvePlayer(string[] args, out string steamId, out string error)
+    {
+        steamId = null;
+        error = null;
+        if (args.Length == 0) { error = "Name a player: a SteamID or a registered character name."; return false; }
+        var matches = ResolvePlayerQuery(args[0]);
+        if (matches.Count == 0) { error = $"No SteamID matched `{args[0]}`."; return false; }
+        if (matches.Count > 1) { error = $"Ambiguous - {matches.Count} players match. Pass an exact SteamID."; return false; }
+        if (!IsValidSteamId(matches[0])) { error = $"`{matches[0]}` is not a SteamID64."; return false; }
+        steamId = matches[0];
+        return true;
+    }
+
+    private string CmdCustomsStatus()
+    {
+        var s = _settings;
+        var mode = CustomsModeNow();
+        var sb = new StringBuilder();
+        if (mode == CustomsMode.Disabled)
+        {
+            sb.AppendLine("[ServerGuard] Customs is off (enableCustoms: false).");
+        }
+        else
+        {
+            sb.AppendLine($"[ServerGuard] Customs {CustomsPolicy.Name(mode)}  newCharacters={CustomsPolicy.Name(CustomsPolicy.ParseNewCharacters(s.CustomsNewCharacters))}  "
+                + $"moderators={(s.CustomsExemptModerators ? "exempt" : "inspected")}  ignored={CustomsIgnored().Count}");
+            sb.AppendLine($"  Timing     declaration within {Math.Max(5, s.CustomsArrivalTimeoutSeconds)}s of entering the world;  "
+                + $"checkpoint every {CustomsWire.ClampCheckpoint(s.CustomsCheckpointSeconds)}s;  change after {CustomsWire.ClampDebounce(s.CustomsDebounceSeconds)}s;  "
+                + $"max {CustomsLimitsNow().MaxRecords} stacks");
+            if (!s.Enforce && string.Equals((s.CustomsMode ?? "").Trim(), "enforce", StringComparison.OrdinalIgnoreCase))
+                sb.AppendLine("  Note       enforce: false in settings.yaml - Customs runs as dryrun");
+            if (!s.RequireCompanion)
+                sb.AppendLine("  Note       requireCompanion: false - players without the client half are not inspected");
+        }
+        sb.AppendLine($"  Store      {CustomsDir}  unsaved={_customsStore.QueuedCount}"
+            + (_customsStore.ConsecutiveFailures > 0 ? $"  write failures={_customsStore.ConsecutiveFailures} ({_customsStore.LastError})" : ""));
+        var approvals = _customsApprovals.Active(DateTime.UtcNow);
+        if (approvals.Count > 0)
+            sb.AppendLine("  Approvals  " + string.Join(", ", approvals.Select(a => $"{FormatPlayer(a.SteamId)} until {a.ExpiresUtc:yyyy-MM-dd HH:mm}Z")));
+        sb.AppendLine($"  Sessions   {_customsSessions.Count}");
+        foreach (var session in _customsSessions.Values)
+            sb.AppendLine("    " + CustomsDescribe(session));
+        return sb.ToString().TrimEnd();
+    }
+
+    private string CustomsDescribe(CustomsSession s)
+    {
+        string state;
+        if (s.Phase == CustomsPhase.Declaring)
+            state = s.DeadlineUtc.HasValue ? $"awaiting declaration (due {s.DeadlineUtc.Value:HH:mm:ss}Z)" : "awaiting declaration (character not in the world yet)";
+        else if (s.Phase == CustomsPhase.Admitted)
+            state = CustomsVerdictText(s.Judgement) + (s.MayRecord ? "" : ", not recording");
+        else
+            state = "closed: " + s.ClosedReason;
+        return $"{FormatPlayer(s.SteamId)}  character={(s.CharacterName.Length > 0 ? s.CharacterName : "?")}  {state}  "
+             + $"reports ok={s.Accepted} dropped={s.Dropped} rejected={s.Rejected}";
+    }
+
+    private string CmdCustomsInspect(string[] args)
+    {
+        string steamId, error;
+        if (!CustomsResolvePlayer(args, out steamId, out error)) return error;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"[ServerGuard] Customs - {FormatPlayer(steamId)}");
+        var live = _customsSessions.Values.Where(x => x.SteamId == steamId).ToList();
+        if (live.Count == 0) sb.AppendLine("  live       none");
+        foreach (var s in live)
+        {
+            sb.AppendLine("  live       " + CustomsDescribe(s));
+            sb.AppendLine($"  carrying   {CustomsItems.Total(s.LastItems)} item(s) in {s.LastItems.Count} stack(s)");
+            if (s.Judgement != null && s.Judgement.Delta.Count > 0)
+                sb.AppendLine($"  finding    {CustomsFindingText(s.Judgement)}");
+            if (s.LastProblem.Length > 0)
+                sb.AppendLine($"  problem    {s.LastProblem}");
+        }
+
+        var stored = _customsStore.List(steamId);
+        if (stored.Count == 0) sb.AppendLine("  baseline   none stored");
+        foreach (var b in stored)
+        {
+            sb.AppendLine($"  baseline   {(b.CharacterName.Length > 0 ? b.CharacterName : "?")} (id {b.CharacterId})  "
+                + $"{CustomsItems.Total(b.Items)} item(s) in {b.Items.Count} stack(s)  updated {b.UpdatedUtc:yyyy-MM-dd HH:mm}Z ({b.Origin})"
+                + (_customsStore.IsQueued(steamId, b.CharacterId) ? "  [not on disk yet]" : ""));
+        }
+        if (_customsApprovals.IsActive(steamId, DateTime.UtcNow))
+            sb.AppendLine("  approval   pending - spent on their next arrival that Customs would refuse");
+        return sb.ToString().TrimEnd();
+    }
+
+    private string CmdCustomsApprove(string[] args, string callerSteamId)
+    {
+        string steamId, error;
+        if (!CustomsResolvePlayer(args, out steamId, out error)) return error;
+        if (IsOwner(steamId)) return $"{FormatPlayer(steamId)} is an owner - Customs never inspects owners.";
+        // A moderator waving their own inventory through would defeat the check.
+        if (string.Equals(steamId, callerSteamId, StringComparison.Ordinal) && !IsOwner(callerSteamId))
+            return "Refusing to approve yourself - ask an owner.";
+
+        _customsApprovals.Grant(steamId, callerSteamId, DateTime.UtcNow);
+        var saved = _customsApprovals.Save();
+        return $"Approved {FormatPlayer(steamId)}: their next arrival that Customs would refuse is admitted instead and "
+             + $"becomes their baseline. Spent on use; expires in {CustomsApprovals.Lifetime.TotalHours:F0}h if unused."
+             + (saved ? "" : $" (approvals.json could not be written: {_customsApprovals.LastError} - it lasts until a restart.)");
+    }
+
+    private string CmdCustomsUnapprove(string[] args)
+    {
+        string steamId, error;
+        if (!CustomsResolvePlayer(args, out steamId, out error)) return error;
+        if (!_customsApprovals.Revoke(steamId)) return $"{FormatPlayer(steamId)} has no pending approval.";
+        _customsApprovals.Save();
+        return $"Withdrew the pending approval for {FormatPlayer(steamId)}.";
+    }
+
+    private string CmdCustomsReset(string[] args, string callerSteamId)
+    {
+        string steamId, error;
+        if (!CustomsResolvePlayer(args, out steamId, out error)) return error;
+        if (string.Equals(steamId, callerSteamId, StringComparison.Ordinal) && !IsOwner(callerSteamId))
+            return "Refusing to reset your own baseline - ask an owner.";
+        // A live session would write the baseline straight back.
+        bool online = _customsSessions.Values.Any(x => x.SteamId == steamId)
+                   || (ZNet.instance?.GetPeers()?.Any(p => p != null && GetPeerPlatformId(p) == steamId) ?? false);
+        if (online) return $"{FormatPlayer(steamId)} is online. Reset works only while they are offline - `sg customs approve` covers a player who is waiting.";
+
+        int removed = 0;
+        if (args.Length > 1)
+        {
+            if (!CustomsWire.IsCanonicalCharacterId(args[1])) return $"`{args[1]}` is not a character id (see `sg customs inspect`).";
+            if (_customsStore.Remove(steamId, args[1])) removed = 1;
+        }
+        else
+        {
+            foreach (var b in _customsStore.List(steamId))
+                if (_customsStore.Remove(steamId, b.CharacterId)) removed++;
+        }
+        if (removed == 0) return $"No stored baseline matched for {FormatPlayer(steamId)}.";
+        return $"Removed {removed} baseline(s) for {FormatPlayer(steamId)}. "
+             + (CustomsModeNow() == CustomsMode.Enforce
+                 ? "Their next arrival is treated as a new character (customsNewCharacters)."
+                 : "Their next arrival establishes a new baseline.");
     }
 
     // ==================== Cheat item removal ====================

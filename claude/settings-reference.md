@@ -253,13 +253,39 @@ debug hotkeys (Z fly, B free build). Full mechanism in `claude/console-guard.md`
 
 ---
 
+## Customs inventory baseline
+
+| C# property | YAML key | Type | Default |
+|---|---|---|---|
+| `EnableCustoms` | `enableCustoms` | bool | `false` |
+| `CustomsMode` | `customsMode` | string | `"dryrun"` |
+| `CustomsNewCharacters` | `customsNewCharacters` | string | `"fresh"` |
+| `CustomsExemptModerators` | `customsExemptModerators` | bool | `false` |
+| `CustomsIgnoredItems` | `customsIgnoredItems` | `List<string>` | `[]` |
+| `CustomsArrivalTimeoutSeconds` | `customsArrivalTimeoutSeconds` | int | `60` |
+| `CustomsCheckpointSeconds` | `customsCheckpointSeconds` | int | `120` |
+| `CustomsDebounceSeconds` | `customsDebounceSeconds` | int | `5` |
+| `CustomsMaxItemRecords` | `customsMaxItemRecords` | int | `256` |
+
+Effective mode comes from `CustomsPolicy.Resolve`: disabled when `enableCustoms` is false; `enforce` only when both `customsMode: enforce` and the global `enforce` switch are true; `off`/`disabled` explicitly disable it; every other value fails safe to `dryrun`. In dry run Customs judges, logs and learns from accepted readable snapshots but never disconnects. In enforce, an arrival with a positive inventory delta is refused unless it has a live operator approval.
+
+`customsNewCharacters` applies only when no baseline exists in enforce: `fresh` admits only an empty inventory after ignored prefabs are removed; `any` admits and establishes whatever arrives; `approve` admits only with a live `sg customs approve`. Unknown values fall back to `fresh`. Approvals are one-shot, expire after 24 hours, and are stored in `customs/approvals.json`.
+
+Owners are never inspected. Moderators are inspected unless `customsExemptModerators` is true. Peers without a resolvable 17-digit SteamID are not inspected because there is no stable account key for their baseline. `customsIgnoredItems` compares prefab names case-insensitively and removes those records from both arrival deltas and the `fresh` emptiness check.
+
+The declaration deadline starts when the character enters the world, with a minimum timeout of 5 seconds; after 15 minutes without a character it starts anyway. Request values sent to clients are clamped: checkpoint 30–3600 seconds, debounce 1–120 seconds, records 32–4096. `customsMaxItemRecords` controls both the request and server parser limit.
+
+Settings, moderator and owner hot-reloads call `CustomsRequestReconcile()`. Newly in-scope online peers are enrolled without judging the current inventory, out-of-scope peers receive a stop request, and timing/record-limit changes are re-pushed. Switching dry run/enforce does not re-judge an admitted player; it applies when the next arrival declaration is handled. See `features-and-rules.md` and `wiki/Customs.md` for rollout and persistence behavior.
+
+---
+
 ## Metrics
 
 | C# property | YAML key | Type | Default |
 |---|---|---|---|
 | `EnableMetrics` | `enableMetrics` | bool | `true` |
 
-New counters in `metrics.yaml`: `ban_layer_blocks`, `console_blocks`.
+Feature counters include `ban_layer_blocks` and `console_blocks`. Customs adds `customs_arrivals`, `customs_flagged`, `customs_refused` and `customs_unusable` to `metrics.yaml`. Its only violation rule is `UndeclaredItems`, which defaults to `countAsViolation: false` because an enforce refusal already disconnects the player.
 
 ---
 
@@ -302,9 +328,9 @@ public List<string> required_mods { get; set; } = new();
 ## Hot-reload
 
 `FileSystemWatcher` watches:
-- `settings.yaml` → calls `LoadSettings()` → `ReconfigureDiscordAndSummary()`, `BroadcastArrivalShoutPolicy()`, `BroadcastConsolePolicy()`, `SweepBannedPeers()`
-- `moderators.yaml` → calls `LoadAdmins()` → `BroadcastConsolePolicy()`
-- `owners.yaml` → calls `LoadOwners()` → `BroadcastConsolePolicy()`
+- `settings.yaml` → calls `LoadSettings()` → `ReconfigureDiscordAndSummary()`, `BroadcastArrivalShoutPolicy()`, `BroadcastConsolePolicy()`, `SweepBannedPeers()`, `CustomsRequestReconcile()`
+- `moderators.yaml` → calls `LoadAdmins()` → `BroadcastConsolePolicy()`, `CustomsRequestReconcile()`
+- `owners.yaml` → calls `LoadOwners()` → `BroadcastConsolePolicy()`, `CustomsRequestReconcile()`
 - `allowed_mods.yaml` → calls `LoadAllowedMods()` → `RecomputeModsetFingerprint()`
 - `bans.yaml` → calls `LoadBans()` → `SweepBannedPeers()`
 

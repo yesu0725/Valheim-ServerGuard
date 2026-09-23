@@ -9,6 +9,8 @@
     <Authors>yesu0725</Authors>
     <LangVersion>latest</LangVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- tests/ is a separate project (Unity-free tests); keep its sources out of the plugin. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <PropertyGroup>

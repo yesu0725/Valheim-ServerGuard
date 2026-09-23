@@ -97,6 +97,22 @@ See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for full server-side configuratio
 
 ---
 
+## Unity-free tests
+
+`tests/ServerGuard.Tests` checks the parts of ServerGuard that need no game: today, the
+Customs inventory model, wire format, verdicts, sessions and baseline store. It compiles the
+same `Shared/*.cs` files the plugin does and needs only the .NET SDK — no Valheim install.
+
+```powershell
+dotnet run --project tests/ServerGuard.Tests -c Release
+```
+
+Exit code `0` means every test passed. The plugin build above is still what proves those
+files stay inside the `net462` surface Valheim's Mono runtime provides; a green test run does
+not replace it.
+
+---
+
 ## Troubleshooting
 
 ### `error MSB3245: Could not resolve this reference. Could not locate the assembly "assembly_valheim"`
@@ -122,3 +138,4 @@ The project pins `BepInEx.Core 5.4.22` and `HarmonyX 2.10.1`. If your server run
 | Clean | `dotnet clean` |
 | Restore only | `dotnet restore` |
 | Rebuild from scratch | `dotnet build -c Release --no-incremental` |
+| Unity-free tests | `dotnet run --project tests/ServerGuard.Tests -c Release` |

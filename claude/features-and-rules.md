@@ -23,6 +23,7 @@ RULE_SKILL_OVERFLOW          = "SkillOverflow"
 RULE_CHEATED_ITEM            = "CheatedItem"     # 2.0
 RULE_CHEATED_BUILD           = "CheatedBuild"    # 2.0
 RULE_DEBUG_FLY               = "DebugFly"        # 2.0
+RULE_UNDECLARED_ITEMS        = "UndeclaredItems" # Customs
 ```
 
 `ALL_RULES` array mirrors these for default-seeding the `countAsViolation` map.
@@ -51,6 +52,7 @@ countAsViolation:
   CheatedItem:                false   # 2.0 — see cheatTaintPolicy; audit first
   CheatedBuild:               false   # 2.0 — audit first
   DebugFly:                   false   # 2.0 — server-observed; safe to enable once staff never trip it
+  UndeclaredItems:            false   # Customs refusal already disconnects; audit in dry run first
 ```
 
 `RuleCountsAsViolation(rule)` returns **false** for missing keys — every new rule is opt-in.
@@ -130,6 +132,22 @@ countAsViolation:
 - **Setting:** `enableInventoryCheck`, `inventoryCheckStackTolerance` (default 1.0)
 - **Trigger:** `Patch_Inventory_AddItem` — stack count > `maxStackSize * tolerance`
 - **countAsViolation default:** `false`
+
+### UndeclaredItems / Customs inventory baseline
+- **Settings:** `enableCustoms` (false), `customsMode` (`dryrun` default / `enforce`), `customsNewCharacters` (`fresh` default / `any` / `approve`), `customsExemptModerators` (false), `customsIgnoredItems` ([]), plus arrival/checkpoint/debounce/record limits in `settings-reference.md`
+- **Trigger:** an arrival declaration has a positive item delta over that character's last trusted baseline. Identity includes prefab, quality, variant, world level, crafter ID/name and SHA-256 of `ItemData.m_customData`; slot order and stack layout do not matter, and arriving with less is allowed.
+- **Arrival capture:** the client max-merges inventory snapshots immediately before and after the first local `Player.OnSpawned`, covering items loaded from the character and synchronous spawn patches. Later full snapshots are sent after a debounced change, at checkpoints and best-effort on logout.
+- **Verdict:** dry run admits, logs and learns what enforce would refuse. Enforce disconnects positive deltas; a character with no baseline follows `customsNewCharacters`. A one-shot 24-hour operator approval converts only an otherwise-refused arrival into a new baseline.
+- **Scope:** starts only after manifest attestation. With `requireCompanion: false`, a peer that never attests is never asked and bypasses Customs. Owners are never inspected; moderators are unless exempt; peers without a resolvable SteamID64 are not inspected.
+- **countAsViolation default:** `false`; `AddViolation(RULE_UNDECLARED_ITEMS, ...)` is called only for an enforce refusal caused by undeclared items, not for an unknown character or unusable declaration.
+
+**Baseline integrity / poisoning invariants:** every report is bound to the attested connection and request nonce, must advance sequence, must match the server-observed name and cannot switch character ID. Stale, replayed and rate-limited reports are dropped. Refused sessions close before any write; malformed/unusable reports never write, and if an admitted dry-run session becomes unusable it closes with the last good baseline intact. A newer admitted connection for the same SteamID/character supersedes the old one, so they cannot interleave writes. Reads consult queued writes before disk, so an immediate reconnect is judged against the newest accepted snapshot.
+
+**Persistence:** `Shared/CustomsLedger.cs` stores one JSON baseline per character under `customs/<steamid>/<characterId>.json`. Writes use `.tmp` + flush + atomic replace and retain `.bak`. Parse-corrupt files are quarantined as `.corrupt-<utc>` before `.bak` fallback; unreadable or newer-schema files are `Unavailable`, which admits unjudged and forbids overwrite. Failed writes remain queued with back-off; logout and shutdown force a flush attempt.
+
+**Trust and coverage limits:** the inventory is client-declared, so a modified client that defeats attestation can lie. `Player.GetInventory().GetAllItems()` covers the normal grid, equipped items and extra rows added to that same inventory, but not separate mod-owned containers. AzuExtendedPlayerInventory should fit the same-inventory model but has not been validated in a live game/AzuEPI install. No live-game RPC/spawn integration validation is provided by the Unity-free harness.
+
+Admin commands: `sg customs [status]`, `inspect <steamid|name>`, `approve`, `unapprove`, and offline-only `reset [characterId]`. Approve, unapprove and reset are mutating-command audit events; moderators cannot approve or reset themselves. Full operator guidance: `wiki/Customs.md`.
 
 ### AnimationCancel
 - **Setting:** `enableAnimationCancelGate` (default `true`)

@@ -1,6 +1,6 @@
 # Implementation Summary — Valheim ServerGuard
 
-This is a technical summary of how ServerGuard works for someone who wants to read or modify the code. For installation/usage docs see [README.md](README.md) and [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md).
+This is a technical summary of how ServerGuard works for someone who wants to read or modify the code. For installation/usage docs see [README.md](../README.md) and [DEPLOYMENT_GUIDE.md](../DEPLOYMENT_GUIDE.md).
 
 ---
 
@@ -16,6 +16,8 @@ ServerGuard v1.3 solves it by making the client tell the server, in a way the se
 - The server checks the signature, the freshness, and whether the listed mods are on its allowlist.
 
 Vanilla clients don't run ServerGuard, so they never reply — and get kicked on timeout.
+
+The optional **Customs** subsystem builds on that attested connection. The client declares full inventory snapshots; the server compares an arriving character with its last trusted departure baseline and can log or refuse positive deltas. It is off by default and defaults to dry run when enabled.
 
 ---
 
@@ -72,6 +74,7 @@ Vanilla clients don't run ServerGuard, so they never reply — and get kicked on
 │   (staff dev commands)   │
 │ • SendPublic / SendAdmin │
 │ • TryKick / TryBan       │
+│ • Customs sessions/store │
 └──────────────────────────┘
 ```
 
@@ -79,7 +82,7 @@ One project, one DLL, installed unchanged on both sides:
 
 | Project | Output |
 |---|---|
-| [Valheim-ServerGuard.csproj](Valheim-ServerGuard.csproj) | `Valheim-ServerGuard.dll` |
+| [Valheim-ServerGuard.csproj](../Valheim-ServerGuard.csproj) | `Valheim-ServerGuard.dll` |
 
 The csproj for the server has `<Compile Remove="ServerGuard.Client/**/*.cs" />` so the client subdirectory doesn't accidentally compile into the server build.
 
@@ -166,6 +169,20 @@ Hot-reload is implemented in `ServerPlugin.cs` (`StartWatchers`) via one `FileSy
 |---|---|
 | `client.yaml` | `ClientSettings { sharedSecret: string }` |
 | `mods_for_allowed_mods.yaml` | Generated; copy-paste-ready snippet for the server |
+
+### Customs baselines, under `BepInEx/config/ServerGuard/customs/`
+
+Customs is lazy: constructing the store and looking up absent baselines creates no directory. Once needed, each character has `<steamid>/<characterId>.json`; atomic replacement retains `.bak`, parse-corrupt files are quarantined, and `approvals.json` holds one-shot approvals. Unreadable/newer-schema baselines are admitted unjudged and never overwritten. Accepted writes queue in memory, reads prefer queued state, and departure/shutdown force a flush attempt.
+
+## Customs lifecycle and trust boundary
+
+`OnManifestReceived` starts Customs only after attestation succeeds. The server sends `ServerGuard_CustomsRequest`; the client answers with a `declare` snapshot max-merged around first spawn, then full `change`, `checkpoint` and best-effort `logout` snapshots. The server binds every report to the peer's SteamID, request nonce, increasing sequence, server-observed character name and first character ID. A refused/unusable/replayed report cannot advance the baseline, and a newer connection supersedes an older writer for the same character.
+
+Modes are disabled / dry run / enforce. Unknown mode values and global `enforce: false` resolve to dry run. New characters in enforce follow `fresh` / `any` / `approve`; approval is one-shot and expires after 24 hours. Operators use `sg customs [status]`, `inspect`, `approve`, `unapprove` and offline-only `reset`.
+
+This is not a server-authoritative inventory: a client that defeats attestation can lie, and with `requireCompanion: false` a peer that never attests is not inspected. Only peers with a resolvable SteamID64 are inspected. The client reads the player's primary inventory (including extra rows in the same `Inventory`), not separate mod-owned containers; live-game RPC/spawn behavior and AzuExtendedPlayerInventory have not been validated by the Unity-free tests.
+
+The test project `tests/ServerGuard.Tests/ServerGuard.Tests.csproj` links the production `Shared/CustomsProtocol.cs` and `Shared/CustomsLedger.cs` directly. Its 96 tests cover item normalization/deltas, wire bounds, policy verdicts, session replay/rate/character binding, no-poisoning transitions, approvals and real-file store recovery. It does not replace the merged net462 plugin build.
 
 ---
 
@@ -308,14 +325,18 @@ The legacy code is gone (`DetectLikelyModdedClient`, `ScanPeerAssemblies`, `mod_
 
 | File | Contents |
 |---|---|
-| [Plugin.cs](Plugin.cs) | Server entry point, all server logic, Harmony patches (`Patch_OnNewConnection`, `Patch_RPC_PeerInfo`, `Patch_Disconnect`, `Patch_SetRandomEvent`, `Patch_ResetRandomEvent`), RPC handlers (`OnChatReceived`, `OnPlayerDeathReceived`), all helpers, `SendPublic`/`SendAdmin` |
-| [Shared/Manifest.cs](Shared/Manifest.cs) | `ModManifest`, `ModManifestEntry`, canonical-string builder, HMAC helpers, `ConstantTimeEquals` |
-| [ServerGuard.Client/ClientPlugin.cs](ServerGuard.Client/ClientPlugin.cs) | Client entry point, manifest builder, deferred init coroutine, first-run export, Harmony patches (`Patch_RegisterClientHandler`, `Patch_Chat_SendText_Report`, `Patch_Player_OnDeath_Report`) |
-| [Valheim-ServerGuard.csproj](Valheim-ServerGuard.csproj) | Server build config; auto-detects Valheim install via `$VALHEIM_PATH` |
-| [ServerGuard.Client/Valheim-ServerGuard-Client.csproj](ServerGuard.Client/Valheim-ServerGuard-Client.csproj) | Client build config; links `../Shared/Manifest.cs` |
-| [BUILD.md](BUILD.md) | How to build both DLLs from source |
-| [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) | Step-by-step Windows install walkthrough |
-| [README.md](README.md) | User-facing documentation (quick setup + advanced reference) |
+| [ServerGuardPlugin.cs](../ServerGuardPlugin.cs) | Only BepInEx entry point; selects server/client half and patches only that half's nested Harmony classes |
+| [ServerPlugin.cs](../ServerPlugin.cs) | Server lifecycle, settings, rules, RPC handlers, admin commands and Customs Unity-facing orchestration |
+| [ClientPlugin.cs](../ClientPlugin.cs) | Manifest/report senders, client enforcement/UI and Customs spawn capture/report loop |
+| [Shared/Manifest.cs](../Shared/Manifest.cs) | `ModManifest`, `ModManifestEntry`, canonical-string builder, HMAC helpers, `ConstantTimeEquals` |
+| [Shared/CustomsProtocol.cs](../Shared/CustomsProtocol.cs) | Customs item identity/normalization, limits, request framing and strict report parser |
+| [Shared/CustomsLedger.cs](../Shared/CustomsLedger.cs) | Customs policy, session state machine, verdict engine, baseline store and approvals |
+| [tests/ServerGuard.Tests](../tests/ServerGuard.Tests) | Unity-free harness linking the two production Customs shared files (96 tests) |
+| [Valheim-ServerGuard.csproj](../Valheim-ServerGuard.csproj) | One merged net462 build; resolves local Valheim/BepInEx references |
+| [BUILD.md](../BUILD.md) | How to build the merged DLL and run Unity-free tests |
+| [DEPLOYMENT_GUIDE.md](../DEPLOYMENT_GUIDE.md) | Step-by-step Windows install walkthrough |
+| [README.md](../README.md) | User-facing documentation (quick setup + advanced reference) |
+| [wiki/Customs.md](../wiki/Customs.md) | Operator rollout, settings, commands, persistence and known limitations |
 
 ---
 

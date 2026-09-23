@@ -151,6 +151,16 @@ The companion's periodic skill report contained a level above `skillCapMaxLevel 
 - **Settings:** `enableSkillCap`, `skillCapMaxLevel` (default 100), `skillCapTolerance` (default 5).
 - **Tuning:** Some modded skill systems legitimately allow higher caps — raise the max.
 
+### UndeclaredItems (Customs)
+
+A character came back carrying items it did not have when it was last trusted on this
+server: imported from single-player or another server, or restored from a character
+backup. Customs is off by default and starts in dry run; the whole mechanism, and how to
+roll it out, is on the **[Customs](Customs)** page.
+
+- **Default:** Not counted (the refusal is already a disconnect).
+- **Settings:** `enableCustoms`, `customsMode` (`dryrun` / `enforce`) and friends.
+
 ## Tuning recommendations
 
 | If you want… | Do this |
