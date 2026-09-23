@@ -75,6 +75,18 @@ If an admin connects and `Register` hasn't run yet, their companion's RPCs arriv
 - **Sender:** `OnCheatStateReceived` when `cheatTaintPolicy` is `strip` or `violation`, on every report while flagged items remain
 - **Payload:** `string` — comma-separated prefab names to **keep** (`cheatTaintIgnoredItems`)
 - **Client handler:** `OnStripCheatedReceived` — removes every `m_cheated` item not in the list from the local inventory immediately, shows a centre message, then force-sends a fresh `ServerGuard_CheatState`
+
+
+### `ServerGuard_CustomsRequest`
+- **Sender:** `CustomsSendRequest(peer, nonce)` after `OnManifestReceived` has accepted the peer; settings/tier hot-reload can start, update or stop an online session through `CustomsReconcile()`
+- **Payload:** versioned pipe framing:
+  ```
+  1|nonce|checkpointSeconds|debounceSeconds|maxRecords
+  ```
+  An empty nonce (`"1|"`) means stop reporting. The client clamps checkpoint to 30–3600 seconds, debounce to 1–120 seconds and records to 32–4096, so a bad server request cannot create a report storm.
+- **Client handler:** `OnCustomsRequest(payload)` stores the request and sends a `declare` snapshot when a character inventory is available; later full snapshots are `change`, `checkpoint` or best-effort `logout` reports.
+- **Compatibility:** an older client has no request handler; dry run logs the missing declaration and enforce disconnects after the arrival deadline. An older server never sends the request.
+
 ---
 
 ## Client → Server RPCs (client invokes, server receives)
@@ -191,6 +203,22 @@ Not ServerGuard RPCs — vanilla ones the server half patches. See `console-guar
   - Validates `IsAdmin(pid)` first
   - Dispatches to `DispatchAdminCommand(args, peer, pid)`
   - Replies via `ServerGuard_AdminCommandReply`
+
+
+### `ServerGuard_CustomsReport`
+- **Sender:** Customs client loop after a valid `ServerGuard_CustomsRequest`
+- **Payload:** compact JSON, version 1:
+  ```json
+  {"v":1,"n":"<nonce>","q":1,"k":"declare","c":"<characterId>","cn":"<characterName>","i":[["Prefab",1,0,0,123,"Crafter","<customDataSha256>",20]]}
+  ```
+  - `q` is a positive, monotonically increasing sequence for the connection.
+  - `k` is `declare`, `change`, `checkpoint` or `logout`.
+  - `c` is the canonical decimal `PlayerProfile.GetPlayerID()`; `cn` is checked against the server-observed peer name.
+  - Every item is exactly `[prefab, quality, variant, worldLevel, crafterId, crafterName, customDataSha256, quantity]`. Reports are full normalized inventory snapshots, not diffs.
+- **Server handler:** `OnCustomsReport(peer, payload)` → `CustomsSession.Screen` → `CustomsEngine.Declare` or `CustomsEngine.Record`.
+- **Validation:** `CustomsWire.TryReadReport` enforces UTF-8 payload size, JSON depth, required/unique fields, item count, string/numeric bounds, canonical character IDs and an all-or-nothing item parse. Unknown top-level fields are skipped for forward compatibility.
+- **Session binding:** SteamID is never accepted from the payload; it comes from the attested peer. The per-session nonce, sequence, server-observed character name and first accepted character ID prevent cross-request replay and character switching. Wrong nonce, stale sequence, repeated declaration and rate-limit excess are dropped without changing the baseline. Malformed, out-of-bounds, wrong-kind or character-mismatched reports are unusable: enforce refuses; dry run logs, and an already-admitted session is closed so it cannot poison later baselines.
+- **Trust boundary:** the server cannot independently read a remote inventory. Attestation and hash pinning protect the expected client binary, but a client that defeats them can lie in a declaration. Customs is provenance checking, not a server-authoritative inventory.
 
 ---
 

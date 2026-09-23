@@ -73,6 +73,7 @@ Awake()
   LoadRegistrations()
   LoadViolations()
   LoadMetrics()
+  CustomsInit()               ← load approvals; construct lazy baseline store; start 1s loop
   StartWatchers()             ← FileSystemWatcher hot-reload
   PatchNested(_harmony, typeof(ServerPlugin))
   ReconfigureDiscordAndSummary()
@@ -82,6 +83,13 @@ Awake()
   RunSelfTest()
   PostAdminEvent(":rocket: ServerGuard online ...")
   _bootCompleted = true       ← NOW hot-reload notices reach Discord
+
+OnDestroy()
+  PostShutdownNoticeBlocking()
+  UnpatchSelf() / dispose Discord listener
+  StopWatchers()
+  CustomsShutdown()           ← force a final flush of queued accepted baselines
+  SaveAll()
 ```
 
 ### Client (`ClientPlugin.cs`)
@@ -98,6 +106,8 @@ DeferredInit()               ← runs 2s after Awake (lets all plugins load)
   StartCoroutine(SkillReportLoop())
   LogInfo("Modset fingerprint loose=... strict=...")
 ```
+
+Customs is dormant until the server sends `ServerGuard_CustomsRequest`. The client captures the local inventory around the first `Player.OnSpawned`, then a two-second polling coroutine sends debounced changes and periodic checkpoints. `ZNet.Shutdown` sends a best-effort logout snapshot in its Prefix, before the connection closes, and resets all Customs connection state in its Postfix.
 
 The 2-second delay in `DeferredInit` is intentional — `PluginInfos` is incomplete during `Awake` because BepInEx loads plugins alphabetically on the same thread.
 
@@ -156,8 +166,13 @@ Server (on receiving ServerGuard_Manifest)
   Verify challenge + timestamp + HMAC
   ValidateAgainstPolicy(manifest)
   If all pass → PostPlayerEvent(":white_check_mark:", steamId, "joined")
+                CustomsOnAttested(peer, steamId)
+                  if in scope: create per-connection session
+                               invoke ServerGuard_CustomsRequest
   If any fail → TryKick(peer, FriendlyReason(rule, detail))
 ```
+
+The Customs report RPC is registered for every peer before the owner early-return, but reports are ignored unless the server created a session after attestation. Owners never attest and are never inspected. The server keys the session by `ZNetPeer` because `m_uid` can still be zero when attestation finishes; account identity comes from the peer, never the report. See `rpc-protocol.md` for framing and `features-and-rules.md` for the no-poisoning rules.
 
 ---
 
@@ -179,6 +194,10 @@ Server (on receiving ServerGuard_Manifest)
 | `_pingState` | `Dictionary<long, PingState>` | Per-peer ping samples |
 | `_suppressLogoutFor` | `HashSet<long>` | Peer UIDs we just kicked (suppress redundant "left") |
 | `_skillOverflowState` | `Dictionary<long, ...>` | Per-peer skill overflow throttle |
+| `_customsAttested` | `HashSet<ZNetPeer>` | Current peers that passed manifest attestation; used for settings/tier reconciliation |
+| `_customsSessions` | `Dictionary<ZNetPeer, CustomsSession>` | Nonce, sequence, character binding, phase and last accepted inventory per inspected connection |
+| `_customsStore` | `CustomsBaselineStore` | Queued and on-disk per-character baselines; reads queued state before disk |
+| `_customsApprovals` | `CustomsApprovals` | Persisted one-shot, 24-hour account approvals |
 
 ---
 
@@ -197,8 +216,11 @@ BepInEx/config/ServerGuard/
 │   ├── violations.yaml             ← per-player violation counts (auto-saved, hot-reload)
 │   ├── metrics.yaml                ← detection counters (auto-saved)
 │   └── modset_fingerprint.txt      ← computed on every allowed_mods reload
-└── build_log/
-    └── YYYY-MM-DD.csv              ← daily build/destroy log
+├── build_log/
+│   └── YYYY-MM-DD.csv              ← daily build/destroy log
+└── customs/                        ← created lazily by a baseline/approval write or enabled self-test
+    ├── approvals.json              ← pending one-shot approvals
+    └── <steamid>/<characterId>.json[.bak]  ← per-character baselines
 ```
 
 Client:
@@ -242,6 +264,8 @@ when missing, plus a single append-migration for `serverAnnouncements` — see
 | `FejdStartup.m_queuedJoinServer`, `SetServerToJoin`, static `ServerPassword` (reflection) | Direct connect, skipping the IP/password dialogs |
 | `TMPro.TMP_TextUtilities.FindIntersectingLink` (reflection) | Which `<link>` was clicked in the announcements box |
 | `UnityEngine.ImageConversion.LoadImage` (reflection) | Decode the server logo PNG/JPG |
+| `Player.OnSpawned`, `Player.GetInventory().GetAllItems()` | Client Customs arrival capture and full inventory snapshots |
+| `Game.GetPlayerProfile().GetPlayerID()` | Stable character ID in Customs reports; SteamID still comes from the server peer |
 
 Every string-named member above is verified against a new game build by the
 procedure in `build-and-release.md`, *Verifying against a new Valheim release*.
